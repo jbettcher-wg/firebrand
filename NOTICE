@@ -1,0 +1,72 @@
+Firebrand
+Copyright (c) 2026 Jordan Bettcher. Firebrand's own code is under the MIT licence (LICENSE).
+
+Firebrand contains, or builds from, the third-party work below. Each keeps its copyright notices
+(at the top of each file it came in) and its licence.
+
+In this repository
+------------------
+
+Linux amdgpu, powerplay and radeon (drivers/gpu/drm/amd, drivers/gpu/drm/radeon)
+    Ported file for file into amdgpu/ (frb_*.c: gmc_v8_0, gfx_v8_0, sdma_v3_0, uvd_v6_0, dce_v11_0,
+    atombios_*, smu7_* and polaris10_smumgr, process_pptables_v1_0, hwmgr, ...).
+    Licence: MIT. Copyright Advanced Micro Devices, Inc.; Red Hat Inc.; Jerome Glisse; and the
+    other holders named in each file. LICENSES/MIT-amdgpu.txt.
+
+AMD register, AtomBIOS, powerplay and SDMA headers (amdgpu/include/, shared/atom/)
+    asic_reg/ (bif 5.0, dce 10.0 and 11.2, gfx 8.0, gmc 8.1, oss 3.0, smu 7.1.3, uvd 6.0),
+    pp/ (smu74, smu7, pptable v1.0), tonga_sdma_pkt_open.h, clearstate_vi.h, vid.h, atombios.h,
+    ObjectID.h, and the AtomBIOS interpreter (atom.c), unchanged or ported.
+    Licence: MIT. Copyright Advanced Micro Devices, Inc. LICENSES/MIT-amdgpu.txt.
+
+RadeonNI-OSX (https://github.com/kouta-kun/RadeonNI-OSX)
+    The OpenGL driver bundle (radeonni/gld), its Mesa winsys, frontend and target
+    (radeonni/mesa), the 2D plug-in (radeonni/ga), the video client library (radeonni/video), the
+    user-client protocol headers (radeonni/hw), and pieces of the kext and the OS layer that
+    Firebrand's files name in their headers.
+    Licence: MIT. Copyright (c) 2026 kouta-kun and Claude. radeonni/LICENSE.
+
+Mesa changes (radeonni/mesa/patches)
+    Patches to Mesa 26.2.4, among them radeonsi on a big-endian host (0030-0041).
+    Licence: that of the Mesa files they change, MIT. LICENSES/MIT-Mesa.txt.
+
+Built from, not in this repository
+----------------------------------
+
+Mesa 26.2.4 (https://mesa3d.org)
+    Downloaded and checksum-verified by radeonni/build-gl.sh; with the patches above, it is
+    linked into RadeonNIGLDriver.bundle (Mesa's GL, gallium, radeonsi, r600, softpipe, the AMD
+    common code and addrlib).
+    Licence: MIT for those components. Copyright Brian Paul, VMware, Inc., Advanced Micro
+    Devices, Inc., Intel Corporation and the other holders named in each Mesa file.
+    LICENSES/MIT-Mesa.txt.
+
+GCC 15.3 runtime (libgcc, libstdc++, libatomic)
+    Linked statically into RadeonNIGLDriver.bundle by the cross compiler.
+    Licence: GNU GPL 3 with the GCC Runtime Library Exception, which permits this.
+
+AMD GPU microcode (linux-firmware: polaris12_*.bin, polaris10_sdma*.bin, polaris10_uvd.bin)
+    Downloaded and checksum-verified by scripts/fetch-firmware.sh; embedded in Firebrand.kext,
+    with the licence in Firebrand.kext/Contents/Resources/LICENSE.amdgpu. Never committed here.
+    Licence: AMD's microcode licence (binary redistribution). Copyright (C) Advanced Micro
+    Devices, Inc. LICENSES/LICENSE.amdgpu.
+
+Noto Sans (https://notofonts.github.io)
+    The typeface of the Firebrand wordmark in art/ and in the boot logo. No font file is included.
+    Licence: SIL Open Font License 1.1. Copyright 2022 The Noto Project Authors.
+    art/OFL-NotoSans.txt.
+
+References
+----------
+
+HDAudio (kexts/HDAudio) is written for this project. Its controller and ring handling follow the
+structure of FreeBSD's HD Audio driver (sys/dev/sound/pci/hda, BSD licence) and its IOAudio side
+follows the layout of Apple's SamplePCIAudioDriver template (IOAudioFamily); register offsets and
+encodings come from Intel's High Definition Audio Specification 1.0a.
+
+The Mac OS X 10.5 SDK and Xcode 3.1 (Apple's licences) are needed to build and are not part of
+this repository.
+
+AMD, Radeon, Polaris and AtomBIOS are trademarks of Advanced Micro Devices, Inc. Mac OS X,
+PowerPC Mac and Quartz Extreme are trademarks of Apple Inc. PowerPC is a trademark of IBM.
+Firebrand is not affiliated with or endorsed by any of them.

@@ -1,0 +1,51 @@
+# Build outputs and downloads
+build/
+*.o
+*.log
+.DS_Store
+._*
+
+# AMD microcode: fetched by scripts/fetch-firmware.sh, never committed (LICENSES/LICENSE.amdgpu)
+firmware/
+
+# Development documents and notes: not part of this repository
+docs/
+doc/
+notes/
+research/
+work/
+journal/
+experiments/
+*.notes.md
+JOURNAL*.md
+KNOWN-ISSUES*.md
+PROMPT*.md
+TODO*.md
+PLAN*.md
+PROGRESS*.md
+
+# Tests, test programs and test kits
+tests/
+test/
+testdata/
+*_test.*
+*-test.*
+test_*
+mesa/tests/
+
+# Coding-assistant files and notes
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.claude/
+.agents/
+.codex/
+.cursor/
+.github/copilot-instructions.md
+copilot-instructions.md
+*handoff*
+*hand-off*
+*agent-report*
+
+# Local release tooling (it names the private sources)
+/local/
