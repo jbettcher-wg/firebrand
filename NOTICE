@@ -1,6 +1,36 @@
 Firebrand
 Copyright (c) 2026 Jordan Bettcher. Firebrand's own code is under the MIT licence (LICENSE).
 
+Scope of the MIT licence in LICENSE
+-----------------------------------
+
+This licence covers the original work in this repository: the Firebrand kext
+(kext/), Firebrand's OS layer and its own parts of the hardware library
+(shared/, amdgpu/), HDAudio (kexts/HDAudio/), the build and install scripts,
+the tools, and the Firebrand artwork (art/).
+
+Much of the hardware library is ported from other projects. Those parts keep
+their own copyright notices, which stay at the top of each file, and their own
+licences, all MIT-style like this one:
+
+  - Code ported from Linux's amdgpu, powerplay and radeon drivers, and AMD's
+    register, AtomBIOS and SMU headers (amdgpu/, amdgpu/include/,
+    shared/atom/): MIT, Advanced Micro Devices, Inc. and the other holders
+    each file names. LICENSES/MIT-amdgpu.txt has the notice.
+  - Code from RadeonNI-OSX (radeonni/, and the Firebrand files whose headers
+    name it): MIT, radeonni/LICENSE.
+  - radeonni/mesa/patches/: changes to Mesa, under the licence of the Mesa
+    files they change (MIT). LICENSES/MIT-Mesa.txt has Mesa's notice.
+
+Not covered, and not in this repository:
+  - AMD's GPU microcode. scripts/fetch-firmware.sh downloads it from
+    linux-firmware and the build embeds it in Firebrand.kext. It is AMD's,
+    redistributable in binary form under LICENSES/LICENSE.amdgpu.
+  - Noto Sans, the typeface of the Firebrand wordmark: SIL Open Font
+    License 1.1, art/OFL-NotoSans.txt.
+
+NOTICE lists every third-party component and its licence.
+
 Firebrand contains, or builds from, the third-party work below. Each keeps its copyright notices
 (at the top of each file it came in) and its licence.
 
