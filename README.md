@@ -98,7 +98,8 @@ This installs into `/System/Library/Extensions`:
 | `RadeonNIGA.plugin` | the window server's 2D plug-in |
 | `HDAudio.kext` | DisplayPort audio (`--no-audio` leaves it out) |
 
-and `frbctl` into `/usr/local/bin`. An OpenGL bundle or 2D plug-in from another driver
+and `frbctl` into `/usr/local/bin`. Each kext is checked with `kextload -nt` (which loads
+nothing) before anything is replaced. An OpenGL bundle or 2D plug-in from another driver
 (RadeonNI uses the same names) is saved first and put back by the uninstaller.
 
 Then shut down, put the AMD card in, connect a **DisplayPort** monitor and start the Mac.
@@ -115,7 +116,10 @@ Graphics/Displays ("Quartz Extreme: Supported", "Core Image: Hardware Accelerate
 - log in with ssh and run `sudo nvram boot-args="frb_enable=0"`, then restart: the driver
   stays installed but does not start (`sudo nvram -d boot-args` undoes this); or
 - put the old card back and start in **Safe Mode** (hold Shift while the Mac starts; no
-  third-party drivers load), then run `sudo ./uninstall.sh`.
+  third-party drivers load), then run `sudo ./uninstall.sh`; or, with the old card back,
+  start in **single-user mode** (hold Command-S; Firebrand does not load there) and run
+  `mount -uw /`, `rm -rf /System/Library/Extensions/Firebrand.kext`,
+  `touch /System/Library/Extensions`, `reboot`.
 
 ## Uninstalling
 

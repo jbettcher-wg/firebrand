@@ -15,7 +15,10 @@
 # Install it while the old graphics card is still in the Mac, then shut down and swap the cards
 # (README.md, "Installing"). An existing RadeonNIGLDriver.bundle or RadeonNIGA.plugin from another
 # driver (RadeonNI) is saved in /Library/Application Support/Firebrand/saved and put back by
-# uninstall.sh. Nothing is written to the card. To undo: sudo ./uninstall.sh
+# uninstall.sh. Every kext is checked with kextload -nt (it loads nothing) before anything in
+# /System/Library/Extensions changes; a Firebrand.kext this replaces is kept in
+# /Library/Application Support/Firebrand/previous. Nothing is written to the card.
+# To undo: sudo ./uninstall.sh
 #
 # Copyright (c) 2026 Jordan Bettcher
 # SPDX-License-Identifier: MIT
@@ -63,30 +66,15 @@ set -e
 mkdir -p "$SAVED"
 : > "$SUPPORT/installed.txt.new"
 
-# Copy a bundle beside the old one and rename it into place, so a running window server keeps
-# the copy it has loaded.
-put() {
-	b="$1"
-	rm -rf "$SLE/$b.new" "$SLE/$b.old"
-	cp -R "$here/$b" "$SLE/$b.new"
-	chown -R root:wheel "$SLE/$b.new"
-	chmod -R go-w "$SLE/$b.new"
-	[ ! -d "$SLE/$b" ] || mv "$SLE/$b" "$SLE/$b.old"
-	mv "$SLE/$b.new" "$SLE/$b"
-	rm -rf "$SLE/$b.old"
-	echo "$b" >> "$SUPPORT/installed.txt.new"
-	echo "Installed $SLE/$b."
-}
+# Everything is prepared and checked in a staging folder first; nothing in
+# /System/Library/Extensions changes unless every kext passes.
+STAGE=/var/tmp/firebrand-install
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+for b in Firebrand.kext RadeonNIGA.plugin; do cp -R "$here/$b" "$STAGE/"; done
+[ "$gl" = 0 ] || cp -R "$here/RadeonNIGLDriver.bundle" "$STAGE/"
+[ "$audio" = 0 ] || cp -R "$here/HDAudio.kext" "$STAGE/"
 
-# Keep another driver's userland bundles (once: a second run does not overwrite the saved copy).
-for b in RadeonNIGLDriver.bundle RadeonNIGA.plugin; do
-	if [ -d "$SLE/$b" ] && [ ! -d "$SAVED/$b" ] && ! grep -qx "$b" "$SUPPORT/installed.txt" 2>/dev/null; then
-		cp -R "$SLE/$b" "$SAVED/$b"
-		echo "Saved the existing $b in $SAVED."
-	fi
-done
-
-put Firebrand.kext
 # The settings of an installed driver: the framebuffer personality at the last bring-up stage
 # (7, video), with the accelerator; OpenGL announced only with the GL bundle installed.
 glval=false
@@ -98,11 +86,56 @@ perl -0777 -pi -e "
 	s{(<key>FirebrandAccelGL</key>\s*)<(true|false)/>}{\${1}<$glval/>}g;
 	s{(<key>FirebrandBringUp</key>\s*)<(true|false)/>}{\${1}<false/>}g;
 	s{(<key>FirebrandAllowRegWrite</key>\s*)<(true|false)/>}{\${1}<false/>}g;
-" "$SLE/Firebrand.kext/Contents/Info.plist"
-plutil -lint "$SLE/Firebrand.kext/Contents/Info.plist" >/dev/null || fail "the edited Info.plist does not parse"
+" "$STAGE/Firebrand.kext/Contents/Info.plist"
+plutil -lint "$STAGE/Firebrand.kext/Contents/Info.plist" >/dev/null || fail "the edited Info.plist does not parse"
+
+# Owned by root:wheel and writable by root only, as the kext loader requires.
+for b in "$STAGE"/*; do
+	chown -R root:wheel "$b"
+	find "$b" -type d -exec chmod 755 {} +
+	find "$b" -type f -exec chmod go-w {} +
+done
+# Ask the system whether it would load each kext (dependencies, symbols); load nothing.
+for k in "$STAGE"/*.kext; do
+	if ! kextload -nt "$k" > "$STAGE/check.txt" 2>&1; then
+		cat "$STAGE/check.txt" >&2
+		rm -rf "$STAGE"
+		fail "the system rejects ${k##*/}; nothing was installed"
+	fi
+done
+rm -f "$STAGE/check.txt"
+
+# Keep another driver's userland bundles (once: a second run does not overwrite the saved copy).
+for b in RadeonNIGLDriver.bundle RadeonNIGA.plugin; do
+	if [ -d "$SLE/$b" ] && [ ! -d "$SAVED/$b" ] && ! grep -qx "$b" "$SUPPORT/installed.txt" 2>/dev/null; then
+		cp -R "$SLE/$b" "$SAVED/$b"
+		echo "Saved the existing $b in $SAVED."
+	fi
+done
+# The Firebrand.kext this replaces, if any, is kept in "$SUPPORT/previous".
+if [ -d "$SLE/Firebrand.kext" ]; then
+	rm -rf "$SUPPORT/previous"
+	mkdir -p "$SUPPORT/previous"
+	cp -R "$SLE/Firebrand.kext" "$SUPPORT/previous/"
+fi
+
+# Move each item beside the old one and rename it into place, so a running window server keeps
+# the copy it has loaded.
+put() {
+	b="$1"
+	rm -rf "$SLE/$b.new" "$SLE/$b.old"
+	mv "$STAGE/$b" "$SLE/$b.new"
+	[ ! -d "$SLE/$b" ] || mv "$SLE/$b" "$SLE/$b.old"
+	mv "$SLE/$b.new" "$SLE/$b"
+	rm -rf "$SLE/$b.old"
+	echo "$b" >> "$SUPPORT/installed.txt.new"
+	echo "Installed $SLE/$b."
+}
+put Firebrand.kext
 put RadeonNIGA.plugin
 [ "$gl" = 0 ] || put RadeonNIGLDriver.bundle
 [ "$audio" = 0 ] || put HDAudio.kext
+rm -rf "$STAGE"
 
 mkdir -p /usr/local/bin
 cp "$here/frbctl" /usr/local/bin/frbctl
@@ -131,5 +164,7 @@ If the Mac does not come up:
   - over ssh: sudo nvram boot-args="frb_enable=0" and restart (the driver stays installed
     but does not start; sudo nvram -d boot-args undoes it); or
   - put the old card back, start in Safe Mode (hold Shift: no third-party drivers load),
-    and run sudo ./uninstall.sh.
+    and run sudo ./uninstall.sh; or start in single-user mode (hold Command-S: Firebrand
+    does not load there), then: mount -uw / ; rm -rf /System/Library/Extensions/Firebrand.kext ;
+    touch /System/Library/Extensions ; reboot
 MSG
