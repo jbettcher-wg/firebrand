@@ -1,0 +1,25 @@
+# The microcode Firebrand.kext carries, by linux-firmware name. The Makefile
+# embeds each file from ../../firmware (scripts/fetch-firmware.sh fills it;
+# never committed) into the personality's "Firmware" dictionary under its own
+# name, and LICENSE.amdgpu into Contents/Resources. The driver asks for files
+# by name (frb_os.firmware), as amdgpu asks request_firmware.
+#
+# Polaris 12, not a "kicker" part (ASICID_IS_P23 is 6987/6981 only):
+# - MC: both images; gmc_v8_0_init_microcode picks one from MC_IO_DEBUG_UP_159.
+# - SMC: polaris12_smc.bin.
+# - CP: the _2 variants amdgpu loads when present (the captures loaded them).
+# - RLC, SDMA0/1: through the SMU's table of contents.
+# - UVD: the decoder's VCPU image, copied into VRAM by the driver (frb_uvd.c,
+#   amdgpu_uvd_resume); polaris10_uvd.bin under Polaris 12's name. VCE stays out.
+polaris12_mc.bin
+polaris12_32_mc.bin
+polaris12_smc.bin
+polaris12_ce_2.bin
+polaris12_me_2.bin
+polaris12_pfp_2.bin
+polaris12_mec_2.bin
+polaris12_mec2_2.bin
+polaris12_rlc.bin
+polaris12_sdma.bin
+polaris12_sdma1.bin
+polaris12_uvd.bin
