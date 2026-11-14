@@ -1,0 +1,470 @@
+osx-gpu: radeonsi on a big-endian host, part two: host-order buffers, GPU-order textures
+
+Application shaders swap every 16-, 32- and 64-bit element after a UBO,
+SSBO, global or constant load and before a store (si_nir_lower_be_memory,
+run before radeonsi's own memory loads, the vertex-buffer descriptors of
+the vertex-input lowering and the T#s and S#s of the resource lowering,
+which use the same intrinsics and must stay little-endian, and before the
+access-size lowering so each access is seen at its own size); user
+constant buffers are no longer converted to little-endian on upload, so
+both kinds of constant buffer agree; radeonsi's own shaders, marked by name
+in si_create_shader_state, are left alone, they work on what the hardware
+or the driver wrote. A texture of a format wider than bytes keeps the
+GPU's layout and is mapped only through a staging texture, swapped unit by
+unit after the copy in and before the copy out (si_be_swap_unit), so the
+CPU sees Mesa's host-order layout and the GPU its own: Core Image's RGBA16
+and float pbuffers, which the window server composites with, work without
+any CPU access at all. Measured on the W8100, 2026-11-04: the
+fixed-function matrices arrived byte-reversed and no vertex reached the
+screen; a build that swapped the descriptor loads drew black vertex
+colours and hung the sampler; and with 16-bit formats refused to the
+sampler the window server's pbuffer calls failed (BadDrawable, BadState)
+and Core Image fell back to software.
+
+Amended with part six (2026-11-13): si_be_swap_unit swaps the two packed
+float formats (R11G11B10, R9G9B9E5), which are not "plain" but are a
+host-order word in Mesa's view all the same, and the 24-bit depth channel
+of Z24X8 and X8Z24 by its whole word (it took a unit of 3, which swapped
+nothing); 8-bit blocks need no staging. si_be_withhold_packed() reads
+RDN_BE_PACKED for the gates in si_state.c.
+
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_nir_lower_abi.c b/src/gallium/drivers/radeonsi/gfx/si_nir_lower_abi.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_nir_lower_abi.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_nir_lower_abi.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "nir_builder.h"
++#include "util/u_endian.h"
+ 
+ #include "ac_nir.h"
+ #include "si_pipe.h"
+@@ -341,6 +342,9 @@ static bool lower_intrinsic(nir_builder *b, nir_instr *instr, struct lower_abi_s
+          intrin->intrinsic == nir_intrinsic_load_tess_level_inner_default ? 16 : 0;
+       replacement = nir_load_ubo(b, num_components, 32, buf, nir_imm_int(b, offset),
+                                  .range = ~0);
++      /* osx-gpu: host-order data, loaded after si_nir_lower_be_memory ran. */
++      if (si_nir_host_order_memory(b->shader))
++         replacement = si_nir_be_swap(b, replacement);
+       break;
+    }
+    case nir_intrinsic_load_patch_vertices_in:
+@@ -465,6 +469,9 @@ static bool lower_intrinsic(nir_builder *b, nir_instr *instr, struct lower_abi_s
+       unsigned offset = nir_intrinsic_ucp_id(intrin) * 16;
+       replacement = nir_load_ubo(b, 4, 32, buf, nir_imm_int(b, offset),
+                                  .range = ~0);
++      /* osx-gpu: host-order data, loaded after si_nir_lower_be_memory ran. */
++      if (si_nir_host_order_memory(b->shader))
++         replacement = si_nir_be_swap(b, replacement);
+       break;
+    }
+    case nir_intrinsic_load_streamout_buffer_amd: {
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_nir_lower_resource.c b/src/gallium/drivers/radeonsi/gfx/si_nir_lower_resource.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_nir_lower_resource.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_nir_lower_resource.c
+@@ -13,11 +13,13 @@
+  * finding which is the most complicated part (move to nir now).
+  */
+ 
++#include <string.h>
+ #include "nir_builder.h"
+ 
+ #include "ac_nir.h"
+ #include "si_pipe.h"
+ #include "si_shader_internal.h"
++#include "util/u_endian.h"
+ 
+ struct lower_resource_state {
+    struct si_shader *shader;
+@@ -625,3 +627,84 @@ bool si_nir_lower_resource(nir_shader *nir, struct si_shader *shader,
+                                        nir_metadata_control_flow,
+                                        &state);
+ }
++
++/*
++ * osx-gpu: application memory on a big-endian host.
++ *
++ * Mesa's convention on a big-endian host is that a buffer holds host-order
++ * data: a float uniform is four bytes with the most significant first, which
++ * is what the application wrote and what a CPU readback expects. The shader
++ * engines load and store little-endian, so every application load of a
++ * 16-, 32- or 64-bit element is byte-swapped after the load, and every store
++ * before it. A 64-bit element also swaps its two words. The vertex fetch
++ * does the same in si_nir_lower_vs_inputs.c, the colour buffer swaps in
++ * hardware (CB_COLOR_INFO.ENDIAN) and descriptors are uploaded little-endian
++ * (si_descriptors.c), so those are not touched here. radeonsi's own shaders
++ * (si_create_shader_state, which names them "si_internal:...") work on data
++ * the hardware or the driver wrote and are left alone; the state tracker's
++ * helper shaders read what it uploaded, host-order, and are not exempt. Measured on the W8100, 2026-11-04: without this the
++ * fixed-function matrices arrived byte-reversed and no vertex was on screen.
++ */
++nir_def *si_nir_be_swap(nir_builder *b, nir_def *x)
++{
++   switch (x->bit_size) {
++   case 16:
++      return nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, x, 0xff), 8), nir_ushr_imm(b, x, 8));
++   case 32:
++      return nir_ior(b,
++                     nir_ior(b, nir_ishl_imm(b, x, 24),
++                             nir_ishl_imm(b, nir_iand_imm(b, x, 0xff00), 8)),
++                     nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, x, 8), 0xff00),
++                             nir_ushr_imm(b, x, 24)));
++   case 64: {
++      nir_def *lo = si_nir_be_swap(b, nir_unpack_64_2x32_split_x(b, x));
++      nir_def *hi = si_nir_be_swap(b, nir_unpack_64_2x32_split_y(b, x));
++      return nir_pack_64_2x32_split(b, hi, lo);
++   }
++   default:
++      return x;
++   }
++}
++
++static bool si_nir_be_swap_mem_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   switch (intr->intrinsic) {
++   case nir_intrinsic_load_ubo:
++   case nir_intrinsic_load_ssbo:
++   case nir_intrinsic_load_global:
++   case nir_intrinsic_load_global_constant:
++   case nir_intrinsic_load_constant: {
++      if (intr->def.bit_size < 16)
++         return false;
++      b->cursor = nir_after_instr(&intr->instr);
++      nir_def *swapped = si_nir_be_swap(b, &intr->def);
++      nir_def_rewrite_uses_after(&intr->def, swapped);
++      return true;
++   }
++   case nir_intrinsic_store_ssbo:
++   case nir_intrinsic_store_global: {
++      if (intr->src[0].ssa->bit_size < 16)
++         return false;
++      b->cursor = nir_before_instr(&intr->instr);
++      nir_src_rewrite(&intr->src[0], si_nir_be_swap(b, intr->src[0].ssa));
++      return true;
++   }
++   default:
++      return false;
++   }
++}
++
++bool si_nir_host_order_memory(const nir_shader *nir)
++{
++   return UTIL_ARCH_BIG_ENDIAN &&
++          !(nir->info.name && strncmp(nir->info.name, "si_internal:", 12) == 0);
++}
++
++bool si_nir_lower_be_memory(nir_shader *nir)
++{
++   if (!si_nir_host_order_memory(nir))
++      return false;
++
++   return nir_shader_intrinsics_pass(nir, si_nir_be_swap_mem_access,
++                                     nir_metadata_control_flow, NULL);
++}
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_shader.c b/src/gallium/drivers/radeonsi/gfx/si_shader.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_shader.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_shader.c
+@@ -1006,6 +1006,16 @@ static void si_postprocess_nir(struct si_nir_shader_ctx *ctx)
+         (nir->info.stage == MESA_SHADER_GEOMETRY && shader->key.ge.as_ngg)) &&
+        !shader->key.ge.as_ls && !shader->key.ge.as_es);
+ 
++   /*
++    * osx-gpu: before anything of radeonsi's own reads memory through the same
++    * intrinsics: the vertex-input lowering loads vertex-buffer descriptors and
++    * the resource lowering loads T#s and S#s, all little-endian in memory and
++    * never to be swapped (a build that swapped them drew black vertex colours
++    * and hung the sampler); and before the bit-size lowering, so that each
++    * application access is seen at its original size.
++    */
++   NIR_PASS(progress, nir, si_nir_lower_be_memory);
++
+    if (nir->info.stage == MESA_SHADER_VERTEX)
+       NIR_PASS(progress, nir, si_nir_lower_vs_inputs, shader, &ctx->args);
+ 
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_shader_internal.h b/src/gallium/drivers/radeonsi/gfx/si_shader_internal.h
+--- a/src/gallium/drivers/radeonsi/gfx/si_shader_internal.h
++++ b/src/gallium/drivers/radeonsi/gfx/si_shader_internal.h
+@@ -114,6 +114,10 @@ bool si_nir_lower_abi(nir_shader *nir, struct si_shader *shader, struct si_shade
+ bool si_nir_lower_intrinsics_early(nir_shader *nir);
+ bool si_nir_lower_polygon_stipple(nir_shader *nir);
+ bool si_nir_lower_color_flatshade_twoside(nir_shader *nir, struct si_shader *shader);
++/* osx-gpu: big-endian host, host-order application memory (si_nir_lower_resource.c). */
++nir_def *si_nir_be_swap(nir_builder *b, nir_def *x);
++bool si_nir_host_order_memory(const nir_shader *nir);
++bool si_nir_lower_be_memory(nir_shader *nir);
+ bool si_nir_lower_resource(nir_shader *nir, struct si_shader *shader,
+                            struct si_shader_args *args);
+ bool si_nir_lower_vs_inputs(nir_shader *nir, struct si_shader *shader,
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c b/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c
+@@ -18,6 +18,13 @@ void *si_create_shader_state(struct si_context *sctx, nir_shader *nir)
+ {
+    static blake3_hash zeros;
+ 
++   /*
++    * osx-gpu: every shader radeonsi builds for itself comes through here;
++    * the name marks it for si_nir_lower_be_memory, which must leave the data
++    * these shaders read (descriptors, metadata, query results) alone.
++    */
++   nir->info.name = ralloc_asprintf(nir, "si_internal:%s", nir->info.name ? nir->info.name : "");
++
+    if (!memcmp(nir->info.source_blake3, zeros, sizeof(blake3_hash))) {
+       struct blob blob = {};
+ 
+diff --git a/src/gallium/drivers/radeonsi/si_descriptors.c b/src/gallium/drivers/radeonsi/si_descriptors.c
+--- a/src/gallium/drivers/radeonsi/si_descriptors.c
++++ b/src/gallium/drivers/radeonsi/si_descriptors.c
+@@ -1102,7 +1102,13 @@ static void si_set_constant_buffer(struct si_context *sctx, struct si_buffer_res
+       pipe_resource_release(&sctx->b, release_buf);
+ 
+       if (uploaded_constbuf.buffer) {
+-         util_memcpy_cpu_to_le32(tmp, input->user_buffer, input->buffer_size);
++         /*
++          * osx-gpu: host-order, like a constant buffer the state tracker
++          * uploaded itself; the shader swaps on load (si_nir_lower_be_memory).
++          * Upstream converted to little-endian here, which made the two kinds
++          * of constant buffer disagree.
++          */
++         memcpy(tmp, input->user_buffer, input->buffer_size);
+          uploaded_constbuf.buffer_size = input->buffer_size;
+          input = &uploaded_constbuf;
+       } else {
+diff --git a/src/gallium/drivers/radeonsi/si_pipe.h b/src/gallium/drivers/radeonsi/si_pipe.h
+--- a/src/gallium/drivers/radeonsi/si_pipe.h
++++ b/src/gallium/drivers/radeonsi/si_pipe.h
+@@ -331,6 +331,9 @@ struct si_resource {
+ struct si_transfer {
+    struct threaded_transfer b;
+    struct si_resource *staging;
++   /* osx-gpu: big-endian host; the staging's mapping and the swap unit of its format (si_texture.c). */
++   void *be_map;
++   unsigned be_unit;
+ };
+ 
+ struct si_texture {
+diff --git a/src/gallium/drivers/radeonsi/si_state.h b/src/gallium/drivers/radeonsi/si_state.h
+--- a/src/gallium/drivers/radeonsi/si_state.h
++++ b/src/gallium/drivers/radeonsi/si_state.h
+@@ -9,6 +9,8 @@
+ 
+ #include "si_pm4.h"
+ #include "util/format/u_format.h"
++#include <stdlib.h>
++#include <string.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -347,6 +349,96 @@ static inline unsigned si_sampler_and_image_descriptors_idx(unsigned shader)
+ /* This represents descriptors in memory, such as buffer resources,
+  * image resources, and sampler states.
+  */
++/*
++ * osx-gpu: on a big-endian host, the unit (in bytes) by which a format's
++ * host-order layout, the one Mesa's format code lays out and reads
++ * (u_format_table.c), differs from the GPU's little-endian one: 0 for
++ * formats with 8-bit channels and for compressed blocks, which are bytes in
++ * the same order on either, the channel for 16-, 32- and 64-bit channels,
++ * the word for packed formats. Textures keep the GPU's layout and are
++ * swapped by this unit at the CPU boundary (si_texture.c); buffers are
++ * host-order and are swapped by the shaders, which no sampler can do, so a
++ * buffer is not offered as a texture or image through a non-native format.
++ */
++static inline unsigned si_be_swap_unit(enum pipe_format format)
++{
++   const struct util_format_description *desc = util_format_description(format);
++   unsigned size = 0;
++
++   if (!UTIL_ARCH_BIG_ENDIAN)
++      return 0;
++   /*
++    * osx-gpu: the two packed float formats are not "plain", but Mesa packs
++    * them into a host-order word like any packed format (u_format_other.c,
++    * texstore), and the GPU reads a little-endian one.
++    */
++   if (format == PIPE_FORMAT_R11G11B10_FLOAT || format == PIPE_FORMAT_R9G9B9E5_FLOAT)
++      return 4;
++   if (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN)
++      return 0;
++   for (unsigned i = 0; i < desc->nr_channels; i++) {
++      if (desc->channel[i].type == UTIL_FORMAT_TYPE_VOID)
++         continue;
++      if (size && size != desc->channel[i].size)
++         return desc->block.bits > 8 ? MIN2(desc->block.bits / 8, 4) : 0;
++      size = desc->channel[i].size;
++   }
++   /*
++    * osx-gpu: a channel that is not a whole power-of-two number of bytes
++    * (5, 10, and 24 in Z24X8/X8Z24) is a field of a packed word.
++    */
++   if (size % 8 || size == 24)
++      return desc->block.bits > 8 ? MIN2(desc->block.bits / 8, 4) : 0;
++   return size > 8 ? size / 8 : 0;
++}
++
++static inline bool si_be_format_native(enum pipe_format format)
++{
++   return si_be_swap_unit(format) == 0;
++}
++
++/*
++ * osx-gpu: a plain format whose channels are not all whole bytes of one
++ * size (5_6_5, 4_4_4_4, 2_10_10_10, 24_8, ...). On a big-endian host Mesa
++ * lists the channels of these formats from the top bits down
++ * (u_format_parse.py), and the hardware was first programmed from that
++ * listing, with the channels reversed (measured: all nine of rdn_gltest
++ * -K's packed uploads came back that way), so they were withheld and the
++ * state tracker converted them on the CPU. Part six programs the hardware
++ * from the little-endian listing (ac_format_description) and the CPU's
++ * host-order words are swapped by si_be_swap_unit at the staging boundary,
++ * so they are offered; RDN_BE_PACKED=0 in the environment withholds them
++ * again.
++ */
++static inline bool si_be_withhold_packed(void)
++{
++   static int withhold = -1;
++
++   if (withhold < 0) {
++      const char *v = getenv("RDN_BE_PACKED");
++
++      withhold = v && (!strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "no"));
++   }
++   return withhold;
++}
++
++static inline bool si_be_format_packed(enum pipe_format format)
++{
++   const struct util_format_description *desc = util_format_description(format);
++   unsigned size = 0;
++
++   if (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN)
++      return false;
++   for (unsigned i = 0; i < desc->nr_channels; i++) {
++      if (desc->channel[i].type == UTIL_FORMAT_TYPE_VOID)
++         continue;
++      if ((size && size != desc->channel[i].size) || desc->channel[i].size % 8)
++         return true;
++      size = desc->channel[i].size;
++   }
++   return false;
++}
++
+ struct si_descriptors {
+    /* The list of descriptors in malloc'd memory. */
+    uint32_t *list;
+diff --git a/src/gallium/drivers/radeonsi/si_texture.c b/src/gallium/drivers/radeonsi/si_texture.c
+--- a/src/gallium/drivers/radeonsi/si_texture.c
++++ b/src/gallium/drivers/radeonsi/si_texture.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "drm-uapi/drm_fourcc.h"
++#include "util/u_math.h"
+ #include "gfx/si_gfx.h"
+ #include "si_pipe.h"
+ #include "si_query.h"
+@@ -2102,6 +2103,59 @@ static void si_texture_invalidate_storage(struct si_context *sctx, struct si_tex
+    sctx->num_alloc_tex_transfer_bytes += tex->surface.total_size;
+ }
+ 
++/*
++ * osx-gpu: on a big-endian host a texture holds the GPU's own layout,
++ * little-endian words for every format wider than bytes, so the sampler, the
++ * colour buffer and the compute blits read and write it natively. Mesa's
++ * format code and the application see the host-order layout, which exists
++ * only in the CPU's view: such a texture is always mapped through a staging
++ * texture, swapped unit by unit after the copy in and before the copy out
++ * (si_be_swap_unit, si_state.h). Measured on the W8100, 2026-11-04: Core
++ * Image's RGBA16 and float pbuffers, which the window server composites
++ * with, are what this is for.
++ */
++static void si_be_swap_box(void *map, unsigned unit, enum pipe_format format,
++                           const struct pipe_box *box, unsigned stride, unsigned layer_stride)
++{
++   unsigned rows = util_format_get_nblocksy(format, box->height);
++   unsigned bytes = util_format_get_stride(format, box->width);
++
++   for (unsigned z = 0; z < box->depth; z++) {
++      for (unsigned y = 0; y < rows; y++) {
++         char *row = (char *)map + (size_t)z * layer_stride + (size_t)y * stride;
++
++         switch (unit) {
++         case 2:
++            for (unsigned i = 0; i + 2 <= bytes; i += 2) {
++               uint16_t v;
++               memcpy(&v, row + i, 2);
++               v = util_bswap16(v);
++               memcpy(row + i, &v, 2);
++            }
++            break;
++         case 4:
++            for (unsigned i = 0; i + 4 <= bytes; i += 4) {
++               uint32_t v;
++               memcpy(&v, row + i, 4);
++               v = util_bswap32(v);
++               memcpy(row + i, &v, 4);
++            }
++            break;
++         case 8:
++            for (unsigned i = 0; i + 8 <= bytes; i += 8) {
++               uint64_t v;
++               memcpy(&v, row + i, 8);
++               v = util_bswap64(v);
++               memcpy(row + i, &v, 8);
++            }
++            break;
++         default:
++            break;
++         }
++      }
++   }
++}
++
+ static void *si_texture_transfer_map(struct pipe_context *ctx, struct pipe_resource *texture,
+                                      unsigned level, unsigned usage, const struct pipe_box *box,
+                                      struct pipe_transfer **ptransfer)
+@@ -2172,6 +2226,10 @@ static void *si_texture_transfer_map(struct pipe_context *ctx, struct pipe_resou
+       }
+    }
+ 
++   /* osx-gpu: the CPU never sees the GPU's layout of a format wider than bytes. */
++   if (si_be_swap_unit(texture->format))
++      use_staging_texture = true;
++
+    trans = CALLOC_STRUCT(si_transfer);
+    if (!trans)
+       return NULL;
+@@ -2203,6 +2261,7 @@ static void *si_texture_transfer_map(struct pipe_context *ctx, struct pipe_resou
+          goto fail_trans;
+       }
+       trans->staging = &staging->buffer;
++      trans->be_unit = si_be_swap_unit(staging->buffer.b.b.format);
+ 
+       /* Just get the strides. */
+       si_texture_get_offset(sctx->screen, staging, 0, NULL, &trans->b.b.stride,
+@@ -2230,6 +2289,13 @@ static void *si_texture_transfer_map(struct pipe_context *ctx, struct pipe_resou
+    if (!(map = si_buffer_map(sctx, buf, usage)))
+       goto fail_trans;
+ 
++   if (trans->be_unit) {
++      trans->be_map = map + offset;
++      if (usage & PIPE_MAP_READ)
++         si_be_swap_box(trans->be_map, trans->be_unit, trans->staging->b.b.format, box,
++                        trans->b.b.stride, trans->b.b.layer_stride);
++   }
++
+    *ptransfer = &trans->b.b;
+    return map + offset;
+ 
+@@ -2247,6 +2313,11 @@ static void si_texture_transfer_unmap(struct pipe_context *ctx, struct pipe_tran
+    struct pipe_resource *texture = transfer->resource;
+    struct si_texture *tex = (struct si_texture *)texture;
+ 
++   /* osx-gpu: back to the GPU's layout before the copy out (and before the mapping goes). */
++   if (stransfer->be_unit && (transfer->usage & PIPE_MAP_WRITE))
++      si_be_swap_box(stransfer->be_map, stransfer->be_unit, stransfer->staging->b.b.format,
++                     &transfer->box, transfer->stride, transfer->layer_stride);
++
+    /* Always unmap texture CPU mappings on 32-bit architectures, so that
+     * we don't run out of the CPU address space.
+     */

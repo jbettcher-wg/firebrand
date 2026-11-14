@@ -1,0 +1,259 @@
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -1002,6 +1002,15 @@
+ if with_gfx_compute
+   pre_args += '-DHAVE_GFX_COMPUTE'
+ endif
++# osx-gpu: no DRM device library behind radeonsi; ac_linux_drm takes its
++# Windows shape (types defined, every ac_drm_* call an inline stub).
++if get_option('rdn')
++  pre_args += '-DAC_NO_DRM'
++  # addrlib keeps Apple-only branches for Apple's own driver (a private
++  # header, a kernel __umoddi3); HAVE_TSERVER is its own switch to the
++  # generic code, which is what a userland Mach-O wants.
++  pre_args += '-DHAVE_TSERVER'
++endif
+ 
+ gl_pkgconfig_c_flags = []
+ with_glx_indirect_rendering = false
+@@ -1897,7 +1906,8 @@
+ 
+ _libdrm_checks = [
+   ['intel', with_gallium_i915],
+-  ['amdgpu', (with_amd_vk and not with_platform_windows) or with_gallium_radeonsi],
++  # osx-gpu: radeonsi on the rdn winsys needs no libdrm_amdgpu.
++  ['amdgpu', (with_amd_vk and not with_platform_windows) or (with_gallium_radeonsi and not get_option('rdn'))],
+ ]
+ 
+ # Loop over the enables versions and get the highest libdrm requirement for all
+@@ -2145,7 +2155,7 @@
+ endif
+ if dep_elf.found()
+   pre_args += '-DUSE_LIBELF'
+-elif with_gallium_radeonsi and with_gfx_compute
++elif with_gallium_radeonsi and with_gfx_compute and not get_option('rdn')
+   error('Gallium driver radeonsi requires libelf')
+ elif with_nouveau_vk
+   error('NVK requires libelf')
+diff --git a/src/gallium/meson.build b/src/gallium/meson.build
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -95,7 +95,9 @@
+   driver_r600 = declare_dependency()
+ endif
+ if with_gallium_radeonsi
+-  subdir('winsys/amdgpu/drm')
++  if with_radeon_drm_winsys
++    subdir('winsys/amdgpu/drm')
++  endif
+   subdir('drivers/radeonsi')
+ else
+   driver_radeonsi = declare_dependency()
+diff --git a/src/gallium/drivers/radeonsi/meson.build b/src/gallium/drivers/radeonsi/meson.build
+--- a/src/gallium/drivers/radeonsi/meson.build
++++ b/src/gallium/drivers/radeonsi/meson.build
+@@ -83,6 +83,10 @@
+ 
+ radeonsi_include_dirs = [inc_src, inc_include, inc_gallium, inc_gallium_aux, inc_amd_common,
+                          inc_gallium_drivers, inc_compiler, inc_amd, inc_amd_vpe, inc_virtio_gpu]
++# osx-gpu: xf86drm.h and libsync.h come from the rdn winsys's shim, not libdrm.
++if get_option('rdn') and not dep_libdrm.found()
++  radeonsi_include_dirs += include_directories('../../winsys/rdn/shim')
++endif
+ radeonsi_deps = [dep_clock, dep_libdrm, idep_nir_headers, idep_amd_generated_headers,
+                  idep_mesautil, idep_u_tracepoints, idep_si_tracepoints]
+ 
+@@ -186,10 +190,15 @@
+   dependencies : radeonsi_deps,
+ )
+ 
+-driver_radeonsi = declare_dependency(
+-  compile_args : ['-DGALLIUM_RADEONSI'] + libradeonsi_cflags,
+-  link_with : radeonsi_gfx_libs + [
+-    libradeonsi, libradeonwinsys, libamdgpuwinsys, amd_common_libs, libvpe, libgm, liblanczos
+-  ],
+-  dependencies : idep_nir,
+-)
++if with_radeon_drm_winsys
++  driver_radeonsi = declare_dependency(
++    compile_args : ['-DGALLIUM_RADEONSI'] + libradeonsi_cflags,
++    link_with : radeonsi_gfx_libs + [
++      libradeonsi, libradeonwinsys, libamdgpuwinsys, amd_common_libs, libvpe, libgm, liblanczos
++    ],
++    dependencies : idep_nir,
++  )
++else
++  # osx-gpu: no DRM winsys; targets/rdn links these itself.
++  driver_radeonsi = declare_dependency()
++endif
+diff --git a/src/gallium/drivers/radeonsi/si_pipe.c b/src/gallium/drivers/radeonsi/si_pipe.c
+--- a/src/gallium/drivers/radeonsi/si_pipe.c
++++ b/src/gallium/drivers/radeonsi/si_pipe.c
+@@ -190,7 +190,8 @@
+    FREE(sscreen);
+ }
+ 
+-static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
++/* osx-gpu: not static; the rdn winsys creates the screen with it (si_public.h). */
++struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
+                                                        const struct pipe_screen_config *config)
+ {
+    struct si_screen *sscreen = CALLOC_STRUCT(si_screen);
+@@ -258,6 +259,7 @@
+    return &sscreen->b;
+ }
+ 
++#ifndef AC_NO_DRM /* osx-gpu: no DRM winsys to open an fd on */
+ struct pipe_screen *radeonsi_screen_create(int fd, const struct pipe_screen_config *config)
+ {
+    struct radeon_winsys *rw = NULL;
+@@ -301,3 +303,4 @@
+    drmFreeVersion(version);
+    return rw ? rw->screen : NULL;
+ }
++#endif /* AC_NO_DRM */
+diff --git a/src/gallium/drivers/radeonsi/si_public.h b/src/gallium/drivers/radeonsi/si_public.h
+--- a/src/gallium/drivers/radeonsi/si_public.h
++++ b/src/gallium/drivers/radeonsi/si_public.h
+@@ -13,6 +13,11 @@
+ 
+ struct pipe_screen *radeonsi_screen_create(int fd, const struct pipe_screen_config *config);
+ 
++/* osx-gpu: the screen on a winsys the caller made (the rdn winsys). */
++struct radeon_winsys;
++struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
++                                                const struct pipe_screen_config *config);
++
+ bool si_virtgpu_probe_nctx(int fd, const struct virgl_renderer_capset_drm *caps);
+ 
+ #endif
+diff --git a/src/amd/common/meson.build b/src/amd/common/meson.build
+--- a/src/amd/common/meson.build
++++ b/src/amd/common/meson.build
+@@ -198,11 +198,16 @@
+   )
+ endif
+ 
+-if not with_platform_windows
++if not with_platform_windows and not get_option('rdn')
+   amd_common_files += files(
+     'ac_linux_drm.c',
+   )
+ endif
++# osx-gpu: ACO never produces an ELF, so the ELF loader is five refusals
++# instead of a libelf cross-built for the target.
++if get_option('rdn') and not dep_elf.found()
++  amd_common_files += files('../../gallium/winsys/rdn/shim/ac_rtld_stub.c')
++endif
+ 
+ link_with = [ libamdgpu_addrlib ]
+ c_args = ['-DADDR_FASTCALL=']
+@@ -229,12 +234,15 @@
+   sources : [amdgfxregs_h, sid_tables_h, amd_packet_headers]
+ )
+ 
++# osx-gpu: the rdn winsys's shim stands in for xf86drm.h.
++amd_common_inc = [inc_include, inc_src, inc_amd, inc_virtio_gpu]
++if get_option('rdn')
++  amd_common_inc += include_directories('../../gallium/winsys/rdn/shim')
++endif
+ libamd_common = static_library(
+   'amd_common',
+   [amd_common_files, gfx10_format_table_c],
+-  include_directories : [
+-    inc_include, inc_src, inc_amd, inc_virtio_gpu,
+-  ],
++  include_directories : amd_common_inc,
+   dependencies : [dep_llvm.partial_dependency(compile_args: true, includes: true)] + [
+     dep_thread, dep_elf, dep_libdrm_amdgpu, dep_valgrind,
+     idep_mesautil, idep_nir_headers, idep_nir, idep_amd_generated_headers
+diff --git a/src/amd/common/ac_linux_drm.h b/src/amd/common/ac_linux_drm.h
+--- a/src/amd/common/ac_linux_drm.h
++++ b/src/amd/common/ac_linux_drm.h
+@@ -9,7 +9,7 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+-#if !defined(_WIN32)
++#if !defined(_WIN32) && !defined(AC_NO_DRM)
+ #include "drm-uapi/amdgpu_drm.h"
+ #include "amdgpu.h"
+ #else
+@@ -318,14 +318,14 @@
+ struct amdgpu_va;
+ typedef struct amdgpu_va *amdgpu_va_handle;
+ 
+-#endif /* !defined(_WIN32) */
++#endif /* !defined(_WIN32) && !defined(AC_NO_DRM) */
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+-/* All functions are static inline stubs on Windows. */
+-#ifdef _WIN32
++/* All functions are static inline stubs on Windows (and on osx-gpu's rdn build). */
++#if defined(_WIN32) || defined(AC_NO_DRM)
+ #define __U_STUB__
+ #endif
+ #include "util/u_stub.h"
+@@ -336,7 +336,7 @@
+ struct radeon_info;
+ 
+ typedef union ac_drm_bo {
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(AC_NO_DRM)
+    void *abo;
+ #else
+    amdgpu_bo_handle abo;
+diff --git a/src/amd/common/ac_gpu_info.c b/src/amd/common/ac_gpu_info.c
+--- a/src/amd/common/ac_gpu_info.c
++++ b/src/amd/common/ac_gpu_info.c
+@@ -30,7 +30,12 @@
+ #define ASICREV_IS_MI200(r)      ASICREV_IS(r, MI200)
+ #define ASICREV_IS_GFX940(r)     ASICREV_IS(r, GFX940)
+ 
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(AC_NO_DRM)
++#include <errno.h>
++#include <string.h>
++#ifndef _WIN32
++#include <unistd.h>   /* readlink: the real one, not the stub below */
++#endif
+ static int drmGetCap(int fd, uint64_t capability, uint64_t *value)
+ {
+    return -EINVAL;
+@@ -42,14 +47,20 @@
+ {
+    return -ENODEV;
+ }
++#ifdef _WIN32
+ static intptr_t readlink(const char *path, char *buf, size_t bufsiz)
+ {
+    return -1;
+ }
++#endif
+ static char *
+ drmGetFormatModifierName(uint64_t modifier)
+ {
++#ifdef AC_NO_DRM
++   return strdup("none");   /* printed and freed by the callers */
++#else
+    return NULL;
++#endif
+ }
+ #else
+ #include <xf86drm.h>
+diff --git a/src/amd/addrlib/src/core/addrlib.cpp b/src/amd/addrlib/src/core/addrlib.cpp
+--- a/src/amd/addrlib/src/core/addrlib.cpp
++++ b/src/amd/addrlib/src/core/addrlib.cpp
+@@ -17,7 +17,7 @@
+ #include "addrlib.h"
+ #include "addrcommon.h"
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(HAVE_TSERVER)
+ 
+ UINT_32 div64_32(UINT_64 n, UINT_32 base)
+ {

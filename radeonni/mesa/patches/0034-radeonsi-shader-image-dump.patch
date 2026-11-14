@@ -1,0 +1,58 @@
+osx-gpu: RDN_SHADER_DUMP_DIR and RDN_DESC_DUMP, two debugging taps
+
+RDN_SHADER_DUMP_DIR=<dir> writes every uploaded shader image as the GPU sees
+it, little-endian instruction words (this build has no GCN disassembler: ACO
+uses LLVM's for GFX7 and there is no LLVM here). RDN_DESC_DUMP=1 prints
+every uploaded descriptor list in host-order words, for comparing a T# or S#
+with a hand-built one (tools/guest/gcndraw).
+
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_shader_binary.c b/src/gallium/drivers/radeonsi/gfx/si_shader_binary.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_shader_binary.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_shader_binary.c
+@@ -319,6 +319,25 @@
+       }
+    }
+ 
++   /*
++    * osx-gpu: RDN_SHADER_DUMP_DIR=<dir> writes every uploaded shader image
++    * as the GPU will see it, for disassembly on the host (llvm-mc), since
++    * this build has no disassembler of its own.
++    */
++   const char *dump_dir = getenv("RDN_SHADER_DUMP_DIR");
++   if (dump_dir) {
++      static unsigned dump_n;
++      char path[1024];
++
++      snprintf(path, sizeof(path), "%s/%03u-%s-%u.bin", dump_dir, dump_n++,
++               _mesa_shader_stage_to_abbrev(shader->selector->stage), code_size);
++      FILE *f = fopen(path, "wb");
++      if (f) {
++         fwrite(rx_ptr, 1, code_size, f);
++         fclose(f);
++      }
++   }
++
+    post_upload_binary(sscreen, shader, rx_ptr, code_size, code_size, dma_upload,
+                       upload_ctx, staging, staging_offset);
+    return code_size;
+diff --git a/src/gallium/drivers/radeonsi/si_descriptors.c b/src/gallium/drivers/radeonsi/si_descriptors.c
+--- a/src/gallium/drivers/radeonsi/si_descriptors.c
++++ b/src/gallium/drivers/radeonsi/si_descriptors.c
+@@ -119,6 +119,17 @@
+    buffer_offset -= first_slot_offset;
+    desc->gpu_address = desc->buffer->gpu_address + buffer_offset;
+ 
++   /* osx-gpu: RDN_DESC_DUMP=1 prints every uploaded descriptor list, host-order words. */
++   if (getenv("RDN_DESC_DUMP")) {
++      const uint32_t *w = (const uint32_t *)((char *)desc->list + first_slot_offset);
++      unsigned n = upload_size / 4, per = desc->element_dw_size;
++
++      fprintf(stderr, "desc list: gpu 0x%llx + 0x%x, %u dw, %u dw per element\n",
++              (unsigned long long)desc->gpu_address, first_slot_offset, n, per);
++      for (unsigned i = 0; i < n; i++)
++         fprintf(stderr, "%s%08x%s", (i % 8) ? " " : "  ", w[i], ((i % 8) == 7 || i + 1 == n) ? "\n" : "");
++   }
++
+    assert(desc->buffer->flags & RADEON_FLAG_32BIT);
+    assert((desc->buffer->gpu_address >> 32) == sctx->screen->info.address32_hi);
+    assert((desc->gpu_address >> 32) == sctx->screen->info.address32_hi);

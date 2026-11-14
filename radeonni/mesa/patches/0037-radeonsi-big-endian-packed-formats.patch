@@ -1,0 +1,348 @@
+osx-gpu: radeonsi on a big-endian host, part six: packed formats from their little-endian listing
+
+On a big-endian host u_format_parse.py lists the channels of a bitmask
+format (5_6_5, 4_4_4_4, 1_5_5_5, 2_10_10_10, 24_8: plain, not an array,
+16 or 32 bits of unsigned or signed fields) from the top bits down and
+remaps its swizzle to match; the shifts are numbered from the other end, so
+each channel keeps its bits and Mesa's packed word means on a big-endian
+host what it means on a little-endian one. radeonsi and ac_formats chose
+the hardware data format, colour format, number type, component swap and
+descriptor swizzle from that listing, channel by channel: B5G5R5A1 became
+1_5_5_5 instead of 5_5_5_1, B5G6R5 got its red and blue swapped,
+R10G10B10A2 had a 2-bit first channel and was no data format at all, and
+Z24_UNORM_S8_UINT got the colour format 24_8 instead of 8_24 for the
+depth-to-colour copies. That was the "two halves disagree" of part one,
+whose answer was to withhold the formats. r600 had the same fault
+(mesa/patches/0006).
+
+ac_format_description() returns the little-endian listing for those
+formats (built once from Mesa's table; identical to util_format_description
+everywhere else and on a little-endian host), and every place that programs
+the hardware from a format's channels or swizzle uses it: ac_formats.c
+(colour format, number type, component swap, alpha position), the texture,
+buffer and colour-buffer descriptors (ac_descriptors.c), and radeonsi's
+sampler and vertex format checks, sampler-view swizzles, vertex elements
+and DCC format compatibility. The CPU side needed nothing new: a packed
+format is a host-order word in Mesa (texstore, u_format_table.c,
+u_format_other.c, GL's packed client types) and the staging copy swaps it
+by its whole word (si_be_swap_unit, part two). With both halves agreeing,
+the formats are offered (RDN_BE_PACKED=0 withholds them as before) and
+Mesa computes OpenGL 3.3 for Southern and Sea Islands instead of 2.1:
+ARB_depth_buffer_float (Z32_FLOAT_S8X24_UINT), ARB_texture_rgb10_a2ui and
+ARB_vertex_type_2_10_10_10_rev were the three it lacked, and 5_6_5,
+4_4_4_4, 5_5_5_1, 10_10_10_2, 24_8 and 10F_11F_11F textures and render
+targets are now the hardware's own instead of being converted to RGBA8 on
+the CPU. tools/guest/begl33test checks each against the expected texels.
+
+diff --git a/src/amd/common/ac_descriptors.c b/src/amd/common/ac_descriptors.c
+--- a/src/amd/common/ac_descriptors.c
++++ b/src/amd/common/ac_descriptors.c
+@@ -399,14 +399,14 @@ ac_build_fmask_descriptor(const enum amd_gfx_level gfx_level, const struct ac_fm
+ static void
+ ac_build_gfx6_texture_descriptor(const struct radeon_info *info, const struct ac_texture_state *state, uint32_t desc[8])
+ {
+-   const struct util_format_description *fmt_desc = util_format_description(state->format);
++   const struct util_format_description *fmt_desc = ac_format_description(state->format);
+    uint32_t num_format, data_format, num_samples;
+    int first_non_void;
+ 
+    num_samples = fmt_desc->colorspace == UTIL_FORMAT_COLORSPACE_ZS ? MAX2(1, state->num_samples)
+                                                                    : MAX2(1, state->num_storage_samples);
+ 
+-   first_non_void = util_format_get_first_non_void_channel(state->format);
++   first_non_void = ac_format_first_non_void_channel(state->format);
+ 
+    num_format = ac_translate_tex_numformat(fmt_desc, first_non_void);
+ 
+@@ -485,7 +485,7 @@ static uint32_t
+ ac_get_gfx10_img_format(const enum amd_gfx_level gfx_level, const struct ac_texture_state *state)
+ {
+    const struct gfx10_format *fmt = &ac_get_gfx10_format_table(gfx_level)[state->format];
+-   const struct util_format_description *desc = util_format_description(state->format);
++   const struct util_format_description *desc = ac_format_description(state->format);
+    uint32_t img_format = fmt->img_format;
+ 
+    if (desc->colorspace == UTIL_FORMAT_COLORSPACE_ZS &&
+@@ -506,7 +506,7 @@ static void
+ ac_build_gfx10_texture_descriptor(const struct radeon_info *info, const struct ac_texture_state *state, uint32_t desc[8])
+ {
+    const struct radeon_surf *surf = state->surf;
+-   const struct util_format_description *fmt_desc = util_format_description(state->format);
++   const struct util_format_description *fmt_desc = ac_format_description(state->format);
+    const uint32_t img_format = ac_get_gfx10_img_format(info->gfx_level, state);
+    const struct ac_surf_nbc_view *nbc_view = state->gfx10.nbc_view;
+    uint32_t num_samples;
+@@ -569,7 +569,7 @@ static void
+ ac_build_gfx12_texture_descriptor(const struct radeon_info *info, const struct ac_texture_state *state, uint32_t desc[8])
+ {
+    const struct radeon_surf *surf = state->surf;
+-   const struct util_format_description *fmt_desc = util_format_description(state->format);
++   const struct util_format_description *fmt_desc = ac_format_description(state->format);
+    const uint32_t img_format = ac_get_gfx10_img_format(info->gfx_level, state);
+    const uint32_t field_last_level = state->num_samples > 1 ? util_logbase2(state->num_samples) : state->last_level;
+    const bool no_edge_clamp = state->num_levels > 1 && util_format_is_compressed(state->img_format) &&
+@@ -851,8 +851,8 @@ ac_set_buf_desc_word3(const enum amd_gfx_level gfx_level, const struct ac_buffer
+                         S_008F0C_WRITE_COMPRESS_ENABLE(state->gfx12.write_compress_enable);
+       }
+    } else {
+-      const struct util_format_description * desc =  util_format_description(state->format);
+-      const int first_non_void = util_format_get_first_non_void_channel(state->format);
++      const struct util_format_description * desc =  ac_format_description(state->format);
++      const int first_non_void = ac_format_first_non_void_channel(state->format);
+       const uint32_t num_format = ac_translate_buffer_numformat(desc, first_non_void);
+ 
+       /* DATA_FORMAT is STRIDE[14:17] for MUBUF with ADD_TID_ENABLE=1 */
+@@ -1391,7 +1391,7 @@ ac_init_gfx12_cb_surface(const struct radeon_info *info, const struct ac_cb_stat
+ void
+ ac_init_cb_surface(const struct radeon_info *info, const struct ac_cb_state *state, struct ac_cb_surface *cb)
+ {
+-   const struct util_format_description *desc = util_format_description(state->format);
++   const struct util_format_description *desc = ac_format_description(state->format);
+    const uint32_t cb_format = ac_get_cb_format(info->gfx_level, state->format);
+    const struct radeon_surf *surf = state->surf;
+    uint32_t width = state->width;
+diff --git a/src/amd/common/ac_formats.c b/src/amd/common/ac_formats.c
+--- a/src/amd/common/ac_formats.c
++++ b/src/amd/common/ac_formats.c
+@@ -10,6 +10,73 @@
+ #include "ac_gpu_info.h"
+ 
+ #include "amdgfxregs.h"
++#include "util/u_call_once.h"
++#include "util/u_endian.h"
++
++#if UTIL_ARCH_BIG_ENDIAN
++/*
++ * osx-gpu: little-endian listings of the bitmask formats (5_6_5, 4_4_4_4,
++ * 1_5_5_5, 2_10_10_10, 24_8, ...). u_format_parse.py reverses their
++ * channels and remaps their swizzles on a big-endian host and numbers the
++ * shifts from the other end, so each channel keeps its bits; undo the
++ * reversal so that channel 0 is the lowest bits again, as the hardware
++ * tables (and every caller below) expect. r600 needed the same
++ * (mesa/patches/0006).
++ */
++static struct util_format_description ac_le_formats[PIPE_FORMAT_COUNT];
++static util_once_flag ac_le_formats_once = UTIL_ONCE_FLAG_INIT;
++
++static void
++ac_le_formats_init(void)
++{
++   for (unsigned f = 0; f < PIPE_FORMAT_COUNT; f++) {
++      const struct util_format_description *desc = util_format_description(f);
++      struct util_format_description *le = &ac_le_formats[f];
++      unsigned n = 0;
++
++      if (!desc)
++         continue;
++      *le = *desc;
++      if (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || !desc->is_bitmask || desc->is_array)
++         continue;
++      for (unsigned i = 0; i < 4; i++)
++         if (desc->channel[i].size)
++            n++;
++      for (unsigned i = 0; i < n; i++)
++         le->channel[i] = desc->channel[n - 1 - i];
++      for (unsigned i = 0; i < 4; i++)
++         if (desc->swizzle[i] <= PIPE_SWIZZLE_W && desc->swizzle[i] < n)
++            le->swizzle[i] = n - 1 - desc->swizzle[i];
++   }
++}
++#endif
++
++const struct util_format_description *
++ac_format_description(enum pipe_format format)
++{
++   const struct util_format_description *desc = util_format_description(format);
++
++#if UTIL_ARCH_BIG_ENDIAN
++   if (desc && desc->layout == UTIL_FORMAT_LAYOUT_PLAIN && desc->is_bitmask && !desc->is_array) {
++      util_call_once(&ac_le_formats_once, ac_le_formats_init);
++      return &ac_le_formats[format];
++   }
++#endif
++   return desc;
++}
++
++int
++ac_format_first_non_void_channel(enum pipe_format format)
++{
++   const struct util_format_description *desc = ac_format_description(format);
++
++   if (!desc)
++      return -1;
++   for (unsigned i = 0; i < 4; i++)
++      if (desc->channel[i].type != UTIL_FORMAT_TYPE_VOID)
++         return i;
++   return -1;
++}
+ 
+ uint32_t
+ ac_translate_buffer_numformat(const struct util_format_description *desc,
+@@ -447,7 +514,7 @@ ac_translate_tex_dataformat(const struct radeon_info *info,
+ unsigned
+ ac_get_cb_format(enum amd_gfx_level gfx_level, enum pipe_format format)
+ {
+-   const struct util_format_description *desc = util_format_description(format);
++   const struct util_format_description *desc = ac_format_description(format);
+ 
+ #define HAS_SIZE(x, y, z, w)                                                                       \
+    (desc->channel[0].size == (x) && desc->channel[1].size == (y) &&                                \
+@@ -468,7 +535,7 @@ ac_get_cb_format(enum amd_gfx_level gfx_level, enum pipe_format format)
+    if (desc->is_mixed && desc->colorspace != UTIL_FORMAT_COLORSPACE_ZS)
+       return V_028C70_COLOR_INVALID;
+ 
+-   int first_non_void = util_format_get_first_non_void_channel(format);
++   int first_non_void = ac_format_first_non_void_channel(format);
+ 
+    /* Reject SCALED formats because we don't implement them for CB. */
+    if (first_non_void >= 0 && first_non_void <= 3 &&
+@@ -544,8 +611,8 @@ ac_get_cb_format(enum amd_gfx_level gfx_level, enum pipe_format format)
+ 
+ unsigned ac_get_cb_number_type(enum pipe_format format)
+ {
+-   const struct util_format_description *desc = util_format_description(format);
+-   int chan = util_format_get_first_non_void_channel(format);
++   const struct util_format_description *desc = ac_format_description(format);
++   int chan = ac_format_first_non_void_channel(format);
+ 
+    if (chan == -1 || desc->channel[chan].type == UTIL_FORMAT_TYPE_FLOAT) {
+       return V_028C70_NUMBER_FLOAT;
+@@ -565,7 +632,7 @@ unsigned ac_get_cb_number_type(enum pipe_format format)
+ unsigned
+ ac_translate_colorswap(enum amd_gfx_level gfx_level, enum pipe_format format, bool do_endian_swap)
+ {
+-   const struct util_format_description *desc = util_format_description(format);
++   const struct util_format_description *desc = ac_format_description(format);
+ 
+ #define HAS_SWIZZLE(chan, swz) (desc->swizzle[chan] == PIPE_SWIZZLE_##swz)
+ 
+@@ -732,7 +799,7 @@ ac_alpha_is_on_msb(const struct radeon_info *info, enum pipe_format format)
+       return false;
+ 
+    format = ac_simplify_cb_format(format);
+-   const struct util_format_description *desc = util_format_description(format);
++   const struct util_format_description *desc = ac_format_description(format);
+    unsigned comp_swap = ac_translate_colorswap(info->gfx_level, format, false);
+ 
+    /* The following code matches the hw behavior. */
+@@ -758,7 +825,7 @@ bool
+ ac_is_reduction_mode_supported(const struct radeon_info *info, enum pipe_format format,
+                                bool shadow_samplers)
+ {
+-   const struct util_format_description *desc = util_format_description(format);
++   const struct util_format_description *desc = ac_format_description(format);
+ 
+    if (info->gfx_level <= GFX8) {
+       /* old HW limitations */
+diff --git a/src/amd/common/ac_formats.h b/src/amd/common/ac_formats.h
+--- a/src/amd/common/ac_formats.h
++++ b/src/amd/common/ac_formats.h
+@@ -16,6 +16,21 @@
+ extern "C" {
+ #endif
+ 
++/*
++ * osx-gpu: the description the hardware is programmed from. On a big-endian
++ * host Mesa lists a bitmask format's channels from the top bits down
++ * (u_format_parse.py; the shifts are the same as on little-endian), so the
++ * channel order and swizzle that pick a data format, a colour format and a
++ * component swap must come from the little-endian listing. Identical to
++ * util_format_description() on a little-endian host and for every other
++ * format.
++ */
++const struct util_format_description *
++ac_format_description(enum pipe_format format);
++
++int
++ac_format_first_non_void_channel(enum pipe_format format);
++
+ uint32_t
+ ac_translate_buffer_numformat(const struct util_format_description *desc,
+                               int first_non_void);
+diff --git a/src/gallium/drivers/radeonsi/si_state.c b/src/gallium/drivers/radeonsi/si_state.c
+--- a/src/gallium/drivers/radeonsi/si_state.c
++++ b/src/gallium/drivers/radeonsi/si_state.c
+@@ -2034,7 +2034,8 @@ static unsigned si_tex_dim(struct si_screen *sscreen, struct si_texture *tex, un
+ static bool si_is_sampler_format_supported(struct pipe_screen *screen, enum pipe_format format)
+ {
+    struct si_screen *sscreen = (struct si_screen *)screen;
+-   const struct util_format_description *desc = util_format_description(format);
++   /* osx-gpu: the little-endian listing on a big-endian host (ac_formats.h). */
++   const struct util_format_description *desc = ac_format_description(format);
+ 
+    /* Samplers don't support 64 bits per channel. */
+    if (desc->layout == UTIL_FORMAT_LAYOUT_PLAIN &&
+@@ -2052,7 +2053,7 @@ static bool si_is_sampler_format_supported(struct pipe_screen *screen, enum pipe
+       return true;
+    }
+ 
+-   const int first_non_void =  util_format_get_first_non_void_channel(format);
++   const int first_non_void =  ac_format_first_non_void_channel(format);
+ 
+    if (si_translate_texformat(screen, format, desc, first_non_void) == ~0U)
+       return false;
+@@ -2135,7 +2136,11 @@ static unsigned si_is_vertex_format_supported(struct pipe_screen *screen, enum p
+    assert((usage & ~(PIPE_BIND_SHADER_IMAGE | PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_VERTEX_BUFFER)) ==
+           0);
+ 
+-   desc = util_format_description(format);
++   desc = ac_format_description(format);
++
++   /* osx-gpu: as for samplers, with RDN_BE_PACKED=0 (si_state.h). */
++   if (UTIL_ARCH_BIG_ENDIAN && si_be_withhold_packed() && si_be_format_packed(format))
++      return 0;
+ 
+    /* There are no native 8_8_8 or 16_16_16 data formats, and we currently
+     * select 8_8_8_8 and 16_16_16_16 instead. This works reasonably well
+@@ -2162,7 +2167,7 @@ static unsigned si_is_vertex_format_supported(struct pipe_screen *screen, enum p
+       return usage;
+    }
+ 
+-   first_non_void = util_format_get_first_non_void_channel(format);
++   first_non_void = ac_format_first_non_void_channel(format);
+    data_format = si_translate_buffer_dataformat(screen, desc, first_non_void);
+    if (data_format == V_008F0C_BUF_DATA_FORMAT_INVALID)
+       return 0;
+@@ -3665,7 +3670,7 @@ static void gfx10_make_texture_descriptor(
+    unsigned char swizzle[4];
+    unsigned type;
+ 
+-   desc = util_format_description(pipe_format);
++   desc = ac_format_description(pipe_format);
+ 
+    if (desc->colorspace == UTIL_FORMAT_COLORSPACE_ZS) {
+       const unsigned char swizzle_xxxx[4] = {0, 0, 0, 0};
+@@ -3792,7 +3797,7 @@ void si_make_texture_descriptor(struct si_screen *screen, struct si_texture *tex
+    unsigned char swizzle[4];
+    unsigned type, num_samples;
+ 
+-   desc = util_format_description(pipe_format);
++   desc = ac_format_description(pipe_format);
+ 
+    num_samples = desc->colorspace == UTIL_FORMAT_COLORSPACE_ZS ? MAX2(1, res->nr_samples)
+                                                                : MAX2(1, res->nr_storage_samples);
+@@ -4337,8 +4342,8 @@ static void *si_create_vertex_elements(struct pipe_context *ctx, unsigned count,
+          }
+       }
+ 
+-      desc = util_format_description(elements[i].src_format);
+-      first_non_void = util_format_get_first_non_void_channel(elements[i].src_format);
++      desc = ac_format_description(elements[i].src_format);
++      first_non_void = ac_format_first_non_void_channel(elements[i].src_format);
+       channel = first_non_void >= 0 ? &desc->channel[first_non_void] : NULL;
+ 
+       v->elem[i].format_size = desc->block.bits / 8;
+diff --git a/src/gallium/drivers/radeonsi/si_texture.c b/src/gallium/drivers/radeonsi/si_texture.c
+--- a/src/gallium/drivers/radeonsi/si_texture.c
++++ b/src/gallium/drivers/radeonsi/si_texture.c
+@@ -2379,8 +2379,8 @@ bool vi_dcc_formats_compatible(struct si_screen *sscreen, enum pipe_format forma
+    if (format1 == format2)
+       return true;
+ 
+-   desc1 = util_format_description(format1);
+-   desc2 = util_format_description(format2);
++   desc1 = ac_format_description(format1);
++   desc2 = ac_format_description(format2);
+ 
+    if (desc1->layout != UTIL_FORMAT_LAYOUT_PLAIN || desc2->layout != UTIL_FORMAT_LAYOUT_PLAIN)
+       return false;

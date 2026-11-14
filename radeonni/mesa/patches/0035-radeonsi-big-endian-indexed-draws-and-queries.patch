@@ -1,0 +1,219 @@
+osx-gpu: radeonsi on a big-endian host, part three: indexed draws, queries, and buffer clears
+
+1. VGT_INDEX_TYPE (si_state_draw.cpp): V_028A7C_VGT_DMA_SWAP_16_BIT (1) and
+   V_028A7C_VGT_DMA_SWAP_32_BIT (2) in amdgfxregs.h are unshifted field
+   values for S_028A7C_SWAP_MODE [3:2], unlike r600d.h where VGT_DMA_SWAP_*
+   already carried (x << 2). ORing them raw into index_type overwrote
+   INDEX_TYPE [1:0] (turning u16 into unswapped u32 and u32 into invalid 3),
+   causing every glDrawElements call on GFX6-7 big-endian to draw zero pixels.
+2. ubyte_to_ushort (si_shaderlib_nir.c): internal shaders skip
+   si_nir_lower_be_memory, so widen GL_UNSIGNED_BYTE indices to big-endian
+   uint16_t (shifted left by 8) on GFX6-7 big-endian to match
+   VGT_DMA_SWAP_16_BIT.
+3. Hardware and QBO queries (si_query.c, si_shaderlib_nir.c): the GPU writes
+   little-endian query dwords; convert CPU reads/writes and QBO constants/SSBO
+   results between little-endian and host byte order.
+4. Buffer clears (si_compute_blit.c): byte-swap application host-order clear
+   values in si_pipe_clear_buffer before GPU clear while leaving internal
+   scalar metadata clears untouched.
+
+diff --git a/src/gallium/drivers/radeonsi/si_state_draw.cpp b/src/gallium/drivers/radeonsi/si_state_draw.cpp
+--- a/src/gallium/drivers/radeonsi/si_state_draw.cpp
++++ b/src/gallium/drivers/radeonsi/si_state_draw.cpp
+@@ -1509,8 +1509,8 @@
+ 
+          if (GFX_VERSION <= GFX7 && UTIL_ARCH_BIG_ENDIAN) {
+             /* GFX7 doesn't support ubyte indices. */
+-            index_type |= index_size == 2 ? V_028A7C_VGT_DMA_SWAP_16_BIT
+-                                          : V_028A7C_VGT_DMA_SWAP_32_BIT;
++            index_type |= S_028A7C_SWAP_MODE(index_size == 2 ? V_028A7C_VGT_DMA_SWAP_16_BIT
++                                                             : V_028A7C_VGT_DMA_SWAP_32_BIT);
+          }
+ 
+          if (GFX_VERSION >= GFX9) {
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c b/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c
+@@ -9,10 +9,12 @@
+ #include "ac_nir_surface.h"
+ #include "si_pipe.h"
+ #include "si_query.h"
++#include "si_shader_internal.h"
+ #include "aco_interface.h"
+ #include "nir_builder.h"
+ #include "ac_nir_helpers.h"
+ #include "nir/nir_serialize.h"
++#include "util/u_endian.h"
+ 
+ void *si_create_shader_state(struct si_context *sctx, nir_shader *nir)
+ {
+@@ -248,7 +250,10 @@
+ 
+    nir_def *ubyte_value = nir_load_ssbo(&b, 1, 8, nir_imm_int(&b, 1),
+                                         load_address, .access = ACCESS_RESTRICT);
+-   nir_store_ssbo(&b, nir_u2u16(&b, ubyte_value), nir_imm_int(&b, 0),
++   nir_def *ushort_value = nir_u2u16(&b, ubyte_value);
++   if (UTIL_ARCH_BIG_ENDIAN && sctx->gfx_level <= GFX7)
++      ushort_value = nir_ishl_imm(&b, ushort_value, 8);
++   nir_store_ssbo(&b, ushort_value, nir_imm_int(&b, 0),
+                   store_address, .access = ACCESS_RESTRICT);
+ 
+    return si_create_shader_state(sctx, b.shader);
+@@ -646,7 +651,9 @@
+        */
+       nir_def *is_result_available = nir_i2b(&b, nir_iand(&b, b0_bitfield, four));
+       nir_if *if_result_available = nir_push_if(&b, is_result_available); {
+-         nir_store_ssbo(&b, nir_iand(&b, nir_inot(&b, z_value), one), two, zero);
++         nir_def *avail = nir_iand(&b, nir_inot(&b, z_value), one);
++         if (UTIL_ARCH_BIG_ENDIAN)
++            avail = si_nir_be_swap(&b, avail);
+ 
+          /* Store full 64 bits result.
+           *    if (b0_bitfield & (1u << 6)) {
+@@ -655,8 +662,12 @@
+           */
+          nir_def *is_result_64_bits = nir_i2b(&b, nir_iand(&b, b0_bitfield, sixty_four));
+          nir_if *if_result_64_bits = nir_push_if(&b, is_result_64_bits); {
+-            nir_store_ssbo(&b, nir_imm_ivec2(&b, 0, 0), two, zero,
+-                           .write_mask = (1u << 1));
++            if (UTIL_ARCH_BIG_ENDIAN)
++               nir_store_ssbo(&b, nir_vec2(&b, zero, avail), two, zero);
++            else
++               nir_store_ssbo(&b, nir_vec2(&b, avail, zero), two, zero);
++         } nir_push_else(&b, if_result_64_bits); {
++            nir_store_ssbo(&b, avail, two, zero);
+          }
+          nir_pop_if(&b, if_result_64_bits);
+       } nir_push_else(&b, if_result_available); {
+@@ -714,7 +725,10 @@
+              */
+             nir_def *is_result_64_bits = nir_i2b(&b, nir_iand(&b, b0_bitfield, sixty_four));
+             nir_if *if_result_64_bits = nir_push_if(&b, is_result_64_bits); {
+-               nir_store_ssbo(&b, nir_vec2(&b, nx, ny), two, zero);
++               if (UTIL_ARCH_BIG_ENDIAN)
++                  nir_store_ssbo(&b, nir_vec2(&b, si_nir_be_swap(&b, ny), si_nir_be_swap(&b, nx)), two, zero);
++               else
++                  nir_store_ssbo(&b, nir_vec2(&b, nx, ny), two, zero);
+             } nir_push_else(&b, if_result_64_bits); {
+ 
+                /* Clamping.
+@@ -729,6 +743,8 @@
+                nir_def *is_signed_32bit_result = nir_i2b(&b, nir_iand_imm(&b, b0_bitfield, 128));
+                nir_def *min = nir_umin(&b, nx, nir_imm_int(&b, INT_MAX));
+                nx = nir_bcsel(&b, is_signed_32bit_result, min, nx);
++               if (UTIL_ARCH_BIG_ENDIAN)
++                  nx = si_nir_be_swap(&b, nx);
+                nir_store_ssbo(&b, nx, two, zero);
+             }
+             nir_pop_if(&b, if_result_64_bits);
+diff --git a/src/gallium/drivers/radeonsi/si_query.c b/src/gallium/drivers/radeonsi/si_query.c
+--- a/src/gallium/drivers/radeonsi/si_query.c
++++ b/src/gallium/drivers/radeonsi/si_query.c
+@@ -14,6 +14,7 @@
+ #include "si_pipe.h"
+ #include "ac_cmdbuf_cp.h"
+ #include "util/os_time.h"
++#include "util/u_endian.h"
+ #include "util/u_memory.h"
+ #include "util/u_suballoc.h"
+ #include "util/u_upload_mgr.h"
+@@ -599,8 +600,8 @@
+       for (j = 0; j < num_results; j++) {
+          for (i = 0; i < max_rbs; i++) {
+             if (!(enabled_rb_mask & (1ull << i))) {
+-               results[(i * 4) + 1] = 0x80000000;
+-               results[(i * 4) + 3] = 0x80000000;
++               results[(i * 4) + 1] = util_cpu_to_le32(0x80000000);
++               results[(i * 4) + 3] = util_cpu_to_le32(0x80000000);
+             }
+          }
+          results += 4 * max_rbs;
+@@ -1360,8 +1361,10 @@
+    uint32_t *current_result = (uint32_t *)map;
+    uint64_t start, end;
+ 
+-   start = (uint64_t)current_result[start_index] | (uint64_t)current_result[start_index + 1] << 32;
+-   end = (uint64_t)current_result[end_index] | (uint64_t)current_result[end_index + 1] << 32;
++   start = (uint64_t)util_le32_to_cpu(current_result[start_index]) |
++           (uint64_t)util_le32_to_cpu(current_result[start_index + 1]) << 32;
++   end = (uint64_t)util_le32_to_cpu(current_result[end_index]) |
++         (uint64_t)util_le32_to_cpu(current_result[end_index + 1]) << 32;
+ 
+    if (!test_status_bit || ((start & BITFIELD64_BIT(63)) && (end & BITFIELD64_BIT(63)))) {
+       return end - start;
+@@ -1394,7 +1397,8 @@
+       result->u64 += si_query_read_result(buffer, 0, 2, false);
+       break;
+    case PIPE_QUERY_TIMESTAMP:
+-      result->u64 = *(uint64_t *)buffer;
++      result->u64 = (uint64_t)util_le32_to_cpu(((uint32_t *)buffer)[0]) |
++                    (uint64_t)util_le32_to_cpu(((uint32_t *)buffer)[1]) << 32;
+       break;
+    case PIPE_QUERY_PRIMITIVES_EMITTED:
+       /* SAMPLE_STREAMOUTSTATS stores this structure:
+@@ -1546,7 +1550,7 @@
+       uint32_t fence_offset;
+       uint32_t pair_stride;
+       uint32_t pair_count;
+-   } consts;
++   } consts, le_consts;
+ 
+    if (!sctx->query_result_shader) {
+       sctx->query_result_shader = si_create_query_result_cs(sctx);
+@@ -1569,8 +1573,8 @@
+    consts.pair_stride = params.pair_stride;
+    consts.pair_count = params.pair_count;
+ 
+-   constant_buffer.buffer_size = sizeof(consts);
+-   constant_buffer.user_buffer = &consts;
++   constant_buffer.buffer_size = sizeof(le_consts);
++   constant_buffer.user_buffer = &le_consts;
+ 
+    ssbo[1].buffer = tmp_buffer;
+    ssbo[1].buffer_offset = tmp_buffer_offset;
+@@ -1629,6 +1633,13 @@
+          params.start_offset += qbuf->results_end - query->result_size;
+       }
+ 
++      le_consts.end_offset = util_cpu_to_le32(consts.end_offset);
++      le_consts.result_stride = util_cpu_to_le32(consts.result_stride);
++      le_consts.result_count = util_cpu_to_le32(consts.result_count);
++      le_consts.config = util_cpu_to_le32(consts.config);
++      le_consts.fence_offset = util_cpu_to_le32(consts.fence_offset);
++      le_consts.pair_stride = util_cpu_to_le32(consts.pair_stride);
++      le_consts.pair_count = util_cpu_to_le32(consts.pair_count);
+       sctx->b.set_constant_buffer(&sctx->b, MESA_SHADER_COMPUTE, 0, &constant_buffer);
+ 
+       ssbo[0].buffer = &qbuf->buf->b.b;
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_compute_blit.c b/src/gallium/drivers/radeonsi/gfx/si_compute_blit.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_compute_blit.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_compute_blit.c
+@@ -8,6 +8,7 @@
+ #include "util/format/u_format.h"
+ #include "util/format_srgb.h"
+ #include "util/hash_table.h"
++#include "util/u_endian.h"
+ #include "ac_nir_meta.h"
+ 
+ static void si_compute_begin_internal(struct si_context *sctx, bool render_condition_enabled)
+@@ -220,6 +221,20 @@
+                                  int clear_value_size)
+ {
+    struct si_context *sctx = (struct si_context *)ctx;
++   uint32_t swapped[4];
++
++   if (UTIL_ARCH_BIG_ENDIAN && clear_value && clear_value_size > 1 &&
++       (unsigned)clear_value_size <= sizeof(swapped)) {
++      memcpy(swapped, clear_value, clear_value_size);
++      if (clear_value_size == 2) {
++         uint16_t *v16 = (uint16_t *)swapped;
++         v16[0] = util_bswap16(v16[0]);
++      } else {
++         for (int i = 0; i < clear_value_size / 4; i++)
++            swapped[i] = util_bswap32(swapped[i]);
++      }
++      clear_value = swapped;
++   }
+ 
+    si_barrier_before_simple_buffer_op(sctx, 0, dst, NULL);
+    si_clear_buffer(sctx, dst, offset, size, (uint32_t *)clear_value, clear_value_size,

@@ -1,0 +1,209 @@
+osx-gpu: radeonsi on a big-endian host, part one: Mesa's memory layout and the GPU's
+
+Two kinds of memory. A buffer is host-order (vertex data, uniforms, index
+and storage buffers, as the application wrote them): every vertex fetch is
+open-coded and swapped per element size, the shaders swap what they load
+(part two), and a buffer is not offered as a texture or image through a
+format wider than bytes, which no sampler could swap. A texture keeps the
+GPU's own little-endian layout, so the colour buffer's ENDIAN field is
+never used (the r600-era table swapped 8_8_8_8 whole and reversed every
+clear and readback), the sampler and the compute blits read and write every
+format natively, and the host-order layout Mesa's format code expects
+(u_format_table.c) exists only in the CPU's view, which part two swaps at
+the staging boundary. Formats with 8-bit channels are the same bytes in
+either layout, which is why the first frames needed none of this; packed
+formats (5_6_5, 4_4_4_4, 2_10_10_10) were at first not offered to the
+sampler and the state tracker converted them on the CPU. Since part six
+(the little-endian listing of the bitmask formats) they are offered;
+RDN_BE_PACKED=0 withholds them again.
+Measured on the W8100, 2026-11-04.
+
+diff --git a/src/gallium/drivers/radeonsi/si_pipe.c b/src/gallium/drivers/radeonsi/si_pipe.c
+--- a/src/gallium/drivers/radeonsi/si_pipe.c
++++ b/src/gallium/drivers/radeonsi/si_pipe.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "si_pipe.h"
++#include "util/u_endian.h"
+ #include "gfx/si_gfx.h"
+ #include "mm/si_mm.h"
+ #include "tests/si_tests.h"
+@@ -207,6 +208,15 @@
+    sscreen->options.name = driQueryOptioni(config->options, "radeonsi_" #name);
+ #include "si_debug_options.h"
+    }
++   if (UTIL_ARCH_BIG_ENDIAN) {
++      /*
++       * osx-gpu: vertex data is host-order in memory (Mesa's big-endian
++       * convention, which r600 served with hardware swaps GCN does not have);
++       * the open-coded fetch loads raw words and swaps them per element
++       * (si_nir_lower_vs_inputs.c).
++       */
++      sscreen->options.vs_fetch_always_opencode = true;
++   }
+ 
+    sscreen->ws = ws;
+    ws->query_info(ws, &sscreen->info);
+diff --git a/src/gallium/drivers/radeonsi/si_state.c b/src/gallium/drivers/radeonsi/si_state.c
+--- a/src/gallium/drivers/radeonsi/si_state.c
++++ b/src/gallium/drivers/radeonsi/si_state.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "si_build_pm4.h"
++#include "util/u_endian.h"
+ #include "si_query.h"
+ #include "gfx/si_gfx.h"
+ #include "gfx/si_shader_internal.h"
+@@ -2040,6 +2041,10 @@
+        desc->channel[0].size == 64)
+       return false;
+ 
++   /* osx-gpu: big-endian host, packed formats only with RDN_BE_PACKED=0 (si_state.h). */
++   if (UTIL_ARCH_BIG_ENDIAN && si_be_withhold_packed() && si_be_format_packed(format))
++      return false;
++
+    if (sscreen->info.gfx_level >= GFX10) {
+       const struct gfx10_format *fmt = &ac_get_gfx10_format_table(sscreen->info.gfx_level)[format];
+       if (!fmt->img_format || fmt->buffers_only)
+@@ -2194,6 +2199,16 @@
+       return false;
+    }
+ 
++   /*
++    * osx-gpu: a buffer is host-order memory on a big-endian host (the vertex
++    * fetch and the shaders swap what they load from it); a sampler or image
++    * reading it through a format wider than bytes cannot (si_state.h).
++    */
++   if (UTIL_ARCH_BIG_ENDIAN && target == PIPE_BUFFER &&
++       (usage & (PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHADER_IMAGE)) &&
++       !si_be_format_native(format))
++      return false;
++
+    /* Require PIPE_BIND_SAMPLER_VIEW support when PIPE_BIND_RENDER_TARGET
+     * is requested.
+     */
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_nir_lower_vs_inputs.c b/src/gallium/drivers/radeonsi/gfx/si_nir_lower_vs_inputs.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_nir_lower_vs_inputs.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_nir_lower_vs_inputs.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "nir_builder.h"
++#include "util/u_endian.h"
+ 
+ #include "ac_nir.h"
+ #include "si_shader_internal.h"
+@@ -198,6 +199,21 @@
+  * - size = 8 bytes, format = fixed indicates PIPE_FORMAT_R11G11B10_FLOAT
+  * - size = 8 bytes, format != {float,fixed} indicates a 2_10_10_10 data format
+  */
++/* osx-gpu: byte swaps for host-order vertex data read as little-endian words. */
++static nir_def *
++rdn_bswap32(nir_builder *b, nir_def *x)
++{
++   return nir_ior(b,
++                  nir_ior(b, nir_ishl_imm(b, x, 24), nir_ishl_imm(b, nir_iand_imm(b, x, 0xff00), 8)),
++                  nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, x, 8), 0xff00), nir_ushr_imm(b, x, 24)));
++}
++
++static nir_def *
++rdn_bswap16(nir_builder *b, nir_def *x)
++{
++   return nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, x, 0xff), 8), nir_ushr_imm(b, x, 8));
++}
++
+ static void
+ opencoded_load_format(nir_builder *b, nir_def *rsrc, nir_def *vindex,
+                       union si_vs_fix_fetch fix_fetch, bool known_aligned,
+@@ -286,6 +302,32 @@
+       }
+    }
+ 
++   if (UTIL_ARCH_BIG_ENDIAN) {
++      /*
++       * osx-gpu: the attribute data is host-order in memory and was read as
++       * little-endian words: swap each element's bytes (none for bytes), and
++       * for doubles also the two words, which the pack below wants low first.
++       */
++      if (log_size == 3) {
++         unsigned words = format == AC_FETCH_FORMAT_FLOAT ? 2 * num_channels : 1;
++         for (unsigned i = 0; i < words; ++i)
++            loads[i] = rdn_bswap32(b, loads[i]);
++         if (format == AC_FETCH_FORMAT_FLOAT) {
++            for (unsigned i = 0; i + 1 < words; i += 2) {
++               nir_def *t = loads[i];
++               loads[i] = loads[i + 1];
++               loads[i + 1] = t;
++            }
++         }
++      } else if (log_size == 2) {
++         for (unsigned i = 0; i < num_channels; ++i)
++            loads[i] = rdn_bswap32(b, loads[i]);
++      } else if (log_size == 1) {
++         for (unsigned i = 0; i < num_channels; ++i)
++            loads[i] = rdn_bswap16(b, loads[i]);
++      }
++   }
++
+    if (log_size == 3) {
+       switch (format) {
+       case AC_FETCH_FORMAT_FLOAT: {
+diff --git a/src/amd/common/ac_formats.c b/src/amd/common/ac_formats.c
+--- a/src/amd/common/ac_formats.c
++++ b/src/amd/common/ac_formats.c
+@@ -637,41 +637,18 @@
+ ac_colorformat_endian_swap(uint32_t colorformat)
+ {
+    if (UTIL_ARCH_BIG_ENDIAN) {
+-      switch (colorformat) {
+-      /* 8-bit buffers. */
+-      case V_028C70_COLOR_8:
+-         return V_028C70_ENDIAN_NONE;
+-
+-      /* 16-bit buffers. */
+-      case V_028C70_COLOR_5_6_5:
+-      case V_028C70_COLOR_1_5_5_5:
+-      case V_028C70_COLOR_4_4_4_4:
+-      case V_028C70_COLOR_16:
+-      case V_028C70_COLOR_8_8:
+-         return V_028C70_ENDIAN_8IN16;
+-
+-      /* 32-bit buffers. */
+-      case V_028C70_COLOR_8_8_8_8:
+-      case V_028C70_COLOR_2_10_10_10:
+-      case V_028C70_COLOR_10_10_10_2:
+-      case V_028C70_COLOR_8_24:
+-      case V_028C70_COLOR_24_8:
+-      case V_028C70_COLOR_16_16:
+-         return V_028C70_ENDIAN_8IN32;
+-
+-      /* 64-bit buffers. */
+-      case V_028C70_COLOR_16_16_16_16:
+-         return V_028C70_ENDIAN_8IN16;
+-
+-      case V_028C70_COLOR_32_32:
+-         return V_028C70_ENDIAN_8IN32;
+-
+-      /* 128-bit buffers. */
+-      case V_028C70_COLOR_32_32_32_32:
+-         return V_028C70_ENDIAN_8IN32;
+-      default:
+-         return V_028C70_ENDIAN_NONE; /* Unsupported. */
+-      }
++      /*
++       * osx-gpu: nothing. A texture keeps the GPU's own layout in memory on
++       * a big-endian host (little-endian words for every format wider than
++       * bytes), so the colour buffer, the sampler and the compute blits all
++       * read and write it as is; the host-order layout Mesa's format code
++       * expects exists only in the CPU's view, which goes through a swapped
++       * staging texture (si_texture.c). The r600-era table this replaces
++       * swapped 8_8_8_8 whole, reversing every clear and readback (measured
++       * on the W8100, 2026-11-04).
++       */
++      (void)colorformat;
++      return V_028C70_ENDIAN_NONE;
+    } else {
+       return V_028C70_ENDIAN_NONE;
+    }

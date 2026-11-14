@@ -1,0 +1,78 @@
+osx-gpu: radeonsi without DRM: GL_TIMESTAMP in the GPU's time base
+
+glGetInteger64v(GL_TIMESTAMP) (pipe_screen::get_timestamp) scaled the
+winsys's RADEON_TIMESTAMP as GPU crystal ticks. RadeonNI's winsys has no
+GPU clock read and returns the CPU's nanosecond clock there, so the value
+came out 37 times the CPU's uptime (1000000 / 27000), in no relation to
+the TIMESTAMP query results (EOP writes of the GPU's counter, converted by
+si_query.c), which ARB_timer_query and EXT_disjoint_timer_query_webgl2
+require to share a time base with it (webgl-plan D1). Without DRM the
+GPU's time is now measured with a TIMESTAMP query on the auxiliary context
+and kept as an offset from the CPU clock, measured again every 30 s. The
+byte order of the query results themselves was settled in part three
+(patch 0035).
+
+diff --git a/src/gallium/drivers/radeonsi/si_get.c b/src/gallium/drivers/radeonsi/si_get.c
+--- a/src/gallium/drivers/radeonsi/si_get.c
++++ b/src/gallium/drivers/radeonsi/si_get.c
+@@ -39,6 +39,52 @@ static const char *si_get_name(struct pipe_screen *pscreen)
+    return sscreen->renderer_string;
+ }
+ 
++#ifdef AC_NO_DRM
++#include "util/os_time.h"
++#include "util/simple_mtx.h"
++
++/*
++ * osx-gpu: GL_TIMESTAMP in the GPU's time base without DRM. The winsys
++ * (RadeonNI on Mac OS X) has no GPU clock read, and its RADEON_TIMESTAMP
++ * is the CPU's nanosecond clock, which the generic code below scaled as if
++ * it were GPU crystal ticks: glGetInteger64v(GL_TIMESTAMP) came out 37 times
++ * the CPU's uptime, nowhere near the TIMESTAMP query results (EOP writes of
++ * the GPU counter), which ARB_timer_query and EXT_disjoint_timer_query_webgl2
++ * require to share one time base. So the GPU's time is measured once by a
++ * TIMESTAMP query on the auxiliary context and kept as an offset from the
++ * CPU clock, measured again every 30 s against the two clocks' drift. The
++ * GPU wrote its time before the CPU read its own, so the value returned
++ * lags the GPU's clock by the round trip, never leads it.
++ */
++static uint64_t si_get_timestamp(struct pipe_screen *screen)
++{
++   struct si_screen *sscreen = (struct si_screen *)screen;
++   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
++   static int64_t offset;
++   static uint64_t measured;
++   uint64_t now = os_time_get_nano();
++
++   simple_mtx_lock(&lock);
++   if (!measured || now - measured > 30000000000ull) {
++      struct si_context *ctx = si_get_aux_context(sscreen, &sscreen->aux_context.general);
++      struct pipe_query *q = ctx ? ctx->b.create_query(&ctx->b, PIPE_QUERY_TIMESTAMP, 0) : NULL;
++      union pipe_query_result r = {0};
++
++      if (q && ctx->b.end_query(&ctx->b, q) && ctx->b.get_query_result(&ctx->b, q, true, &r) && r.u64) {
++         now = os_time_get_nano();
++         offset = (int64_t)(r.u64 - now);
++         measured = now;
++      }
++      if (q)
++         ctx->b.destroy_query(&ctx->b, q);
++      if (ctx)
++         si_put_aux_context_flush(&sscreen->aux_context.general);
++   }
++   now += offset;
++   simple_mtx_unlock(&lock);
++   return now;
++}
++#else
+ static uint64_t si_get_timestamp(struct pipe_screen *screen)
+ {
+    struct si_screen *sscreen = (struct si_screen *)screen;
+@@ -46,6 +92,7 @@ static uint64_t si_get_timestamp(struct pipe_screen *screen)
+    return 1000000 * sscreen->ws->query_value(sscreen->ws, RADEON_TIMESTAMP) /
+           sscreen->info.clock_crystal_freq;
+ }
++#endif
+ 
+ static void si_query_memory_info(struct pipe_screen *screen, struct pipe_memory_info *info)
+ {

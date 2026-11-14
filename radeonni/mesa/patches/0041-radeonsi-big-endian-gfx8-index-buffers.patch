@@ -1,0 +1,426 @@
+osx-gpu: radeonsi on a big-endian host, GFX8: index buffers byte-swapped for the fetch
+
+An index buffer holds host-order indices on a big-endian host (part one).
+GFX6-7 swap them as they fetch (VGT_DMA_INDEX_TYPE.SWAP_MODE, part three);
+GFX8 fetches index buffers through L2 and ignores that field. Measured on
+Polaris 12 (Firebrand's E9173, 2026-11-13) with rdn_gltest -L: 16- and
+32-bit indices from client memory and from buffer objects drew nothing for
+every SWAP_MODE 0-3, set through PKT3_INDEX_TYPE and again as the context
+register, with REQ_PATH and RDREQ_POLICY varied as well; the same indices
+stored little-endian drew right with any of them; 8-bit indices (native on
+GFX8, nothing to swap) drew right. Display lists, which st/mesa replays as
+indexed draws, and everything Mesa turns into an indexed draw drew nothing.
+
+So on GFX8 the draw reads a byte-swapped copy of the indices it uses, made
+the way GFX7's ubyte indices are already widened (si_draw_vbo): user
+indices are swapped on the CPU as they are uploaded, and a buffer object's
+by a compute shader (si_create_index_swap_compute_shader, internal, so the
+big-endian memory lowering leaves its loads alone) into a new buffer that
+keeps the indices at their offsets. Indirect draws take the range
+si_get_draw_start_count reads, as the ubyte path does.
+
+Gated on GFX_VERSION == GFX8 inside the per-generation draw code: the GFX6
+and GFX7 instantiations compile as before. The rdn winsys serves GFX8 only
+where the kext sets RDN_VRAM_INFO64_LE_IBS (Firebrand), so this path is
+behind that flag as well.
+
+The swapped copy of a buffer object is kept with the buffer (si_resource
+be_index_swap), made once by one dispatch over the whole buffer and made
+again only after the buffer is written: a CPU write map or buffer_subdata,
+new storage, or a GPU write through si_barrier_after_internal_op (copies,
+clears). Buffers radeonsi cannot watch -- persistently mapped (glthread's
+upload buffers among them), bound as an SSBO, image or streamout target,
+over 16 MB, or rewritten more than 8 times -- are swapped per draw, just
+the range the draw reads, into the stream uploader. The first version made
+a new buffer per draw sized to the range's end: on glthread's upload
+buffer that ran the card out of video memory (frb_glbench draws-c on the
+E9173, 2026-11-13). The copy is used only by the context whose command
+stream made it.
+
+diff --git a/src/gallium/drivers/radeonsi/si_pipe.h b/src/gallium/drivers/radeonsi/si_pipe.h
+--- a/src/gallium/drivers/radeonsi/si_pipe.h
++++ b/src/gallium/drivers/radeonsi/si_pipe.h
+@@ -326,6 +326,17 @@
+ 
+    /* Whether the resource has been exported via resource_get_handle. */
+    uint8_t external_usage; /* PIPE_HANDLE_USAGE_* */
++
++   /* osx-gpu: GFX8 on a big-endian host, this buffer's indices byte-swapped
++    * for the index fetch, kept until the buffer is written (si_state_draw.cpp,
++    * si_be_index_swap_cached). Last, so no field before moves. */
++   struct pipe_resource *be_index_swap;
++   struct si_context *be_index_swap_ctx;  /* the context whose compute made it */
++   uint8_t be_index_swap_size;            /* the index size it was made for, 2 or 4 */
++   uint8_t be_index_swap_rewrites;        /* times it went stale */
++   bool be_index_swap_dirty;              /* written since: a CPU map, a GPU write, new storage */
++   bool be_index_swap_nocache;            /* persistently mapped, shader- or streamout-written,
++                                             or rewritten too often: swap per draw */
+ };
+ 
+ struct si_transfer {
+@@ -1337,6 +1348,9 @@
+    uint32_t task_tmpring_size;
+    struct si_pm4_state *task_preamble_state;
+    struct si_resource *mesh_scratch_ring;
++
++   /* osx-gpu: GFX8 big-endian index swap shaders, [index_size == 4]; last, so no field before moves. */
++   void *cs_index_swap[2];
+ };
+ 
+ /* si_barrier.c */
+@@ -1477,6 +1491,9 @@
+ MESAPROC void si_compute_shorten_ubyte_buffer(struct si_context *sctx, struct pipe_resource *dst, struct pipe_resource *src,
+                                           uint64_t dst_offset, uint64_t src_offset, unsigned size,
+                                           bool render_condition_enable) TAILV;
++MESAPROC void si_compute_swap_index_buffer(struct si_context *sctx, struct pipe_resource *dst, struct pipe_resource *src,
++                                       uint64_t dst_offset, uint64_t src_offset, unsigned count,
++                                       unsigned index_size, bool render_condition_enable) TAILV;
+ MESAPROC void si_compute_clear_image_dcc_single(struct si_context *sctx, struct si_texture *tex,
+                                             unsigned level, enum pipe_format format,
+                                             const union pipe_color_union *color,
+@@ -1621,6 +1638,7 @@
+ void *si_get_blitter_vs(struct si_context *sctx, enum blitter_attrib_type type,
+                         unsigned num_layers);
+ void *si_create_ubyte_to_ushort_compute_shader(struct si_context *sctx);
++void *si_create_index_swap_compute_shader(struct si_context *sctx, unsigned index_size);
+ void *si_create_clear_buffer_rmw_cs(struct si_context *sctx);
+ void *si_create_fmask_expand_cs(struct si_context *sctx, unsigned num_samples, bool is_array);
+ MESAPROC void *si_create_query_result_cs(struct si_context *sctx) TAILPTR;
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c b/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_shaderlib_nir.c
+@@ -259,6 +259,34 @@
+    return si_create_shader_state(sctx, b.shader);
+ }
+ 
++/*
++ * osx-gpu: GFX8 on a big-endian host. An index buffer holds host-order
++ * indices, and GFX8 fetches them through L2 little-endian: VGT_DMA_INDEX_TYPE's
++ * SWAP_MODE, which GFX6-7 honour, is ignored there (measured on Polaris 12,
++ * Firebrand's E9173, 2026-11-13: every value 0-3, through INDEX_TYPE and as a
++ * context register, drew 16- and 32-bit indices alike, wrongly; indices
++ * stored little-endian drew right). So the draw takes a copy with each index
++ * byte-swapped, made by this shader (index_size 2 or 4, one index per
++ * invocation). Internal, so si_nir_lower_be_memory leaves its loads alone.
++ */
++void *si_create_index_swap_compute_shader(struct si_context *sctx, unsigned index_size)
++{
++   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, sctx->screen->nir_options,
++                                                  index_size == 4 ? "index_swap32" : "index_swap16");
++   b.shader->info.workgroup_size[0] = 64;
++   b.shader->info.workgroup_size[1] = 1;
++   b.shader->info.workgroup_size[2] = 1;
++   b.shader->info.num_ssbos = 2;
++
++   nir_def *address = nir_imul_imm(&b, ac_get_global_ids(&b, 1, 32), index_size);
++   nir_def *value = nir_load_ssbo(&b, 1, index_size * 8, nir_imm_int(&b, 1), address,
++                                  .access = ACCESS_RESTRICT);
++   nir_store_ssbo(&b, si_nir_be_swap(&b, value), nir_imm_int(&b, 0), address,
++                  .access = ACCESS_RESTRICT);
++
++   return si_create_shader_state(sctx, b.shader);
++}
++
+ /* Load samples from the image, and copy them to the same image. This looks like
+  * a no-op, but it's not. Loads use FMASK, while stores don't, so samples are
+  * reordered to match expanded FMASK.
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_compute_blit.c b/src/gallium/drivers/radeonsi/gfx/si_compute_blit.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_compute_blit.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_compute_blit.c
+@@ -268,6 +268,34 @@
+                                  render_condition_enable);
+ }
+ 
++/* osx-gpu: GFX8 on a big-endian host, a byte-swapped copy of 16- or 32-bit indices (si_shaderlib_nir.c). */
++void si_compute_swap_index_buffer(struct si_context *sctx, struct pipe_resource *dst, struct pipe_resource *src,
++                                  uint64_t dst_offset, uint64_t src_offset, unsigned count,
++                                  unsigned index_size, bool render_condition_enable)
++{
++   void **cs = &sctx->cs_index_swap[index_size == 4];
++
++   if (!count)
++      return;
++
++   if (!*cs)
++      *cs = si_create_index_swap_compute_shader(sctx, index_size);
++
++   struct pipe_grid_info info = {};
++   set_work_size(&info, 64, 1, 1, count, 1, 1);
++
++   struct pipe_shader_buffer sb[2] = {};
++   sb[0].buffer = dst;
++   sb[0].buffer_offset = dst_offset;
++   sb[0].buffer_size = count * index_size;
++
++   sb[1].buffer = src;
++   sb[1].buffer_offset = src_offset;
++   sb[1].buffer_size = count * index_size;
++
++   si_launch_grid_internal_ssbos(sctx, &info, *cs, 2, sb, 0x1, render_condition_enable);
++}
++
+ static void si_compute_save_and_bind_images(struct si_context *sctx, unsigned num_images,
+                                             struct pipe_image_view *images,
+                                             struct pipe_image_view *saved_images)
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_gfx_context.c b/src/gallium/drivers/radeonsi/gfx/si_gfx_context.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_gfx_context.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_gfx_context.c
+@@ -429,6 +429,10 @@
+       sctx->b.delete_compute_state(&sctx->b, sctx->cs_clear_buffer_rmw);
+    if (sctx->cs_ubyte_to_ushort)
+       sctx->b.delete_compute_state(&sctx->b, sctx->cs_ubyte_to_ushort);
++   for (unsigned i = 0; i < ARRAY_SIZE(sctx->cs_index_swap); i++) {
++      if (sctx->cs_index_swap[i])
++         sctx->b.delete_compute_state(&sctx->b, sctx->cs_index_swap[i]);
++   }
+    for (unsigned i = 0; i < ARRAY_SIZE(sctx->cs_dcc_retile); i++) {
+       if (sctx->cs_dcc_retile[i])
+          sctx->b.delete_compute_state(&sctx->b, sctx->cs_dcc_retile[i]);
+diff --git a/src/gallium/drivers/radeonsi/si_buffer.c b/src/gallium/drivers/radeonsi/si_buffer.c
+--- a/src/gallium/drivers/radeonsi/si_buffer.c
++++ b/src/gallium/drivers/radeonsi/si_buffer.c
+@@ -178,6 +178,7 @@
+ 
+    util_range_set_empty(&res->valid_buffer_range);
+    res->L2_cache_dirty = false;
++   res->be_index_swap_dirty = true;   /* osx-gpu: new storage */
+ 
+    if (res->b.b.target != PIPE_BUFFER && !(res->b.b.flags & SI_RESOURCE_AUX_PLANE)) {
+       /* The buffer is shared with other planes. */
+@@ -217,6 +218,7 @@
+       struct si_resource *buffer = si_resource(buf);
+ 
+       threaded_resource_deinit(buf);
++      pipe_resource_reference(&buffer->be_index_swap, NULL);   /* osx-gpu */
+       util_range_destroy(&buffer->valid_buffer_range);
+       radeon_bo_reference(((struct si_screen*)screen)->ws, &buffer->buf, NULL);
+       util_idalloc_mt_free(&sscreen->buffer_ids, buffer->b.buffer_id_unique);
+@@ -290,6 +292,7 @@
+ 
+    radeon_bo_reference(sctx->screen->ws, &sdst->buf, ssrc->buf);
+    sdst->gpu_address = ssrc->gpu_address;
++   sdst->be_index_swap_dirty = true;   /* osx-gpu: new storage */
+    sdst->b.b.usage = ssrc->b.b.usage;
+    sdst->b.b.bind = ssrc->b.b.bind;
+    sdst->domains = ssrc->domains;
+@@ -387,6 +390,14 @@
+    if (usage & PIPE_MAP_ONCE)
+       usage |= RADEON_MAP_TEMPORARY;
+ 
++   /* osx-gpu: the GFX8 big-endian index copy goes stale; a persistent mapping
++    * can be written at any time, so such a buffer is swapped per draw. */
++   if (usage & PIPE_MAP_WRITE) {
++      buf->be_index_swap_dirty = true;
++      if (usage & PIPE_MAP_PERSISTENT)
++         buf->be_index_swap_nocache = true;
++   }
++
+    /* See if the buffer range being mapped has never been initialized,
+     * in which case it can be mapped unsynchronized. */
+    if (!(usage & (PIPE_MAP_UNSYNCHRONIZED | TC_TRANSFER_MAP_NO_INFER_UNSYNCHRONIZED)) &&
+@@ -604,6 +615,13 @@
+    buf->buf = NULL;
+    buf->bind_history = 0;
+    buf->L2_cache_dirty = false;
++   /* osx-gpu: no big-endian index copy yet */
++   buf->be_index_swap = NULL;
++   buf->be_index_swap_ctx = NULL;
++   buf->be_index_swap_size = 0;
++   buf->be_index_swap_rewrites = 0;
++   buf->be_index_swap_dirty = true;
++   buf->be_index_swap_nocache = false;
+    util_range_init(&buf->valid_buffer_range);
+    return buf;
+ }
+diff --git a/src/gallium/drivers/radeonsi/si_barrier.c b/src/gallium/drivers/radeonsi/si_barrier.c
+--- a/src/gallium/drivers/radeonsi/si_barrier.c
++++ b/src/gallium/drivers/radeonsi/si_barrier.c
+@@ -612,8 +612,12 @@
+     *
+     * L2_cache_dirty is checked explicitly when buffers are used in those cases to enforce coherency.
+     */
+-   while (writable_buffers_mask)
+-      si_resource(buffers[u_bit_scan(&writable_buffers_mask)].buffer)->L2_cache_dirty = true;
++   while (writable_buffers_mask) {
++      struct si_resource *written = si_resource(buffers[u_bit_scan(&writable_buffers_mask)].buffer);
++
++      written->L2_cache_dirty = true;
++      written->be_index_swap_dirty = true;   /* osx-gpu: GPU-written */
++   }
+ 
+    /* Make sure RBs see our DCC image stores if RBs and TCCs (L2 instances) are non-coherent. */
+    if (sctx->gfx_level >= GFX10 && sctx->screen->info.tcc_rb_non_coherent) {
+diff --git a/src/gallium/drivers/radeonsi/si_state_streamout.c b/src/gallium/drivers/radeonsi/si_state_streamout.c
+--- a/src/gallium/drivers/radeonsi/si_state_streamout.c
++++ b/src/gallium/drivers/radeonsi/si_state_streamout.c
+@@ -86,8 +86,11 @@
+        * handle it at draw call time.
+        */
+       for (i = 0; i < old_num_targets; i++)
+-         if (sctx->streamout.targets[i])
++         if (sctx->streamout.targets[i]) {
+             si_resource(sctx->streamout.targets[i]->b.buffer)->L2_cache_dirty = true;
++            /* osx-gpu: no big-endian index copy for a streamout target */
++            si_resource(sctx->streamout.targets[i]->b.buffer)->be_index_swap_nocache = true;
++         }
+ 
+       /* Invalidate the scalar cache in case a streamout buffer is
+        * going to be used as a constant buffer.
+diff --git a/src/gallium/drivers/radeonsi/si_state_draw.cpp b/src/gallium/drivers/radeonsi/si_state_draw.cpp
+--- a/src/gallium/drivers/radeonsi/si_state_draw.cpp
++++ b/src/gallium/drivers/radeonsi/si_state_draw.cpp
+@@ -2151,6 +2151,66 @@
+    return true;
+ }
+ 
++/*
++ * osx-gpu: GFX8 on a big-endian host (patch 0041): the index fetch needs a
++ * byte-swapped copy of a buffer object's indices. Made per draw, that is a
++ * compute dispatch and a new buffer for every indexed draw, which draw-heavy
++ * programs (WebGL) feel. So each index buffer keeps one copy, the whole
++ * buffer swapped by one dispatch, until it is written:
++ *  - a CPU write map (si_buffer_transfer_map, buffer_subdata), new storage
++ *    (si_alloc_resource, si_replace_buffer_storage) and every GPU write
++ *    radeonsi makes through si_barrier_after_internal_op (copies, clears)
++ *    mark it stale, and the next draw swaps the buffer again;
++ *  - a buffer that may change without radeonsi seeing it (persistently
++ *    mapped, glthread's upload buffers included), that shaders or streamout
++ *    may write (bound as an SSBO, image or streamout target), that is big,
++ *    or that went stale too often, is swapped per draw instead: only the
++ *    range the draw reads, into the stream uploader, not a buffer of its
++ *    own (a buffer per draw sized to the range's END ran a glthread upload
++ *    buffer out of video memory, 2026-11-13, frb_glbench draws-c);
++ *  - the copy is used only by the context that made it, whose command
++ *    stream holds the dispatch before the draws that read it.
++ */
++#define SI_BE_INDEX_SWAP_CACHE_MAX     (16u * 1024 * 1024)
++#define SI_BE_INDEX_SWAP_MAX_REWRITES  8
++
++static struct pipe_resource *si_be_index_swap_cached(struct si_context *sctx, struct si_resource *src,
++                                                     unsigned index_size)
++{
++   if (src->bind_history & (SI_BIND_SHADER_BUFFER_ALL | SI_BIND_IMAGE_BUFFER_ALL |
++                            SI_BIND_STREAMOUT_BUFFER))
++      src->be_index_swap_nocache = true;
++   if (src->be_index_swap_nocache || src->b.b.width0 > SI_BE_INDEX_SWAP_CACHE_MAX ||
++       src->b.b.width0 < index_size || (src->be_index_swap_ctx && src->be_index_swap_ctx != sctx))
++      return NULL;
++   if (src->be_index_swap && !src->be_index_swap_dirty && src->be_index_swap_size == index_size)
++      return src->be_index_swap;
++   if (src->be_index_swap && src->be_index_swap_dirty &&
++       ++src->be_index_swap_rewrites > SI_BE_INDEX_SWAP_MAX_REWRITES) {
++      /* written over and over: a streaming buffer */
++      src->be_index_swap_nocache = true;
++      pipe_resource_reference(&src->be_index_swap, NULL);
++      return NULL;
++   }
++   if (!src->be_index_swap || src->be_index_swap->width0 != src->b.b.width0) {
++      pipe_resource_reference(&src->be_index_swap, NULL);
++      src->be_index_swap = pipe_buffer_create(&sctx->screen->b, 0, PIPE_USAGE_DEFAULT,
++                                              src->b.b.width0);
++      if (unlikely(!src->be_index_swap))
++         return NULL;
++   }
++   src->be_index_swap_ctx = sctx;
++   src->be_index_swap_size = index_size;
++   /* Not under the render condition: the copy outlives this draw. */
++   si_compute_swap_index_buffer(sctx, src->be_index_swap, &src->b.b, 0, 0,
++                                src->b.b.width0 / index_size, index_size, false);
++   si_barrier_after_simple_buffer_op(sctx, 0, src->be_index_swap, &src->b.b);
++   /* GFX8 reads index buffers through L2: no write-back needed. */
++   si_resource(src->be_index_swap)->L2_cache_dirty = false;
++   src->be_index_swap_dirty = false;
++   return src->be_index_swap;
++}
++
+ static void si_get_draw_start_count(struct si_context *sctx, const struct pipe_draw_info *info,
+                                     const struct pipe_draw_indirect_info *indirect,
+                                     const struct pipe_draw_start_count_bias *draws,
+@@ -2348,6 +2408,87 @@
+          /* GFX6-7 don't read index buffers through L2. */
+          si_set_barrier_flags(sctx, SI_BARRIER_WB_L2 | SI_BARRIER_PFP_SYNC_ME);
+          si_resource(indexbuf)->L2_cache_dirty = false;
++      } else if (!IS_DRAW_VERTEX_STATE && GFX_VERSION == GFX8 && UTIL_ARCH_BIG_ENDIAN &&
++                 index_size > 1) {
++         /*
++          * osx-gpu: GFX8 on a big-endian host (Polaris on Firebrand; the rdn
++          * winsys serves GFX8 only with the kext's little-endian command
++          * buffers). The indices are host-order and GFX8 fetches them
++          * little-endian through L2, ignoring SWAP_MODE (measured, see
++          * si_create_index_swap_compute_shader), so the draw reads a
++          * byte-swapped copy: swapped on the CPU as user indices are
++          * uploaded, by a compute shader from a buffer object. Like GFX7's
++          * ubyte path above, the copy keeps the indices at their offsets.
++          * GFX6-7 never come here.
++          */
++         if (info->has_user_indices) {
++            struct pipe_resource *release_buf = NULL;
++            unsigned start_offset, count;
++            const uint8_t *src;
++            uint8_t *dst = NULL;
++
++            assert(!indirect);
++            assert(num_draws == 1);
++            start_offset = draws[0].start * index_size;
++            count = draws[0].count;
++            src = (const uint8_t *)info->index.user + start_offset;
++
++            indexbuf = NULL;
++            u_upload_alloc(ctx->stream_uploader, start_offset, count * index_size,
++                           sctx->screen->info.tcc_cache_line_size, &index_offset, &indexbuf,
++                           &release_buf, (void **)&dst);
++            pipe_resource_release(ctx, release_buf);
++            if (unlikely(!indexbuf))
++               return;
++            if (index_size == 2) {
++               for (unsigned i = 0; i < count; i++) {
++                  uint16_t v;
++                  memcpy(&v, src + 2 * i, 2);
++                  v = util_bswap16(v);
++                  memcpy(dst + 2 * i, &v, 2);
++               }
++            } else {
++               for (unsigned i = 0; i < count; i++) {
++                  uint32_t v;
++                  memcpy(&v, src + 4 * i, 4);
++                  v = util_bswap32(v);
++                  memcpy(dst + 4 * i, &v, 4);
++               }
++            }
++
++            /* info->start will be added by the drawing code */
++            index_offset -= start_offset;
++         } else if (struct pipe_resource *cached =
++                       si_be_index_swap_cached(sctx, si_resource(info->index.resource), index_size)) {
++            /* The buffer's swapped copy: the indices at their offsets, index_offset as it is. */
++            indexbuf = cached;
++         } else {
++            struct pipe_resource *release_buf = NULL;
++            unsigned start, count, start_offset, out_offset = 0;
++            void *unused_map = NULL;
++
++            si_get_draw_start_count(sctx, info, indirect, draws, num_draws, &start, &count);
++            start_offset = start * index_size;
++
++            /* Only the range the draw reads, from the stream uploader (see
++             * si_be_index_swap_cached); out_offset >= start_offset. */
++            indexbuf = NULL;
++            u_upload_alloc(ctx->stream_uploader, start_offset, MAX2(count, 1) * index_size,
++                           sctx->screen->info.tcc_cache_line_size, &out_offset, &indexbuf,
++                           &release_buf, &unused_map);
++            pipe_resource_release(ctx, release_buf);
++            if (unlikely(!indexbuf))
++               return;
++
++            si_compute_swap_index_buffer(sctx, indexbuf, info->index.resource, out_offset,
++                                         index_offset + start_offset, count, index_size,
++                                         sctx->render_cond_enabled);
++            si_barrier_after_simple_buffer_op(sctx, 0, indexbuf, info->index.resource);
++            /* info->start will be added by the drawing code */
++            index_offset = out_offset - start_offset;
++            /* GFX8 reads index buffers through L2: no write-back needed. */
++            si_resource(indexbuf)->L2_cache_dirty = false;
++         }
+       } else if (!IS_DRAW_VERTEX_STATE && info->has_user_indices) {
+          struct pipe_resource *release_buf = NULL;
+          unsigned start_offset;

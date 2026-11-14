@@ -1,0 +1,134 @@
+/*
+ * rdnvd: the card's video decoder (UVD) for programs. Plain C, no Mesa or OpenGL types.
+ *
+ * A session takes H.264 NAL units (Annex B, or length prefixed as in an MP4/QuickTime sample), finds the
+ * pictures, decodes them on the card and hands them back in display order, each with the time stamp of
+ * the data it came from. The pictures stay in video memory; rdnvd_frame_read() copies one into the
+ * caller's memory (the card copies it into system memory first: the CPU reads video memory at under
+ * 10 MB/s). Not thread safe: one thread per session.
+ *
+ *   struct rdnvd *d = rdnvd_open();                       NULL: no card, no kext, or no firmware in it
+ *   struct rdnvd_session *s = rdnvd_h264_open(d, avcc, n, output, user);
+ *   rdnvd_h264_feed(s, sample, size, pts, nal_length_size, 1);     (a QuickTime sample: one access unit)
+ *   ... output(user, frame) is called, in display order, inside feed and flush
+ *   rdnvd_h264_flush(s, 0);  rdnvd_h264_close(s);  rdnvd_close(d);
+ *
+ * Two implementations: mesa/target/rdnvd.c (Mesa's r600 UVD code; TeraScale cards) and video/rdnvd_rdnv.c (the
+ * kext's typed 'rdnv' sessions, no Mesa; GCN cards such as Hawaii UVD 4.2). With the second, frames are copies in
+ * system memory, there is one decoder in the whole system, and MBAFF is refused (see that file).
+ *
+ * Copyright (c) 2026 kouta-kun and Claude
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef RDNVD_H
+#define RDNVD_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* The results are the RDNVD_H264_* of rdnvd_h264.h: 0 is success, UNSUPPORTED means "decode it in software". */
+#define RDNVD_OK		0
+#define RDNVD_UNSUPPORTED	(-1)
+#define RDNVD_BAD_STREAM	(-2)
+#define RDNVD_NO_MEMORY		(-3)
+#define RDNVD_FAILED		(-4)
+
+struct rdnvd;
+struct rdnvd_session;
+
+/* A decoded picture. Valid until rdnvd_frame_release() (the session may be closed first). */
+struct rdnvd_frame {
+	uint64_t pts;
+	/* The picture shown: after the cropping of the stream. */
+	unsigned width, height;
+	/* What the decoder produced. */
+	unsigned coded_width, coded_height;
+	unsigned crop_left, crop_top;
+	void *priv;
+};
+
+typedef void (*rdnvd_output_fn)(void *user, struct rdnvd_frame *frame);
+
+/*
+ * Whether the card decodes a stream, from its avcC record, without opening the card: the profile, 4:2:0 at 8
+ * bits, no interlaced coding, not larger than level 4.2. 0 if not, 1 if so; *width and *height (may be NULL)
+ * get the picture's size.
+ */
+int rdnvd_h264_supported(const uint8_t *avcc, size_t avcc_size, unsigned *width, unsigned *height);
+
+struct rdnvd *rdnvd_open(void);
+void rdnvd_close(struct rdnvd *d);
+
+/*
+ * `avcc`: the configuration record of an MP4/QuickTime 'avcC' box (its SPS and PPS), or NULL for a stream that
+ * carries them. Returns the session; *nal_length_size gets the length-prefix size to pass to feed (0 for Annex B).
+ * Returns NULL if the stream is one the card does not decode (with an avcC record that is known here: other
+ * than 4:2:0 at 8 bits, interlaced coding, more than 8704 macroblocks): decode it in software.
+ */
+struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_t *avcc, size_t avcc_size,
+				      rdnvd_output_fn output, void *user, unsigned *nal_length_size);
+/*
+ * Whether the card has the video memory for another decoder of this picture size now (some 125 MB at 1080p, 50 MB at
+ * 720p, all of it in the 256 MB the decoder reaches: one 1080p decoder at a time). Looks, takes nothing.
+ */
+int rdnvd_h264_room(struct rdnvd *d, unsigned width, unsigned height);
+/* The same for the stream a session was opened with: the decoder is sized for it (the level and its reference frames), as Mesa's decoder is. */
+int rdnvd_h264_room_for(struct rdnvd_session *s);
+/*
+ * Makes the decoder (and takes its video memory) now, for a session opened with an avcC record; otherwise it is made
+ * when the first picture comes. 0, or an error: another decoder may have the card's memory.
+ */
+int rdnvd_h264_prepare(struct rdnvd_session *s);
+/*
+ * Data: Annex B (nal_length_size 0) or length prefixed. `end_of_au`: the data ends an access unit, so the
+ * picture in it is decoded now (a QuickTime sample, or what a VLC packetizer hands over). `pts` goes with the
+ * pictures that start in this data.
+ */
+int rdnvd_h264_feed(struct rdnvd_session *s, const uint8_t *data, size_t size, uint64_t pts,
+		    unsigned nal_length_size, int end_of_au);
+/*
+ * Decode one access unit (a QuickTime sample) and give back the picture it holds, as soon as it is decoded
+ * and in decoding order, not display order: for a consumer that shows pictures by time stamp itself
+ * (QuickTime draws them in display order, later). *frame is NULL if the data held no picture (parameter
+ * sets only, or not a point to start from); release it with rdnvd_frame_release(). The `output` callback of
+ * rdnvd_h264_open may be NULL when this is used.
+ */
+int rdnvd_h264_decode_au(struct rdnvd_session *s, const uint8_t *data, size_t size, unsigned nal_length_size,
+			 struct rdnvd_frame **frame);
+/*
+ * How many pictures a picture can be decoded before it is displayed: the decoder's picture buffer, or
+ * what the stream says it reorders. For a consumer that has to say how far ahead it decodes.
+ */
+unsigned rdnvd_h264_reorder_delay(struct rdnvd_session *s);
+/*
+ * How many pictures the session has decoded so far. A caller that feeds one access unit at a time sees from it
+ * whether the unit held a picture (one that will come out of `output` later, in display order) or none
+ * (parameter sets only, a failed decode, or data skipped while waiting for an IDR picture).
+ */
+unsigned rdnvd_h264_decoded(struct rdnvd_session *s);
+/* The end of the stream or a seek: decode what is pending and output everything (drop: forget it instead). */
+int rdnvd_h264_flush(struct rdnvd_session *s, int drop);
+void rdnvd_h264_close(struct rdnvd_session *s);
+
+/*
+ * The picture's samples as NV12 (a plane of luma, then one of interleaved U and V at half the size in
+ * both directions) cropped to width x height, into the caller's planes.
+ */
+int rdnvd_frame_read(struct rdnvd_frame *frame, uint8_t *y, size_t y_stride, uint8_t *uv, size_t uv_stride);
+/*
+ * The same picture as packed 4:2:2 ('2vuy': U, Y, V, Y for every two pixels; chroma rows repeated), into a
+ * buffer of rows `stride` bytes apart, cropped to width x height.
+ */
+int rdnvd_frame_read_2vuy(struct rdnvd_frame *frame, uint8_t *dst, size_t stride);
+void rdnvd_frame_release(struct rdnvd_frame *frame);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* RDNVD_H */

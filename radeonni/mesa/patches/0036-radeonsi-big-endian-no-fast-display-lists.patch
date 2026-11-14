@@ -1,0 +1,30 @@
+osx-gpu: radeonsi on a big-endian host, part four: no fast display lists
+
+radeonsi's draw_vertex_state path (st/mesa replays a compiled display list
+from a prebuilt pipe_vertex_state: one buffer holding the vertices and the
+32-bit indices, descriptors built once at compile time) draws nothing on a
+big-endian host. Measured on the R7 450 (Verde, GFX6) under Leopard
+PowerPC, 2026-11-10: rdn_gltest -L 1/2/3 (a quad strip and a quad compiled
+into a display list, Apple Chess's shape) left the clear colour everywhere,
+while the same geometry drawn immediately, with glDrawArrays from a buffer
+object and with glDrawElements (16- and 32-bit indices, client memory and
+buffer objects) was right. With AMD_DEBUG=nofastdlist every list mode draws
+correctly. So the cap is withheld on big-endian hosts and display lists take
+the regular draw path, which carries the swapped vertex fetch.
+
+--- a/src/gallium/drivers/radeonsi/gfx/si_gfx_screen.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_gfx_screen.c
+@@ -670,7 +670,12 @@
+    caps->texture_transfer_modes =
+       PIPE_TEXTURE_TRANSFER_BLIT | PIPE_TEXTURE_TRANSFER_COMPUTE;
+ 
+-   caps->draw_vertex_state = !(sscreen->debug_flags & DBG(NO_FAST_DISPLAY_LIST));
++   /* osx-gpu: the fast display-list path draws nothing on a big-endian host
++    * (prebuilt vertex state, not the swapped vertex fetch); the regular path
++    * draws lists correctly, as AMD_DEBUG=nofastdlist showed on the R7 450.
++    */
++   caps->draw_vertex_state = !UTIL_ARCH_BIG_ENDIAN &&
++                             !(sscreen->debug_flags & DBG(NO_FAST_DISPLAY_LIST));
+ 
+    caps->shader_samples_identical =
+       sscreen->info.compiler_info.has_fmask && !(sscreen->debug_flags & DBG(NO_FMASK));

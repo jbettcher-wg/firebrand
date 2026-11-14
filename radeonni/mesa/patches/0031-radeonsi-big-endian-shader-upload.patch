@@ -1,0 +1,69 @@
+osx-gpu: radeonsi writes shader code and vertex descriptors little-endian
+
+The shader engines read the instruction stream and its constant data as
+little-endian words. radeonsi writes the binary in host order and patches
+symbols in place, so on a big-endian host the whole image is swapped once
+before post_upload_binary(). Step 3 of the GCN port plan; the first
+run without it (2026-11-04) showed waves executing memory that was never
+written, which the placement fix in rdn_winsys.c addresses, and this is the
+next thing those waves would have met.
+
+
+Vertex buffer descriptors are the one descriptor set radeonsi writes into
+memory outside si_upload_descriptors() (which already converts), so the
+same conversion is applied where si_set_vb_descriptor() fills them.
+The constant data behind the instructions is not swapped: it stays
+host-order and the shader swaps on load (0033).
+
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_shader_binary.c b/src/gallium/drivers/radeonsi/gfx/si_shader_binary.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_shader_binary.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_shader_binary.c
+@@ -3,6 +3,8 @@
+  */
+ 
+ #include "si_shader.h"
++#include "util/u_endian.h"
++#include "util/u_math.h"
+ #include "si_shader_internal.h"
+ #include "si_pipe.h"
+ #include "ac_rtld.h"
+@@ -296,6 +298,18 @@
+                                 scratch_va, const_offset);
+       }
+ 
++      /*
++       * osx-gpu: the shader engine fetches instruction words little-endian;
++       * everything above, symbol patches included, was written in the host's
++       * order. The constant data that follows the code stays host-order: the
++       * shader's load_constant goes through si_nir_lower_be_memory.
++       */
++      if (UTIL_ARCH_BIG_ENDIAN) {
++         uint32_t *w = (uint32_t *)((char *)rx_ptr + exec_offset);
++         for (unsigned j = 0; j < bin[i]->exec_size / 4; j++)
++            w[j] = util_bswap32(w[j]);
++      }
++
+       exec_offset += bin[i]->exec_size;
+ 
+       unsigned data_size = bin[i]->code_size - bin[i]->exec_size;
+diff --git a/src/gallium/drivers/radeonsi/si_state_draw.cpp b/src/gallium/drivers/radeonsi/si_state_draw.cpp
+--- a/src/gallium/drivers/radeonsi/si_state_draw.cpp
++++ b/src/gallium/drivers/radeonsi/si_state_draw.cpp
+@@ -2048,10 +2048,16 @@
+       do {
+          if (IS_DRAW_VERTEX_STATE) {
+             unsigned velem_index = get_next_vertex_state_elem<POPCNT>(&vstate->b, partial_velem_mask);
+-            memcpy(ptr, &vstate->descriptors[velem_index * 4], 16);
++            /* osx-gpu: this copy lands in memory the shader reads little-endian. */
++            util_memcpy_cpu_to_le32(ptr, &vstate->descriptors[velem_index * 4], 16);
+          } else {
+             unsigned vbo_index = velems->vertex_buffer_index[i];
+             si_set_vb_descriptor<GFX_VERSION>(velems, &sctx->vertex_buffer[vbo_index], i, ptr);
++            /* osx-gpu: the descriptors in the IB are swapped by the CP; these are not. */
++            if (UTIL_ARCH_BIG_ENDIAN) {
++               for (unsigned w = 0; w < 4; w++)
++                  ptr[w] = util_bswap32(ptr[w]);
++            }
+          }
+          ptr += 4;
+          i++;

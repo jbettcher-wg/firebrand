@@ -1,0 +1,63 @@
+osx-gpu: radeonsi on a big-endian host, part seven: transform feedback stores host-order data
+
+A buffer is host-order on a big-endian host (part one): the application
+reads what transform feedback captured with glGetBufferSubData or a map,
+or draws it as vertices, whose open-coded fetch swaps it again. The
+shader engine stores little-endian, so the legacy streamout store
+(GFX6-9: the hardware VS and the GS copy shader write each captured
+component with a buffer store) byte-swaps every 32-bit (and 16-bit)
+component first. Without it FrostByte's webgl2-buffers page read 1.0 back
+as 4.6e-41 (0x0000803f) and drew nothing from the captured buffer
+(webgl-plan D2). The buffer-filled-size counters the GPU keeps for
+glDrawTransformFeedback are read only by the GPU and stay as they are;
+NGG streamout (GFX10 and later) is not covered. Doubles (ARB_gpu_shader_fp64
+captures) would also need their two words exchanged; this build reports
+OpenGL 3.3, which has none.
+
+diff --git a/src/amd/common/nir/ac_nir_prerast_utils.c b/src/amd/common/nir/ac_nir_prerast_utils.c
+--- a/src/amd/common/nir/ac_nir_prerast_utils.c
++++ b/src/amd/common/nir/ac_nir_prerast_utils.c
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include "util/u_endian.h"
+ #include "ac_nir.h"
+ #include "ac_nir_helpers.h"
+ #include "amdgfxregs.h"
+@@ -557,6 +558,19 @@ ac_nir_get_sorted_xfb_info(const nir_shader *nir)
+    return info;
+ }
+ 
++/* osx-gpu: a 16- or 32-bit value with its bytes reversed (big-endian host, transform feedback). */
++static nir_def *
++ac_nir_be_swap_xfb(nir_builder *b, nir_def *x)
++{
++   if (x->bit_size == 16)
++      return nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, x, 0xff), 8), nir_ushr_imm(b, x, 8));
++   if (x->bit_size != 32)
++      return x;
++   return nir_ior(b,
++                  nir_ior(b, nir_ishl_imm(b, x, 24), nir_ishl_imm(b, nir_iand_imm(b, x, 0xff00), 8)),
++                  nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, x, 8), 0xff00), nir_ushr_imm(b, x, 24)));
++}
++
+ void
+ ac_nir_emit_legacy_streamout(nir_builder *b, unsigned stream, nir_xfb_info *info, ac_nir_prerast_out *out)
+ {
+@@ -606,6 +620,15 @@ ac_nir_emit_legacy_streamout(nir_builder *b, unsigned stream, nir_xfb_info *info
+                data = nir_convert_to_bit_size(b, data, output->mediump_upconvert_type, 32);
+          }
+ 
++         /*
++          * osx-gpu: on a big-endian host a buffer holds host-order data (the
++          * application reads it back, maps it, or draws it as vertices, whose
++          * fetch swaps it again); the shader engine stores little-endian, so
++          * every captured component is byte-swapped before the store.
++          */
++         if (UTIL_ARCH_BIG_ENDIAN)
++            data = ac_nir_be_swap_xfb(b, data);
++
+          assert(out_comp >= output->component_offset);
+          const unsigned store_comp = out_comp - output->component_offset;
+          const unsigned store_comp_offset = output->offset + store_comp * 4;

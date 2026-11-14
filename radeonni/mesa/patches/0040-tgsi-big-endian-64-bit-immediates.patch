@@ -1,0 +1,78 @@
+osx-gpu: TGSI 64-bit immediates on a big-endian host, low word first
+
+ureg_DECL_immediate_f64/uint64/int64 copied each value into two 32-bit
+channels through a union, which on a big-endian host puts the high word in
+the first channel; tgsi_to_nir joins the pair with nir_bitcast_vector, low
+word first, so every double or 64-bit integer immediate came out with its
+halves exchanged. u_blitter's Z24 packing shader multiplies the depth by
+the double 0xffffff, so the depth half of every Z24_S8 texture copied to a
+colour staging texture (glReadPixels of GL_DEPTH_STENCIL /
+UNSIGNED_INT_24_8, any CPU map of a packed depth/stencil texture) read
+back as 0 on PowerPC while the stencil was right. Measured on the R7 450,
+2026-11-13 (tools/guest/begl33test).
+
+diff --git a/src/gallium/auxiliary/tgsi/tgsi_ureg.c b/src/gallium/auxiliary/tgsi/tgsi_ureg.c
+--- a/src/gallium/auxiliary/tgsi/tgsi_ureg.c
++++ b/src/gallium/auxiliary/tgsi/tgsi_ureg.c
+@@ -36,6 +36,7 @@
+ #include "tgsi/tgsi_dump.h"
+ #include "tgsi/tgsi_sanity.h"
+ #include "util/glheader.h"
++#include "util/u_endian.h"
+ #include "util/u_debug.h"
+ #include "util/u_inlines.h"
+ #include "util/u_memory.h"
+@@ -1009,6 +1010,29 @@ ureg_DECL_immediate( struct ureg_program *ureg,
+    return decl_immediate(ureg, fu.u, nr, TGSI_IMM_FLOAT32);
+ }
+ 
++/*
++ * osx-gpu: a 64-bit TGSI immediate is two 32-bit channels, the low word in
++ * the first (tgsi_to_nir joins them with nir_bitcast_vector, low first).
++ * Copying the value into the channels through a union puts the high word
++ * first on a big-endian host; swap each pair back. u_blitter's Z24 packing
++ * shader (DMUL by 0xffffff) read depth back as 0 on PowerPC because of it.
++ */
++static void
++ureg_imm64_low_word_first(unsigned *u, unsigned nr)
++{
++#if UTIL_ARCH_BIG_ENDIAN
++   for (unsigned i = 0; i + 1 < nr; i += 2) {
++      unsigned t = u[i];
++
++      u[i] = u[i + 1];
++      u[i + 1] = t;
++   }
++#else
++   (void)u;
++   (void)nr;
++#endif
++}
++
+ struct ureg_src
+ ureg_DECL_immediate_f64( struct ureg_program *ureg,
+                          const double *v,
+@@ -1025,6 +1049,7 @@ ureg_DECL_immediate_f64( struct ureg_program *ureg,
+       fu.d[i] = v[i];
+    }
+ 
++   ureg_imm64_low_word_first(fu.u, nr);
+    return decl_immediate(ureg, fu.u, nr, TGSI_IMM_FLOAT64);
+ }
+ 
+@@ -1090,6 +1115,7 @@ ureg_DECL_immediate_uint64( struct ureg_program *ureg,
+       fu.u64[i] = v[i];
+    }
+ 
++   ureg_imm64_low_word_first(fu.u, nr);
+    return decl_immediate(ureg, fu.u, nr, TGSI_IMM_UINT64);
+ }
+ 
+@@ -1109,6 +1135,7 @@ ureg_DECL_immediate_int64( struct ureg_program *ureg,
+       fu.i64[i] = v[i];
+    }
+ 
++   ureg_imm64_low_word_first(fu.u, nr);
+    return decl_immediate(ureg, fu.u, nr, TGSI_IMM_INT64);
+ }
+ 

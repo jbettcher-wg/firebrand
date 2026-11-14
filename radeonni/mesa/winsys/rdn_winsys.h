@@ -1,0 +1,57 @@
+/*
+ * Mesa winsys for the Radeon HD 7570 without the Linux DRM.
+ *
+ * Copyright (c) 2026 kouta-kun and Claude
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef RDN_WINSYS_H
+#define RDN_WINSYS_H
+
+#include "winsys/radeon_winsys.h"
+#include "rdn_device.h"
+
+struct pipe_screen_config;
+
+/*
+ * resource_from_handle with a winsys_handle of type WINSYS_HANDLE_TYPE_KMS
+ * and this handle gives the surface the display shows (rdn_device's
+ * screen), linear, not owned by the resource.
+ */
+#define RDN_WINSYS_HANDLE_SCREEN 0x7570
+/*
+ * And with this handle, video memory that the caller got from the device
+ * itself (rdn_device's alloc) at the winsys_handle's offset: a linear
+ * surface whose place the caller can tell others.
+ */
+#define RDN_WINSYS_HANDLE_VRAM 0x7571
+
+/*
+ * After the fence of the newest video decoder stream has been reached: did the firmware answer it? A decode message is
+ * answered by a feedback block whose second word is the message's counter (the message's fourth word); a firmware
+ * that has stopped serving a session runs the commands and the fences and writes nothing. 1 if it answered or there is
+ * nothing to look at (a stream without a decode message), 0 if not. Looks at the stream once.
+ */
+int rdn_winsys_uvd_answered(struct radeon_winsys *ws);
+
+/* Give the kext the memory the cache keeps (a closed decoder's buffers, for one). */
+void rdn_winsys_trim(struct radeon_winsys *ws);
+
+/*
+ * This winsys belongs to a program that decodes video: its shareable buffers are the decoder's, and with the decoder in a
+ * segment of the video memory beyond the aperture (docs/UVD.md) they are made there. Call it before the first buffer.
+ */
+void rdn_winsys_set_video(struct radeon_winsys *ws);
+
+typedef struct pipe_screen *(*rdn_screen_create_t)(struct radeon_winsys *,
+                                                   const struct pipe_screen_config *);
+
+/* A GCN card (GFX6 or GFX7): the screen is radeonsi's, not r600's. */
+bool rdn_device_is_gcn(const struct rdn_device *dev);
+
+/* Takes ownership of `dev`. */
+struct radeon_winsys *rdn_winsys_create(struct rdn_device *dev,
+                                        const struct pipe_screen_config *config,
+                                        rdn_screen_create_t screen_create);
+
+#endif /* RDN_WINSYS_H */
