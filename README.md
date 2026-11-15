@@ -266,6 +266,10 @@ font installed.
   command submission with buffer lists, sync objects), with a Vulkan loader and window-system
   integration for Leopard; then Zink, OpenGL 4.6 over Vulkan.
 
+## The name
+
+Radeon red is the fire. When AMD launched Vega it called the campaign the "Radeon Rebellion", and a firebrand is a rebel who stirs things up. A driver that brings modern Radeons to Mac OS X on PowerPC, long after anyone expected one, is a bit of both.
+
 ## Licence
 
 Firebrand's own code is under the [MIT licence](LICENSE). The code ported from Linux and AMD's
