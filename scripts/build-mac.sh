@@ -33,7 +33,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 JOBS="${FRB_JOBS:-2}"
-SDK=/Developer/SDKs/MacOSX10.5.sdk
+SDK="${SDK:-/Developer/SDKs/MacOSX10.5.sdk}"
 DIST="$ROOT/build/dist/Firebrand"
 
 die() { echo "build-mac: $*" >&2; exit 1; }
@@ -44,7 +44,14 @@ say() { echo "== $*"; }
 case "$(sw_vers -productVersion)" in 10.5*) ;; *) die "Mac OS X 10.5 is needed (this is $(sw_vers -productVersion))" ;; esac
 command -v gcc-4.0 >/dev/null || die "no gcc-4.0: install Xcode 3.1 (Xcode 3.1.4 is the last for PowerPC)"
 [ -d /System/Library/Frameworks/Kernel.framework/Headers/IOKit ] || die "no Kernel.framework headers: install Xcode 3.1"
-[ -d "$SDK" ] || die "no $SDK: install Xcode 3.1 with the 10.5 SDK"
+if [ ! -d "$SDK" ]; then
+	# An Xcode install without the SDK package still puts the 10.5 headers and libraries in the
+	# running system; build against that root instead.
+	[ -f /usr/include/stdio.h ] && [ -d /System/Library/Frameworks/IOKit.framework/Headers ] ||
+		die "no $SDK and no system headers: install Xcode 3.1 with the 10.5 SDK"
+	echo "build-mac: no $SDK; building against the running system's headers (/)" >&2
+	SDK=/
+fi
 
 missing=
 for f in $(sed 's/#.*//' kext/Firebrand/firmware.list) LICENSE.amdgpu; do
