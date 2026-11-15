@@ -34,6 +34,8 @@
 			<string>0x699f1002</string>
 			<key>IOMatchCategory</key>
 			<string>Firebrand</string>
+			<key>QorIQDMACommand</key>
+			<true/>
 			<key>FirebrandStage</key>
 			<integer>0</integer>
 			<key>FirebrandAllowRegWrite</key>
@@ -69,6 +71,8 @@
 			<string>0x699f1002</string>
 			<key>IOMatchCategory</key>
 			<string>IOFramebuffer</string>
+			<key>QorIQDMACommand</key>
+			<true/>
 			<key>IOProbeScore</key>
 			<integer>65000</integer>
 			<key>FirebrandFramebuffer</key>

@@ -16,10 +16,11 @@ library) comes from [RadeonNI-OSX](https://github.com/kouta-kun/RadeonNI-OSX), w
 Firebrand's accelerator speaks, with Mesa's radeonsi made to run on a big-endian host.
 
 > **Status: early.** Firebrand runs today on Mac OS X 10.5.8 on NXP QorIQ T4240 (e6500)
-> systems, where everything below was measured. The **Power Mac G5 is not supported yet**: the
-> G5 routes device memory access through its DART IOMMU, and Firebrand (and HDAudio) address
-> memory directly. The G5 path is next on the [roadmap](#roadmap). There is no installer
-> package or binary release yet; see [Building](#building).
+> systems, where everything below was measured. **Power Mac G5:** Firebrand and HDAudio now
+> take every device address through IOKit (`IODMACommand`), which on a G5 goes through its DART
+> IOMMU, so the same build is meant for both machines. It has not been run on a G5 yet; see the
+> [roadmap](#roadmap). There is no installer package or binary release yet; see
+> [Building](#building).
 
 ## Supported cards
 
@@ -254,8 +255,9 @@ font installed.
 
 - **Installer:** a flat `.pkg` with checks before it installs anything, an uninstaller, and
   RadeonNI handled where it is installed.
-- **Power Mac G5:** device memory access through the G5's DART IOMMU, for Firebrand and
-  HDAudio; then an Open Firmware boot path so the card shows the boot screen from power-on.
+- **Power Mac G5:** the DMA side is done (addresses through IOKit, so the DART translates them);
+  next is a test run on G5 hardware, then an Open Firmware boot path so the card shows the boot
+  screen from power-on.
 - **Vega 20** (Radeon VII, Radeon Pro VII): the next GPU. It brings the PSP,
   GMC 9, GFX 9, SMU 11 and DCE 12 blocks.
 - **Southern and Sea Islands** (for example the R7 450 and the FirePro W8100): fold RadeonNI's

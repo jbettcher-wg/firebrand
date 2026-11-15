@@ -46,8 +46,7 @@ extern "C" {
 #include "frb_uvd.h"
 }
 
-#define FRB_PCI_INBOUND_BASE	0x1000000000ULL		/* as FirebrandCore.cpp's */
-#define FRB_PCI_INBOUND_SIZE	(1ULL << 36)
+/* Bus addresses: FirebrandCore::busOfPage() (qoriq_dma.h). */
 
 enum {
 	kVideoPage = 4096,
@@ -481,20 +480,28 @@ int FirebrandAccel::videoBindLocked(FirebrandVideoMemory *memory, UInt32 *first,
 		return -ENODEV;
 	if (frb_gart_alloc(adev, n, &at))
 		return -ENOMEM;
-	for (i = 0; i < n; i++) {
-		IOByteCount len = 0;
-		addr64_t phys = memory->getPhysicalSegment64((IOByteCount)i * kVideoPage, &len);
-		UInt64 bus = (UInt64)phys + FRB_PCI_INBOUND_BASE;
+	{
+		QorIQDMAWalk *walk = fCore->dmaWalk(memory);
 
-		if (!phys || (phys & (kVideoPage - 1)) || len < kVideoPage || phys >= FRB_PCI_INBOUND_SIZE ||
-		    !frb_gart_bus_addr_ok(adev, bus)) {
-			IOLog("FirebrandAccel: video: page %lu at 0x%llx has no bus address\n", (unsigned long)i,
-			      (unsigned long long)phys);
-			frb_gart_unbind(adev, at, n);
-			frb_gart_free(adev, at, n);
-			return -EIO;
+		for (i = 0; i < n; i++) {
+			UInt64 bus = fCore->busOfPage(walk, memory, (UInt64)i * kVideoPage);
+
+			if (!bus || !frb_gart_bus_addr_ok(adev, bus)) {
+				IOLog("FirebrandAccel: video: page %lu at 0x%llx has no bus address\n",
+				      (unsigned long)i,
+				      (unsigned long long)memory->getPhysicalSegment64((IOByteCount)i * kVideoPage, 0));
+				if (walk)
+					delete walk;
+				frb_gart_unbind(adev, at, n);
+				frb_gart_free(adev, at, n);
+				return -EIO;
+			}
+			frb_gart_set_pte(adev, at + i, bus, FRB_PTE_GTT);
+			if (!i)
+				fCore->logBinding("video", memory, bus, n);
 		}
-		frb_gart_set_pte(adev, at + i, bus, FRB_PTE_GTT);
+		if (walk)
+			delete walk;
 	}
 	frb_gart_invalidate_tlb(adev);
 	fCore->busMaster();

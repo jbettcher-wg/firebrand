@@ -31,6 +31,7 @@ extern "C" {
 #include "frb_display.h"
 }
 #include "frb_user.h"
+#include "qoriq_dma.h"
 
 /*
  * RadeonNISubDeviceMemory, renamed: a sub-range of BAR0, for IOFramebuffer
@@ -76,6 +77,21 @@ public:
 	void lock(void) { if (fLock) IOLockLock(fLock); }
 	void unlock(void) { if (fLock) IOLockUnlock(fLock); }
 	struct frb_device *adev(void) { return &fAdev; }
+
+	/*
+	 * System memory as the card sees it (qoriq_dma.h). Switch
+	 * QorIQDMACommand / qdmacmd= off: CPU physical + inbound window 2, as
+	 * always. On: an IODMACommand walk -- the DART's address on a G5, the
+	 * kernel's translation on a T4240 that has one, else physical + the
+	 * bridge's PCIInboundDMAOffset. dmaWalk() makes the walker for a
+	 * prepared descriptor (inert when the switch is off) and busOfPage()
+	 * answers one page through it; 0 means no bus address.
+	 */
+	bool dmaCommand(void) const { return fDMACmd; }
+	QorIQDMAWalk *dmaWalk(IOMemoryDescriptor *md);
+	UInt64 busOfPage(QorIQDMAWalk *walk, IOMemoryDescriptor *md, UInt64 offset);
+	/* the first few bindings say what their first page became, either way */
+	void logBinding(const char *what, IOMemoryDescriptor *md, UInt64 bus, UInt32 pages);
 	/* the display once stage dce is done, else 0 */
 	struct frb_display *display(void);
 
@@ -184,6 +200,8 @@ private:
 
 	IOService *fOwner;
 	IOPCIDevice *fDevice;
+	bool fDMACmd;
+	UInt64 fDMAAdd, fDMALimit;
 	IOMemoryMap *fRegMap;
 	volatile UInt8 *fRegs;
 	IOMemoryMap *fFbMap;

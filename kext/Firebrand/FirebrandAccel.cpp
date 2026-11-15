@@ -25,9 +25,7 @@ extern "C" {
 #include "include/asic_reg/gmc/gmc_8_1_sh_mask.h"
 }
 
-/* RadeonNIAccel.cpp gartBusOf: inbound ATMU window 2, PCI 0x10_0000_0000 -> CPU 0, snooped */
-#define FRB_PCI_INBOUND_BASE	0x1000000000ULL
-#define FRB_PCI_INBOUND_SIZE	(1ULL << 36)
+/* Bus addresses: FirebrandCore::busOfPage() (qoriq_dma.h). */
 
 #define FRB_GL_BUNDLE_NAME	"RadeonNIGLDriver"	/* one bundle; FrostByte checks its renderer ID 0x00021a00 */
 #define FRB_GA_PLUGIN_TYPE	"ACCF0000-0000-0000-0000-000a2789904e"
@@ -1270,19 +1268,25 @@ IOReturn FirebrandAccel::gartBind(void *owner, task_t task, UInt64 address, UInt
 		if (frb_gart_alloc(adev, npages, &first))
 			ret = kIOReturnNoResources;
 	}
-	for (i = 0; ret == kIOReturnSuccess && i < npages; i++) {
-		IOByteCount len = 0;
-		addr64_t phys = memory->getPhysicalSegment64((IOByteCount)i * 4096, &len);
-		UInt64 bus = (UInt64)phys + FRB_PCI_INBOUND_BASE;
+	{
+		QorIQDMAWalk *walk = ret == kIOReturnSuccess ? fCore->dmaWalk(memory) : 0;
 
-		if (!phys || (phys & 4095) || len < 4096 || phys >= FRB_PCI_INBOUND_SIZE ||
-		    !frb_gart_bus_addr_ok(adev, bus)) {
-			IOLog("FirebrandAccel: GART_BIND: page %lu at 0x%llx has no bus address\n", (unsigned long)i,
-			      (unsigned long long)phys);
-			ret = kIOReturnVMError;
-			break;
+		for (i = 0; ret == kIOReturnSuccess && i < npages; i++) {
+			UInt64 bus = fCore->busOfPage(walk, memory, (UInt64)i * 4096);
+
+			if (!bus || !frb_gart_bus_addr_ok(adev, bus)) {
+				IOLog("FirebrandAccel: GART_BIND: page %lu at 0x%llx has no bus address\n",
+				      (unsigned long)i,
+				      (unsigned long long)memory->getPhysicalSegment64((IOByteCount)i * 4096, 0));
+				ret = kIOReturnVMError;
+				break;
+			}
+			frb_gart_set_pte(adev, first + i, bus, FRB_PTE_GTT);
+			if (!i)
+				fCore->logBinding("GART_BIND", memory, bus, npages);
 		}
-		frb_gart_set_pte(adev, first + i, bus, FRB_PTE_GTT);
+		if (walk)
+			delete walk;
 	}
 	if (ret == kIOReturnSuccess) {
 		frb_gart_invalidate_tlb(adev);

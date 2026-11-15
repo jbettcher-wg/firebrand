@@ -412,7 +412,7 @@ bool FirebrandCore::allocDummyPage(void)
 	}
 	bzero(fDummy->getBytesNoCopy(), 4096);
 	phys = fDummy->getPhysicalSegment64(0, &length);
-	if (!phys || phys >= FRB_PCI_INBOUND_SIZE || length < 4096) {
+	if (!phys || (!fDMACmd && phys >= FRB_PCI_INBOUND_SIZE) || length < 4096) {
 		IOLog("Firebrand: dummy page at 0x%llx is outside the inbound window\n",
 		      (unsigned long long)phys);
 		fDummy->complete();
@@ -420,10 +420,67 @@ bool FirebrandCore::allocDummyPage(void)
 		fDummy = 0;
 		return false;
 	}
-	fAdev.dummy_page_addr = (uint64_t)phys + FRB_PCI_INBOUND_BASE;
+	{
+		QorIQDMAWalk *walk = dmaWalk(fDummy);
+
+		fAdev.dummy_page_addr = busOfPage(walk, fDummy, 0);
+		if (walk)
+			delete walk;
+	}
+	if (!fAdev.dummy_page_addr) {
+		IOLog("Firebrand: dummy page at 0x%llx has no bus address\n", (unsigned long long)phys);
+		fDummy->complete();
+		fDummy->release();
+		fDummy = 0;
+		return false;
+	}
 	IOLog("Firebrand: dummy page: CPU 0x%llx, bus 0x%llx\n", (unsigned long long)phys,
 	      (unsigned long long)fAdev.dummy_page_addr);
 	return true;
+}
+
+/* --- bus addresses (FirebrandCore.h) ---------------------------------------- */
+
+/* The GPU's VM takes a 40-bit system address (RadeonNIAccel.cpp's too). */
+#define FRB_BUS_ADDRESS_BITS	40
+
+QorIQDMAWalk *FirebrandCore::dmaWalk(IOMemoryDescriptor *md)
+{
+	QorIQDMAWalk *walk;
+
+	if (!fDMACmd)
+		return 0;
+	walk = new QorIQDMAWalk(md, true, FRB_BUS_ADDRESS_BITS, fDMAAdd, fDMALimit, 4096);
+	if (walk && !walk->ready()) {
+		delete walk;
+		walk = 0;
+	}
+	return walk;
+}
+
+UInt64 FirebrandCore::busOfPage(QorIQDMAWalk *walk, IOMemoryDescriptor *md, UInt64 offset)
+{
+	IOByteCount len = 0;
+	addr64_t phys;
+
+	if (fDMACmd)
+		return walk ? walk->page(offset) : 0;
+	/* the pre-IODMACommand rule, unchanged */
+	phys = md->getPhysicalSegment64((IOByteCount)offset, &len);
+	if (!phys || (phys & 0xfff) || len < 4096 || phys >= FRB_PCI_INBOUND_SIZE)
+		return 0;
+	return (UInt64)phys + FRB_PCI_INBOUND_BASE;
+}
+
+void FirebrandCore::logBinding(const char *what, IOMemoryDescriptor *md, UInt64 bus, UInt32 pages)
+{
+	static SInt32 logged;
+
+	if (OSIncrementAtomic(&logged) >= 8)
+		return;
+	IOLog("Firebrand: %s: %lu page(s), first CPU 0x%llx -> bus 0x%llx (%s)\n", what, (unsigned long)pages,
+	      (unsigned long long)md->getPhysicalSegment64(0, 0), (unsigned long long)bus,
+	      fDMACmd ? "IODMACommand" : "physical + window 2");
 }
 
 /* --- GTT ------------------------------------------------------------------- */
@@ -459,14 +516,18 @@ int FirebrandCore::gttAlloc(uint32_t size, struct frb_gtt *gtt)
 		mem->release();
 		return -ENOMEM;
 	}
-	for (i = 0; i < npages && !r; i++) {
-		IOByteCount len = 0;
-		addr64_t phys = mem->getPhysicalSegment64(i * 4096, &len);
+	{
+		QorIQDMAWalk *walk = dmaWalk(mem);
 
-		if (!phys || (phys & 0xfff) || len < 4096 || phys >= FRB_PCI_INBOUND_SIZE)
-			r = -EIO;
-		else
-			bus[i] = (uint64_t)phys + FRB_PCI_INBOUND_BASE;
+		for (i = 0; i < npages && !r; i++) {
+			bus[i] = busOfPage(walk, mem, (UInt64)i * 4096);
+			if (!bus[i])
+				r = -EIO;
+		}
+		if (walk)
+			delete walk;
+		if (!r)
+			logBinding("GTT", mem, bus[0], npages);
 	}
 	if (!r)
 		r = frb_gart_alloc(&fAdev, npages, &first);
@@ -647,6 +708,19 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 	fDevice = dev;
 	if (!fDevice)
 		return false;
+
+	{
+		const char *from = 0, *how = 0;
+
+		fDMACmd = qoriqDMACommandSwitch(fOwner, &from);
+		fDMAAdd = fDMALimit = 0;
+		if (fDMACmd) {
+			fDMAAdd = qoriqDMAAddFor(fDevice, &how, &fDMALimit);
+			IOLog("Firebrand: DMA from IODMACommand (%s): %s, + 0x%llx\n", from, how,
+			      (unsigned long long)fDMAAdd);
+		} else
+			IOLog("Firebrand: DMA: physical + inbound window 2 (QorIQDMACommand off, %s)\n", from);
+	}
 
 	fLock = IOLockAlloc();
 	fLogMem = IOBufferMemoryDescriptor::withOptions(0, FRB_LOG_BYTES, 4096);

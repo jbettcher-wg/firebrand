@@ -14,7 +14,7 @@ BUILD  = build
 CC     = gcc-4.0
 CFLAGS = -arch ppc -static -mlong-branch -fno-common -msoft-float \
 	-DAPPLE -DKERNEL -DKERNEL_PRIVATE -DXNU_KERNEL_PRIVATE -DPRIVATE \
-	-D__MACHO__=1 -DPPC -Dppc -D__PPC__ -I$(K) -I. -O2 -Wall
+	-D__MACHO__=1 -DPPC -Dppc -D__PPC__ -I$(K) -I. -I../../shared -O2 -Wall
 
 all: $(BUILD)/$(NAME).kext
 

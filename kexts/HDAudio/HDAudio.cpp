@@ -70,6 +70,7 @@
 #include <mach/kmod.h>
 
 #include "hda_calc.h"
+#include "qoriq_dma.h"
 
 /* Controller registers, HDA 1.0a 3.3 */
 #define R_GCAP		0x00
@@ -130,6 +131,7 @@ class HDAudioDevice : public IOAudioDevice
     IOBufferMemoryDescriptor *	fArena;
     volatile UInt8 *		fVA;
     UInt64			fDev;		/* the arena as the device sees it */
+    bool			fDMACmd;	/* QorIQDMACommand: see allocArena */
     unsigned			fCorbN, fRirbN, fRirbRP, fISS, fSD, fTimeouts;
     unsigned			fCad;
     UInt8			fConv[MAX_NODES], fPin[MAX_NODES], fPinMux[MAX_NODES];
@@ -270,7 +272,32 @@ bool HDAudioDevice::allocArena()
     fVA = (volatile UInt8 *)fArena->getBytesNoCopy();
     bzero((void *)fVA, ARENA_SIZE);
     pa = fArena->getPhysicalSegment64(0, &len);	/* never getPhysicalSegment */
-    fDev = hda_dma_addr((hda_u64)pa, ARENA_SIZE);
+
+    /*
+     * Switch QorIQDMACommand / qdmacmd= off (the default): physical +
+     * inbound window 2, as always. On: IOKit's DMA path (qoriq_dma.h), with
+     * the controller's own address width (GCAP[64OK]), so the same binary
+     * gets DART addresses on a G5. On the T4240 both give the same number.
+     */
+    {
+	const char * from = 0, * how = 0;
+
+	fDMACmd = qoriqDMACommandSwitch(this, &from);
+	if (!fDMACmd)
+	    fDev = hda_dma_addr((hda_u64)pa, ARENA_SIZE);
+	else {
+	    UInt64 add, limit = 0, blen = 0;
+	    UInt8  bits = (rd16(0x00) & 0x0001) ? 64 : 32;	/* GCAP 64OK */
+
+	    add = qoriqDMAAddFor(fPCI, &how, &limit);
+	    fDev = qoriqDMABusAddress(fArena, 0, &blen, bits, add, limit);
+	    if (blen < ARENA_SIZE)
+		fDev = 0;
+	    IOLog("HDAudio: DMA from IODMACommand (%s, %u-bit): %s; arena at"
+		  " bus 0x%llx\n", from, (unsigned) bits, how,
+		  (unsigned long long) fDev);
+	}
+    }
     if (!pa || len < ARENA_SIZE || !fDev) {
 	IOLog("HDAudio: arena physical 0x%llx (%u of %u contiguous) is outside"
 	      " inbound window 2; refusing\n", (unsigned long long)pa,
