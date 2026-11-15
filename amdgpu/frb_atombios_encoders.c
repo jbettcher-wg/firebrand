@@ -2,7 +2,10 @@
  * atombios_encoders.c (Linux 6.16), the DIG (UNIPHY) paths DCE 11.2 uses:
  * DIGxEncoderControl 1.5, UNIPHYTransmitterControl 1.6, SelectCRTC_Source
  * 1.3, the transmitter INIT pass, and the DIG dpms sequence with DP link
- * training. DisplayPort only for now (the E9173 has nothing else).
+ * training; and the arms DCE 6 takes (Linux 7.0.2): DIGxEncoderControl
+ * 1.4, UNIPHYTransmitterControl 1.5, SelectCRTC_Source 1.2. Each parameter
+ * block is built byte by byte, its bitfield bytes by hand (atombios.h's
+ * bitfields lay out the other way round on a big-endian compiler).
  *
  * Copyright 2007-11 Advanced Micro Devices, Inc.
  * Copyright 2008 Red Hat Inc.
@@ -145,11 +148,45 @@ void frb_atombios_encoder_setup_dig_encoder(struct frb_device *adev, struct frb_
 
 	if (conn->dig_encoder == -1)
 		return;
-	if (frb_cmd_rev(adev, index, &frev, &crev) || frev != 1 || crev != 5) {
+	if (frb_cmd_rev(adev, index, &frev, &crev) || frev != 1 || (crev != 4 && crev != 5)) {
 		frb_err(adev, "display: DIGxEncoderControl %u.%u not handled", frev, crev);
 		return;
 	}
 	frb_ps_init(&ps);
+	if (crev == 4) {
+		/* DIG_ENCODER_CONTROL_PARAMETERS_V4 (DCE6/8); ucConfig: link rate in bits 0-1, DIG in 4-6 */
+		int is_dp = frb_atombios_encoder_get_encoder_mode(conn) == ATOM_ENCODER_MODE_DP;
+		uint8_t config = 0;
+
+		frb_ps_u8(&ps, OFS(DIG_ENCODER_CONTROL_PARAMETERS_V4, ucAction), action);
+		frb_ps_le16(&ps, OFS(DIG_ENCODER_CONTROL_PARAMETERS_V4, usPixelClock), conn->pixel_clock / 10);
+		if (action == ATOM_ENCODER_CMD_SETUP_PANEL_MODE)
+			frb_ps_u8(&ps, OFS(DIG_ENCODER_CONTROL_PARAMETERS_V4, ucPanelMode), panel_mode);
+		else
+			frb_ps_u8(&ps, OFS(DIG_ENCODER_CONTROL_PARAMETERS_V4, ucEncoderMode),
+				  frb_atombios_encoder_get_encoder_mode(conn));
+		if (is_dp)
+			frb_ps_u8(&ps, OFS(DIG_ENCODER_CONTROL_PARAMETERS_V4, ucLaneNum), conn->dp_lane_count);
+		else
+			frb_ps_u8(&ps, OFS(DIG_ENCODER_CONTROL_PARAMETERS_V4, ucLaneNum),
+				  frb_dig_monitor_is_duallink(conn, conn->pixel_clock) ? 8 : 4);
+		if (is_dp) {
+			if (conn->dp_clock == 540000)
+				config |= ATOM_ENCODER_CONFIG_V4_DPLINKRATE_5_40GHZ;
+			else if (conn->dp_clock == 324000)
+				config |= ATOM_ENCODER_CONFIG_V4_DPLINKRATE_3_24GHZ;
+			else if (conn->dp_clock == 270000)
+				config |= ATOM_ENCODER_CONFIG_V4_DPLINKRATE_2_70GHZ;
+			else
+				config |= ATOM_ENCODER_CONFIG_V4_DPLINKRATE_1_62GHZ;
+		}
+		config |= (uint8_t)((conn->dig_encoder & 7) << 4);	/* acConfig.ucDigSel */
+		frb_ps_u8(&ps, OFS(DIG_ENCODER_CONTROL_PARAMETERS_V4, ucConfig), config);
+		frb_ps_u8(&ps, OFS(DIG_ENCODER_CONTROL_PARAMETERS_V4, ucBitPerColor), frb_atombios_encoder_get_bpc(c));
+		frb_ps_u8(&ps, OFS(DIG_ENCODER_CONTROL_PARAMETERS_V4, ucHPD_ID), conn->hpd < 0 ? 0 : conn->hpd + 1);
+		frb_ps_exec(adev, index, &ps);
+		return;
+	}
 	switch (action) {
 	case ATOM_ENCODER_CMD_SETUP_PANEL_MODE:
 		frb_ps_u8(&ps, OFS(DP_PANEL_MODE_SETUP_PARAMETERS_V5, ucAction), action);
@@ -198,19 +235,14 @@ void frb_atombios_encoder_setup_dig_transmitter(struct frb_device *adev, struct 
 	uint8_t frev, crev, phy = 0;
 
 	(void)lane_num;
-	(void)c;
 	if (action == ATOM_TRANSMITTER_ACTION_INIT)
 		dig_encoder = 0;	/* "the encoder isn't used for init" */
 	if (dig_encoder == -1)
 		return;
-	if (frb_cmd_rev(adev, index, &frev, &crev) || frev != 1 || crev != 6) {
+	if (frb_cmd_rev(adev, index, &frev, &crev) || frev != 1 || (crev != 5 && crev != 6)) {
 		frb_err(adev, "display: UNIPHYTransmitterControl %u.%u not handled", frev, crev);
 		return;
 	}
-	frb_ps_init(&ps);
-	frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_6, ucAction), action);
-	frb_ps_le32(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_6, ulSymClock),
-		    is_dp ? conn->dp_clock / 10 : conn->pixel_clock / 10);
 	switch (conn->encoder_id) {
 	case ENCODER_OBJECT_ID_INTERNAL_UNIPHY:
 		phy = conn->linkb ? ATOM_PHY_ID_UNIPHYB : ATOM_PHY_ID_UNIPHYA;
@@ -225,6 +257,44 @@ void frb_atombios_encoder_setup_dig_transmitter(struct frb_device *adev, struct 
 		phy = ATOM_PHY_ID_UNIPHYG;
 		break;
 	}
+	frb_ps_init(&ps);
+	if (crev == 5) {
+		/*
+		 * DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5 (DCE6/8). ucConfig
+		 * (ATOM_DIG_TRANSMITTER_CONFIG_V5): bit 1 coherent mode, bits
+		 * 2-3 the PHY's clock source, bits 4-6 the HPD line + 1.
+		 */
+		uint8_t config = 0, clk_src;
+		/* amdgpu: the CRTC's pll_id, 0 for INIT (no CRTC yet) */
+		int pll_id = (c && action != ATOM_TRANSMITTER_ACTION_INIT) ? c->pll_id : 0;
+
+		frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5, ucAction), action);
+		frb_ps_le16(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5, usSymClock),
+			    is_dp ? conn->dp_clock / 10 : conn->pixel_clock / 10);
+		frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5, ucPhyId), phy);
+		frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5, ucLaneNum),
+			  is_dp ? conn->dp_lane_count : frb_dig_monitor_is_duallink(conn, conn->pixel_clock) ? 8 : 4);
+		frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5, ucConnObjId), conn->connector_type);
+		frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5, ucDigMode),
+			  frb_atombios_encoder_get_encoder_mode(conn));
+		if (is_dp && adev->display && adev->display->dp_extclk)
+			clk_src = ENCODER_REFCLK_SRC_EXTCLK;
+		else
+			clk_src = (uint8_t)pll_id;
+		config |= (uint8_t)((clk_src & 3) << 2);
+		/* DP requires coherent; a DFP's dig->coherent_mode is amdgpu's default (true) */
+		if (is_dp || (conn->devices & ATOM_DEVICE_DFP_SUPPORT))
+			config |= 1 << 1;
+		config |= (uint8_t)(((conn->hpd < 0 ? 0 : conn->hpd + 1) & 7) << 4);
+		frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5, ucConfig), config);
+		frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5, ucDigEncoderSel), 1 << dig_encoder);
+		frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5, ucDPLaneSet), lane_set);
+		frb_ps_exec(adev, index, &ps);
+		return;
+	}
+	frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_6, ucAction), action);
+	frb_ps_le32(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_6, ulSymClock),
+		    is_dp ? conn->dp_clock / 10 : conn->pixel_clock / 10);
 	frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_6, ucPhyId), phy);
 	frb_ps_u8(&ps, OFS(DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_6, ucLaneNum),
 		  is_dp ? conn->dp_lane_count : frb_dig_monitor_is_duallink(conn, conn->pixel_clock) ? 8 : 4);
@@ -251,13 +321,22 @@ void frb_atombios_encoder_set_crtc_source(struct frb_device *adev, struct frb_cr
 	struct frb_ps ps;
 	uint8_t frev, crev;
 
-	if (frb_cmd_rev(adev, index, &frev, &crev) || frev != 1 || crev != 3) {
+	if (frb_cmd_rev(adev, index, &frev, &crev) || frev != 1 || (crev != 2 && crev != 3)) {
 		frb_err(adev, "display: SelectCRTC_Source %u.%u not handled", frev, crev);
 		return;
 	}
 	if (c->conn->dig_encoder < 0 || c->conn->dig_encoder > 6)
 		return;
 	frb_ps_init(&ps);
+	if (crev == 2) {
+		/* SELECT_CRTC_SOURCE_PARAMETERS_V2 (DCE6/8): no destination bpc */
+		frb_ps_u8(&ps, OFS(SELECT_CRTC_SOURCE_PARAMETERS_V2, ucCRTC), c->crtc_id);
+		frb_ps_u8(&ps, OFS(SELECT_CRTC_SOURCE_PARAMETERS_V2, ucEncodeMode),
+			  frb_atombios_encoder_get_encoder_mode(c->conn));
+		frb_ps_u8(&ps, OFS(SELECT_CRTC_SOURCE_PARAMETERS_V2, ucEncoderID), dig_id[c->conn->dig_encoder]);
+		frb_ps_exec(adev, index, &ps);
+		return;
+	}
 	frb_ps_u8(&ps, OFS(SELECT_CRTC_SOURCE_PARAMETERS_V3, ucCRTC), c->crtc_id);
 	frb_ps_u8(&ps, OFS(SELECT_CRTC_SOURCE_PARAMETERS_V3, ucEncodeMode), frb_atombios_encoder_get_encoder_mode(c->conn));
 	frb_ps_u8(&ps, OFS(SELECT_CRTC_SOURCE_PARAMETERS_V3, ucDstBpc), frb_atombios_encoder_get_bpc(c));

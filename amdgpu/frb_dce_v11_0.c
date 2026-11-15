@@ -72,7 +72,7 @@ static const uint32_t polaris11_golden_settings_a11[] = {
 };
 
 /* dce_v11_0_hpd_sense */
-int frb_dce_v11_0_hpd_sense(struct frb_device *adev, int hpd)
+static int dce_v11_0_hpd_sense(struct frb_device *adev, int hpd)
 {
 	if (hpd < 0 || hpd >= 6)
 		return 0;
@@ -80,7 +80,7 @@ int frb_dce_v11_0_hpd_sense(struct frb_device *adev, int hpd)
 }
 
 /* DC_GPIO_HPD_Y's bit for each line (DC_GPIO_HPD1_Y .. HPD6_Y: not evenly spaced) */
-int frb_dce_v11_0_hpd_pad(struct frb_device *adev, int hpd)
+static int dce_v11_0_hpd_pad(struct frb_device *adev, int hpd)
 {
 	static const uint32_t y[6] = { 0x1, 0x100, 0x10000, 0x1000000, 0x4000000, 0x10000000 };
 
@@ -126,13 +126,13 @@ static void hpd_init(struct frb_device *adev, struct frb_display *d)
 		WREG32(mmDC_HPD_INT_CONTROL + hpd_offsets[hpd], tmp);
 		tmp = RREG32(mmDC_HPD_INT_CONTROL + hpd_offsets[hpd]);
 		tmp = REG_SET_FIELD(tmp, DC_HPD_INT_CONTROL, DC_HPD_INT_POLARITY,
-				    frb_dce_v11_0_hpd_sense(adev, hpd) ? 0 : 1);
+				    dce_v11_0_hpd_sense(adev, hpd) ? 0 : 1);
 		WREG32(mmDC_HPD_INT_CONTROL + hpd_offsets[hpd], tmp);
 	}
 }
 
 /* dce_v11_0_hw_init (+ early/sw_init's counts and the object table) */
-int frb_dce_v11_0_hw_init(struct frb_device *adev, struct frb_display *d)
+static int dce_v11_0_hw_init(struct frb_device *adev, struct frb_display *d)
 {
 	const uint8_t *bios = adev->bios;
 	uint16_t off;
@@ -204,7 +204,7 @@ int frb_dce_v11_0_hw_init(struct frb_device *adev, struct frb_display *d)
  * for DVI/HDMI connectors the DDC probe and EDID (amdgpu_connector_dvi_detect).
  * Returns the first connected connector, or -1.
  */
-int frb_display_detect(struct frb_device *adev, struct frb_display *d)
+static int dce_v11_0_detect(struct frb_device *adev, struct frb_display *d)
 {
 	int i, found = -1;
 
@@ -222,12 +222,25 @@ int frb_display_detect(struct frb_device *adev, struct frb_display *d)
 			 * EDID; digital input (byte 20 bit 7) is a TMDS sink.
 			 * The HPD line is only logged (amdgpu decides on DDC).
 			 */
-			sense = frb_dce_v11_0_hpd_sense(adev, c->hpd);
+			sense = dce_v11_0_hpd_sense(adev, c->hpd);
 			if (frb_ddc_probe(adev, c) && !frb_ddc_read_edid(adev, c) && c->edid_len >= 128 &&
 			    (c->edid[20] & 0x80)) {
 				c->sink_tmds = 1;
 				c->is_hdmi = frb_edid_is_hdmi(c->edid, c->edid_len);
 				connected = 1;
+			} else if (adev->force_tmds) {
+				/* the test aid: drive the link blind with DMT modes, as RadeonNI's FakeEDID did */
+				c->edid_len = 0;
+				c->sink_tmds = 1;
+				connected = 1;
+				if (c->detect_logged != 8)
+					frb_info(adev, "display: connector %d (hpd %d): no sink answers; taken as a DVI sink "
+						 "with no EDID (FirebrandForceTMDS)", i, c->hpd);
+				c->detect_logged = 8;
+				if (found < 0)
+					found = i;
+				frb_atombios_encoder_set_bios_scratch_regs(adev, c, connected);
+				continue;
 			}
 			frb_atombios_encoder_set_bios_scratch_regs(adev, c, connected);
 			if (!connected) {
@@ -252,7 +265,7 @@ int frb_display_detect(struct frb_device *adev, struct frb_display *d)
 			continue;
 		}
 		c->dp_sink_type = frb_dp_get_sinktype(adev, c);
-		sense = frb_dce_v11_0_hpd_sense(adev, c->hpd);
+		sense = dce_v11_0_hpd_sense(adev, c->hpd);
 		if (sense) {
 			connected = 1;
 			if (c->dp_sink_type == CONNECTOR_OBJECT_ID_DISPLAYPORT)
@@ -267,7 +280,7 @@ int frb_display_detect(struct frb_device *adev, struct frb_display *d)
 			c->detect_logged = 4;
 			if (c->detect_logged != was)
 				frb_info(adev, "display: connector %d (hpd %d): nothing (sink type 0x%x, pad %d)", i, c->hpd,
-					 c->dp_sink_type, frb_dce_v11_0_hpd_pad(adev, c->hpd));
+					 c->dp_sink_type, dce_v11_0_hpd_pad(adev, c->hpd));
 			continue;
 		}
 		if (c->dp_sink_type != CONNECTOR_OBJECT_ID_DISPLAYPORT || !c->dpcd[0]) {
@@ -282,7 +295,7 @@ int frb_display_detect(struct frb_device *adev, struct frb_display *d)
 			if (c->detect_logged != was)
 				frb_info(adev, "display: connector %d (hpd %d): HPD line up (pad %d, DC_HPD_INT_STATUS %08x) "
 					 "but no DPCD answers: no DisplayPort sink", i, c->hpd,
-					 frb_dce_v11_0_hpd_pad(adev, c->hpd),
+					 dce_v11_0_hpd_pad(adev, c->hpd),
 					 c->hpd >= 0 && c->hpd < 6 ? RREG32(mmDC_HPD_INT_STATUS + hpd_offsets[c->hpd]) : 0);
 			continue;
 		}
@@ -297,28 +310,6 @@ int frb_display_detect(struct frb_device *adev, struct frb_display *d)
 			found = i;
 	}
 	return found;
-}
-
-/*
- * Stage dce: dce_v11_0 sw_init's object table and hw_init, then what DRM's
- * first probe does (each connector's detect and EDID).
- */
-int frb_display_init(struct frb_device *adev)
-{
-	struct frb_display *d = adev->display;
-	int r;
-
-	if (!d) {
-		d = (struct frb_display *)adev->os->alloc(adev->os->cookie, sizeof(*d));
-		if (!d)
-			return -ENOMEM;
-		adev->display = d;
-	}
-	r = frb_dce_v11_0_hw_init(adev, d);
-	if (r)
-		return r;
-	frb_display_detect(adev, d);
-	return 0;
 }
 
 /* dce_v11_0_hpd_fini */
@@ -338,30 +329,8 @@ static void hpd_fini(struct frb_device *adev, struct frb_display *d)
 	}
 }
 
-/*
- * The unload: amdgpu_device_fini_hw's drm_helper_force_disable_all (the
- * CRTC and its encoder off), DP audio's teardown (RadeonNI's
- * rdn_dce8_afmt_fini), then dce_v11_0_hw_fini (hpd_fini; the pageflip
- * interrupts were never set up).
- */
-void frb_display_fini(struct frb_device *adev)
-{
-	struct frb_display *d = adev->display;
-
-	if (!d)
-		return;
-	if (d->ready) {
-		frb_display_off(adev, d);
-		if (adev->want_audio)
-			frb_audio_fini(adev, d);	/* rdn_dce8_afmt_fini */
-		hpd_fini(adev, d);
-	}
-	adev->os->free(adev->os->cookie, d);
-	adev->display = NULL;
-}
-
 /* dce_v11_0_crtc_load_lut, from the CRTC's gamma store */
-void frb_dce_v11_0_load_lut(struct frb_device *adev, struct frb_crtc *c)
+static void dce_v11_0_load_lut(struct frb_device *adev, struct frb_crtc *c)
 {
 	uint32_t o = c->crtc_offset, tmp;
 	int i;
@@ -414,7 +383,7 @@ void frb_dce_v11_0_load_lut(struct frb_device *adev, struct frb_crtc *c)
 	WREG32(mmALPHA_CONTROL + o, tmp);
 }
 
-int frb_display_read_lut(struct frb_device *adev, struct frb_display *d, uint32_t *out)
+static int dce_v11_0_read_lut(struct frb_device *adev, struct frb_display *d, uint32_t *out)
 {
 	struct frb_crtc *c = &d->crtc;
 	uint32_t o = c->crtc_offset;
@@ -428,18 +397,6 @@ int frb_display_read_lut(struct frb_device *adev, struct frb_display *d, uint32_
 		out[i] = RREG32(mmDC_LUT_30_COLOR + o);
 	}
 	return 0;
-}
-
-void frb_display_set_gamma(struct frb_device *adev, struct frb_display *d,
-			   const uint16_t *r, const uint16_t *g, const uint16_t *b)
-{
-	struct frb_crtc *c = &d->crtc;
-
-	memcpy(c->gamma[0], r, sizeof(c->gamma[0]));
-	memcpy(c->gamma[1], g, sizeof(c->gamma[1]));
-	memcpy(c->gamma[2], b, sizeof(c->gamma[2]));
-	if (c->enabled)
-		frb_dce_v11_0_load_lut(adev, c);
 }
 
 /* dce_v11_0_program_fmt, 8 bpc, no dither: truncate to 8 */
@@ -861,12 +818,9 @@ static void amdgpu_dpm_compute_clocks(struct frb_device *adev, struct frb_displa
 }
 
 /* after the DPM init: tell powerplay about a display stage dce lit before it */
-void frb_display_dpm_changed(struct frb_device *adev)
+static void dce_v11_0_dpm_changed(struct frb_device *adev, struct frb_display *d)
 {
-	struct frb_display *d = adev->display;
-
-	if (d && d->ready)
-		amdgpu_dpm_compute_clocks(adev, d);
+	amdgpu_dpm_compute_clocks(adev, d);
 }
 
 /* dce_v11_0_crtc_dpms */
@@ -878,7 +832,7 @@ static void crtc_dpms(struct frb_device *adev, struct frb_crtc *c, int on)
 		vga_enable(adev, c, 1);
 		frb_atombios_crtc_blank(adev, c, ATOM_DISABLE);
 		vga_enable(adev, c, 0);
-		frb_dce_v11_0_load_lut(adev, c);
+		dce_v11_0_load_lut(adev, c);
 	} else {
 		if (c->enabled) {
 			vga_enable(adev, c, 1);
@@ -910,37 +864,6 @@ static int pick_pll(struct frb_connector *conn)
 	}
 }
 
-int frb_display_mode_valid(const struct frb_connector *c, const struct frb_mode *mode, uint32_t max_rate)
-{
-	uint32_t rate, lanes;
-
-	if (!c || !mode || !mode->clock || mode->clock > FRB_MODE_MAX_CLOCK)
-		return 0;
-	if (frb_connector_is_tmds(c)) {
-		if (!c->sink_tmds)
-			return 0;
-		if (mode->clock <= 165000)
-			return 1;
-		if (c->connector_type == CONNECTOR_OBJECT_ID_DUAL_LINK_DVI_I ||
-		    c->connector_type == CONNECTOR_OBJECT_ID_DUAL_LINK_DVI_D ||
-		    c->connector_type == CONNECTOR_OBJECT_ID_HDMI_TYPE_B)
-			return c->is_hdmi ? mode->clock <= 340000 : mode->clock <= 330000;
-		/* HDMI 1.3+ supports max clock of 340 Mhz */
-		return c->is_hdmi && mode->clock <= 340000;
-	}
-	switch (c->dpcd[1]) {
-	case 0x0a:		rate = 270000; break;
-	case 0x14: case 0x1e:	rate = 540000; break;
-	default:		rate = 162000; break;
-	}
-	if (max_rate && max_rate < rate)
-		rate = max_rate;
-	lanes = c->dpcd[2] & 0x1f;
-	if (lanes > 4)
-		lanes = 4;
-	return c->dpcd[0] && (uint64_t)lanes * rate * 8 / 24 >= mode->clock;
-}
-
 static int pick_dig_encoder(struct frb_connector *conn)
 {
 	switch (conn->encoder_id) {
@@ -957,8 +880,10 @@ static int pick_dig_encoder(struct frb_connector *conn)
  * CRTC0. max_link_rate (kHz, 0 = the sink's) lets a first light run slower.
  */
 static void dce_v11_0_cursor_reset(struct frb_device *adev, struct frb_crtc *c);
+static void dce_v11_0_off(struct frb_device *adev, struct frb_display *d);
+static void dce_v11_0_report(struct frb_device *adev, struct frb_display *d);
 
-int frb_display_set_mode(struct frb_device *adev, struct frb_display *d, struct frb_connector *conn,
+static int dce_v11_0_set_mode(struct frb_device *adev, struct frb_display *d, struct frb_connector *conn,
 			 const struct frb_mode *mode, uint32_t fb_offset, uint32_t pitch_pixels,
 			 uint32_t bpp, uint32_t max_link_rate)
 {
@@ -995,7 +920,7 @@ int frb_display_set_mode(struct frb_device *adev, struct frb_display *d, struct 
 		return -ERANGE;
 	}
 	if (c->conn && c->conn != conn)
-		frb_display_off(adev, d);
+		dce_v11_0_off(adev, d);
 	c->conn = conn;
 	c->mode = *mode;
 	c->fb_offset = fb_offset;
@@ -1079,7 +1004,7 @@ int frb_display_set_mode(struct frb_device *adev, struct frb_display *d, struct 
 		frb_audio_dp_enable(adev, d, conn->dig_encoder, true);
 	frb_atombios_scratch_regs_lock(adev, 0);
 	frb_dp_link_report(adev, conn);
-	frb_display_report(adev, d);
+	dce_v11_0_report(adev, d);
 	return 0;
 }
 
@@ -1150,7 +1075,7 @@ static int dce_v11_0_cursor_move_locked(struct frb_device *adev, struct frb_crtc
  * framebuffer owns it) and the hot spot 0: IOFramebuffer positions the
  * image's top left. Off: bar_offset ~0u.
  */
-int frb_display_cursor_set(struct frb_device *adev, struct frb_display *d, uint32_t bar_offset,
+static int dce_v11_0_cursor_set(struct frb_device *adev, struct frb_display *d, uint32_t bar_offset,
 			   uint32_t width, uint32_t height)
 {
 	struct frb_crtc *c = &d->crtc;
@@ -1185,7 +1110,7 @@ int frb_display_cursor_set(struct frb_device *adev, struct frb_display *d, uint3
 }
 
 /* dce_v11_0_crtc_cursor_move, and IOFramebuffer's setCursorState(visible) */
-int frb_display_cursor_move(struct frb_device *adev, struct frb_display *d, int x, int y, int visible)
+static int dce_v11_0_cursor_move(struct frb_device *adev, struct frb_display *d, int x, int y, int visible)
 {
 	struct frb_crtc *c = &d->crtc;
 
@@ -1224,7 +1149,7 @@ static void dce_v11_0_cursor_reset(struct frb_device *adev, struct frb_crtc *c)
  * then dce_v11_0_crtc_disable (dpms off, GRPH off, power gate; the DP DTO
  * has no PLL to turn off), then the line buffer is released.
  */
-void frb_display_off(struct frb_device *adev, struct frb_display *d)
+static void dce_v11_0_off(struct frb_device *adev, struct frb_display *d)
 {
 	struct frb_crtc *c = &d->crtc;
 
@@ -1246,7 +1171,7 @@ void frb_display_off(struct frb_device *adev, struct frb_display *d)
 }
 
 /* the scanout state, for the log: is the pipe alive */
-void frb_display_report(struct frb_device *adev, struct frb_display *d)
+static void dce_v11_0_report(struct frb_device *adev, struct frb_display *d)
 {
 	uint32_t o = d->crtc.crtc_offset, a, b;
 
@@ -1261,3 +1186,30 @@ void frb_display_report(struct frb_device *adev, struct frb_display *d)
 		 RREG32(mmGRPH_PRIMARY_SURFACE_ADDRESS_HIGH + o), RREG32(mmGRPH_PRIMARY_SURFACE_ADDRESS + o),
 		 RREG32(mmGRPH_PITCH + o), RREG32(mmVIEWPORT_SIZE + o));
 }
+
+/* frb_display_funcs.hpd_sense: the connector's HPD pin */
+static int dce_v11_0_conn_hpd_sense(struct frb_device *adev, const struct frb_connector *c)
+{
+	return dce_v11_0_hpd_sense(adev, c->hpd);
+}
+
+const struct frb_display_funcs frb_dce_v11_0_funcs = {
+	.name = "dce_v11_0",
+	.has_audio = 1,
+	.audio_regs = &frb_audio_regs_dce11,
+	.cursor_max = FRB_CURSOR_MAX,
+	.hpd_gpio_reg = mmDC_GPIO_HPD_A,
+	.hw_init = dce_v11_0_hw_init,
+	.hw_fini = hpd_fini,
+	.hpd_sense = dce_v11_0_conn_hpd_sense,
+	.hpd_pad = dce_v11_0_hpd_pad,
+	.detect = dce_v11_0_detect,
+	.set_mode = dce_v11_0_set_mode,
+	.off = dce_v11_0_off,
+	.dpm_changed = dce_v11_0_dpm_changed,
+	.report = dce_v11_0_report,
+	.load_lut = dce_v11_0_load_lut,
+	.read_lut = dce_v11_0_read_lut,
+	.cursor_set = dce_v11_0_cursor_set,
+	.cursor_move = dce_v11_0_cursor_move,
+};

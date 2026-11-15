@@ -9,6 +9,7 @@
 #   HDAudio.kext         DisplayPort audio (kexts/HDAudio)
 #   RadeonNIGA.plugin    the window server's 2D plug-in (radeonni/ga)
 #   frbctl               the driver's control and status tool (tools/frbctl.c)
+#   Firebrand Monitor    the status app: clocks, temperature, load (tools/FirebrandMonitor)
 # and copies in RadeonNIGLDriver.bundle, the OpenGL driver, from build/gl if it is there (it is
 # cross-built on a Linux or macOS machine by radeonni/build-gl.sh; scripts/build-remote.sh brings
 # it along).
@@ -24,7 +25,10 @@
 #
 # IT INSTALLS NOTHING. To install: sudo build/dist/Firebrand/install.sh (README.md).
 #
-# FRB_JOBS (default 2) sets make's parallelism for the driver.
+# FRB_JOBS (default 2) sets make's parallelism for the driver. FRB_BRINGUP (default vega20)
+# is the kext Makefile's BRINGUP: vega20 adds the Instinct MI50 (1002:66a1) to the cards the
+# driver matches and embeds its microcode (kext/Firebrand/firmware-vega20.list); FRB_BRINGUP=
+# (empty) builds for the SI and Polaris cards alone.
 #
 # Copyright (c) 2026 Jordan Bettcher
 # SPDX-License-Identifier: MIT
@@ -33,6 +37,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 JOBS="${FRB_JOBS:-2}"
+BRINGUP="${FRB_BRINGUP-vega20}"
 SDK="${SDK:-/Developer/SDKs/MacOSX10.5.sdk}"
 DIST="$ROOT/build/dist/Firebrand"
 
@@ -54,7 +59,9 @@ if [ ! -d "$SDK" ]; then
 fi
 
 missing=
-for f in $(sed 's/#.*//' kext/Firebrand/firmware.list) LICENSE.amdgpu; do
+lists=kext/Firebrand/firmware.list
+[ "$BRINGUP" != vega20 ] || lists="$lists kext/Firebrand/firmware-vega20.list"
+for f in $(sed 's/#.*//' $lists) LICENSE.amdgpu; do
 	[ -s "firmware/$f" ] || missing="$missing $f"
 done
 [ -z "$missing" ] || die "firmware/ lacks$missing. Run scripts/fetch-firmware.sh on a current machine and copy firmware/ here."
@@ -74,8 +81,8 @@ gates() {
 	echo "   checks: $jbsr JBSR, 0 external BR24, $(nm -u "$exe" | wc -l | tr -d ' ') undefined symbols, none mangled from the library"
 }
 
-say "Firebrand.kext (make -j$JOBS)"
-make -C kext/Firebrand -j"$JOBS" >build/build-firebrand.log 2>&1 || { tail -30 build/build-firebrand.log >&2; die "the driver did not build (build/build-firebrand.log)"; }
+say "Firebrand.kext (make -j$JOBS BRINGUP=$BRINGUP)"
+make -C kext/Firebrand -j"$JOBS" BRINGUP="$BRINGUP" >build/build-firebrand.log 2>&1 || { tail -30 build/build-firebrand.log >&2; die "the driver did not build (build/build-firebrand.log)"; }
 echo "   warnings: $(grep -c 'warning:' build/build-firebrand.log || true)"
 gates kext/Firebrand/build/Firebrand.kext/Contents/MacOS/Firebrand
 
@@ -87,14 +94,18 @@ say "RadeonNIGA.plugin"
 make -C radeonni/ga SDK="$SDK" >build/build-ga.log 2>&1 || { tail -30 build/build-ga.log >&2; die "the 2D plug-in did not build (build/build-ga.log)"; }
 
 say "frbctl"
-gcc -std=gnu99 -Wall -O1 -Ikext/Firebrand -Ishared -o build/frbctl tools/frbctl.c shared/frb_edid.c shared/frb_dmt.c \
+gcc -std=gnu99 -Wall -O1 -Ikext/Firebrand -Ishared -o build/frbctl tools/frbctl.c tools/frb_status.c shared/frb_edid.c shared/frb_dmt.c \
 	-framework IOKit -framework CoreFoundation
+
+say "Firebrand Monitor.app"
+tools/FirebrandMonitor/build.sh >build/build-monitor.log 2>&1 || { tail -30 build/build-monitor.log >&2; die "Firebrand Monitor did not build (build/build-monitor.log)"; }
 
 say "build/dist/Firebrand"
 rm -rf "$DIST"
 mkdir -p "$DIST"
 cp -R kext/Firebrand/build/Firebrand.kext kexts/HDAudio/build/HDAudio.kext radeonni/ga/build/RadeonNIGA.plugin "$DIST/"
 cp build/frbctl scripts/install.sh scripts/uninstall.sh "$DIST/"
+cp -R "tools/FirebrandMonitor/build/Firebrand Monitor.app" "$DIST/"
 cp README.md LICENSE NOTICE "$DIST/"
 cp -R LICENSES "$DIST/"
 if [ -d build/gl/RadeonNIGLDriver.bundle ]; then

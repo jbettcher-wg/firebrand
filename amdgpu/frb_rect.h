@@ -5,16 +5,32 @@
  * submits them on SDMA0 (FirebrandAccel.cpp). Nothing here touches the card,
  * so the host tests run it against a model of the engine (tests/frb_unit.c).
  *
- * Packets (tonga_sdma_pkt_open.h, SDMA v3):
+ * Packets (tonga_sdma_pkt_open.h, SDMA v3; vega10_sdma_pkt_open.h, SDMA v4):
  *   COPY_LINEAR_SUB_WINDOW  one rectangle, any pitches, 4-byte elements;
  *                           Mesa's cik_sdma_copy_texture layout for GFX8
- *                           (pitch, slice pitch and the extent minus one)
+ *                           (pitch, slice pitch and the extent minus one).
+ *                           SDMA 4 moves the pitches to bits 31:13 (19 bits;
+ *                           SDMA 3: 29:16, 14 bits), the rest unchanged
+ *                           (Mesa's ac_emit_sdma_copy_linear_sub_window,
+ *                           pitch_shift 13 from SDMA_4_0)
  *   CONSTANT_FILL           FILLSIZE 2: a dword fill (Mesa's
  *                           SDMA_CONSTANT_FILL_EXTRA_SIZE(2)); FILLSIZE 0, what
  *                           amdgpu uses, repeats the data's low byte
  *                           (frb_sdma_v3_0.c), which a pixel whose four bytes
  *                           differ cannot use. One packet a row, one for a
- *                           run of whole rows.
+ *                           run of whole rows. The count is in bytes; SDMA 4
+ *                           takes it less one (sdma_v4_0_emit_fill_buffer,
+ *                           Mesa's ac_emit_sdma_constant_fill), SDMA 3 as it is.
+ * The IB says which engine it is for (frb_rect_ib.sdma4; the kext sets it
+ * from frb_is_soc15). Everything else here is the same on both.
+ *
+ * Southern Islands' DMA engine (si_dma.c, sid.h DMA_PACKET; frb_rect_ib.si_dma):
+ *   COPY                    linear, a byte count (amdgpu's si_dma_emit_copy_buffer):
+ *                           no sub-window packet, so one per row, or one for
+ *                           a run of whole rows when both surfaces have the
+ *                           rectangle's width as their pitch
+ *   CONSTANT_FILL           a dword count of the dword `data` (si_dma's fill
+ *                           repeats the whole dword), one per row or run
  *
  * Surfaces are 32 bits a pixel, linear, at dword-aligned GPU addresses. The
  * engine copies bytes unchanged, so a surface keeps the CPU's byte order
@@ -47,7 +63,10 @@
 #define FRB_RECT_MAX		16384u		/* pitch, width, height, x + w, y + h: the packet's 14-bit fields */
 #define FRB_RECT_COPY_DW	13u		/* COPY_LINEAR_SUB_WINDOW */
 #define FRB_RECT_FILL_DW	5u		/* CONSTANT_FILL */
-#define FRB_RECT_FILL_MAX_BYTES	0x3fffe0u	/* sdma_v3_0's fill_max_bytes */
+#define FRB_RECT_FILL_MAX_BYTES	0x3fffe0u	/* sdma_v3_0's fill_max_bytes (sdma_v4_0's is 1 << 22) */
+#define FRB_RECT_SI_COPY_DW	5u		/* SI DMA COPY (one row or run) */
+#define FRB_RECT_SI_FILL_DW	4u		/* SI DMA CONSTANT_FILL */
+#define FRB_RECT_SI_MAX_BYTES	0xffff8u	/* si_dma's copy_max_bytes and fill_max_bytes */
 
 struct frb_rect_surface {
 	uint64_t gpu_addr;		/* pixel (0, 0) */
@@ -64,6 +83,8 @@ struct frb_rect_move {
 struct frb_rect_ib {
 	uint8_t *buf;
 	uint32_t len_dw, cap_dw;
+	int sdma4;			/* for SDMA 4 (SOC15): its pitch field and count less one */
+	int si_dma;			/* for SI's DMA engine (si_dma.c): its COPY and CONSTANT_FILL */
 };
 
 /* usable: dword-aligned, pitch >= width, every field inside the packet's */
@@ -106,5 +127,18 @@ int frb_rect_emit_copy(struct frb_rect_ib *ib, const struct frb_rect_surface *ds
 int frb_rect_emit_moves(struct frb_rect_ib *ib, const struct frb_rect_surface *s,
 			const struct frb_rect_surface *scratch, const struct frb_rect_move *m, uint32_t n,
 			int phase);
+
+/*
+ * The same, resumable, for moves that need more than one IB (SI's DMA has no
+ * sub-window copy: a row a packet): from move *at, row *row on, as much as
+ * fits; *at and *row say where the next IB goes on. -ENOSPC when nothing
+ * fit; 0 when something did (or nothing was left).
+ */
+int frb_rect_emit_moves_from(struct frb_rect_ib *ib, const struct frb_rect_surface *s,
+			     const struct frb_rect_surface *scratch, const struct frb_rect_move *m, uint32_t n,
+			     int phase, uint32_t *at, uint32_t *row);
+/* how many IBs of like's room and engine one phase of the moves takes, or -errno */
+int frb_rect_moves_ibs(const struct frb_rect_ib *like, const struct frb_rect_surface *s,
+		       const struct frb_rect_surface *scratch, const struct frb_rect_move *m, uint32_t n, int phase);
 
 #endif

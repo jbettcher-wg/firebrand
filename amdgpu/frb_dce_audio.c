@@ -1,6 +1,14 @@
 /*
- * DisplayPort audio, RadeonNI's (RadeonNI's hw/rdn_dce8_afmt.c, the
- * DCE8 arm) on DCE 11.2's registers.
+ * DisplayPort audio, RadeonNI's (RadeonNI's hw/rdn_dce8_afmt.c) on
+ * DCE 11.2's registers (its DCE8 arm) and DCE 6's (its DCE6 arm).
+ *
+ * PER DCE. Every register and layout fact comes from the DCE's table,
+ * frb_display_funcs.audio_regs (struct frb_audio_regs): frb_audio_regs_dce11
+ * at the end of this file, frb_audio_regs_dce6 in frb_dce_v6_0_audio.c (the
+ * endpoint index's write-enable bit, DCE 6's DTO1 pair, six pins 6 dwords
+ * apart, no AFMT_CNTL, DTO1's module from the display engine clock). What
+ * follows describes the DCE 11.2 table; tests/frb_audio_test.c holds both
+ * against RadeonNI's two arms, write for write.
  *
  * WHY RADEONNI'S. It is the DP audio that has been heard on this platform
  * and this monitor: an LG HDR 4K played it from the R7 450
@@ -116,30 +124,30 @@
 #define FRB_AFMT_CNTL				mmAFMT_CNTL
 #define FRB_AFMT_AUDIO_CLOCK_EN			AFMT_CNTL__AFMT_AUDIO_CLOCK_EN_MASK
 
-/* DCE8: pin_offsets[] 0x18 bytes apart; DCE 11.2: AZF0ENDPOINTn, 4 dwords apart (vid.h AUDn_REGISTER_OFFSET) */
-static uint32_t pin_offset(unsigned pin)
+/* the DCE's DP audio registers (frb_display_funcs.audio_regs) */
+static const struct frb_audio_regs *AR(struct frb_device *adev)
 {
-	return 4u * pin;
+	return frb_funcs(adev)->display->audio_regs;
 }
 
-/* DCE8: dig_afmt_offsets[]; DCE 11.2: vid.h DIGn_REGISTER_OFFSET */
-static const uint32_t dig_afmt_offsets[] = {
-	DIG0_REGISTER_OFFSET, DIG1_REGISTER_OFFSET, DIG2_REGISTER_OFFSET, DIG3_REGISTER_OFFSET,
-	DIG4_REGISTER_OFFSET, DIG5_REGISTER_OFFSET, DIG6_REGISTER_OFFSET,
-};
-#define RDN_DCE8_AFMT_NUM_DIG	((int)ARRAY_SIZE(dig_afmt_offsets))
+/* DCE8/DCE6: pin_offsets[] 0x18 bytes (6 dwords) apart; DCE 11.2: AZF0ENDPOINTn, 4 dwords apart */
+#define pin_offset(pin)		(AR(adev)->pin_stride * (uint32_t)(pin))
+
+#define dig_afmt_offsets	(AR(adev)->dig_off)
+#define RDN_DCE8_AFMT_NUM_DIG	((int)AR(adev)->num_dig)
+#define RDN_DCE8_AFMT_NUM_PINS	((int)AR(adev)->num_pins)
 
 static uint32_t endpoint_rreg(struct frb_device *adev, uint32_t pin_off, uint8_t reg)
 {
-	WREG32(RDN_AZ_F0_CODEC_ENDPOINT_INDEX + pin_off, (uint32_t)reg);
-	return RREG32(RDN_AZ_F0_CODEC_ENDPOINT_DATA + pin_off);
+	WREG32(AR(adev)->ep_index + pin_off, (uint32_t)reg);
+	return RREG32(AR(adev)->ep_data + pin_off);
 }
 
-/* DCE8 and DCE 11.2: no AZ_ENDPOINT_REG_WRITE_EN in the index (RadeonNI sets it on DCE6 only) */
+/* DCE8 and DCE 11.2: no AZ_ENDPOINT_REG_WRITE_EN in the index; DCE6 needs it (dce6_endpoint_wreg) */
 static void endpoint_wreg(struct frb_device *adev, uint32_t pin_off, uint8_t reg, uint32_t val)
 {
-	WREG32(RDN_AZ_F0_CODEC_ENDPOINT_INDEX + pin_off, (uint32_t)reg);
-	WREG32(RDN_AZ_F0_CODEC_ENDPOINT_DATA + pin_off, val);
+	WREG32(AR(adev)->ep_index + pin_off, (uint32_t)reg | AR(adev)->ep_write_en);
+	WREG32(AR(adev)->ep_data + pin_off, val);
 }
 
 static void pin_audio_enable(struct frb_device *adev, uint32_t pin_off, bool enable)
@@ -151,14 +159,17 @@ static void pin_audio_enable(struct frb_device *adev, uint32_t pin_off, bool ena
 		endpoint_wreg(adev, pin_off, RDN_AZ_PIN_HOT_PLUG_CONTROL, want);
 }
 
-/* the AFMT block's audio clock (DCE 10+; see the top of the file) */
+/* the AFMT block's audio clock (DCE 10+; see the top of the file); DCE6 has no AFMT_CNTL */
 static void afmt_clock(struct frb_device *adev, uint32_t afmt_off, bool on)
 {
-	uint32_t v = RREG32(FRB_AFMT_CNTL + afmt_off);
-	uint32_t want = on ? (v | FRB_AFMT_AUDIO_CLOCK_EN) : (v & ~FRB_AFMT_AUDIO_CLOCK_EN);
+	uint32_t v, want;
 
+	if (!AR(adev)->afmt_cntl)
+		return;
+	v = RREG32(AR(adev)->afmt_cntl + afmt_off);
+	want = on ? (v | AR(adev)->afmt_audio_clock_en) : (v & ~AR(adev)->afmt_audio_clock_en);
 	if (want != v)
-		WREG32(FRB_AFMT_CNTL + afmt_off, want);
+		WREG32(AR(adev)->afmt_cntl + afmt_off, want);
 }
 
 uint32_t frb_audio_decode_dfs_div(uint32_t did)
@@ -177,7 +188,7 @@ uint32_t frb_audio_decode_dfs_div(uint32_t did)
  * FirmwareInfo v2.2 ulGPUPLL_OutputFreq (0 -> 360000, 3.6 GHz), scaled by
  * the DENTIST DPREFCLK divider (clock * 100 / div): the DP reference clock.
  */
-static uint32_t frb_dce8_dispclk_khz(struct frb_device *adev)
+static uint32_t frb_dce8_dispclk_khz(struct frb_device *adev, struct frb_display *d)
 {
 	uint16_t data_offset = 0, size = 0;
 	uint8_t frev = 0, crev = 0;
@@ -209,9 +220,9 @@ void frb_audio_hw_init(struct frb_device *adev, struct frb_display *d)
 	memset(afmt, 0, sizeof(*afmt));
 	afmt->active_dig = -1;
 	afmt->active_pin = -1;
-	afmt->dprefclk_khz = frb_dce8_dispclk_khz(adev);
+	afmt->dprefclk_khz = AR(adev)->dto1_module_khz(adev, d);
 
-	for (i = 0; i < FRB_AFMT_NUM_PINS; i++) {
+	for (i = 0; i < RDN_DCE8_AFMT_NUM_PINS; i++) {
 		uint32_t cfg = endpoint_rreg(adev, pin_offset(i), RDN_AZ_PIN_CONFIG_DEFAULT);
 		bool conn = ((cfg >> 30) & 3u) != 1u;
 
@@ -232,7 +243,7 @@ void frb_audio_hw_init(struct frb_device *adev, struct frb_display *d)
 
 	afmt->initialized = true;
 	frb_info(adev, "audio: init: %u/%u codec pin(s) connected, DPREFCLK %u kHz",
-		 connected, (unsigned)FRB_AFMT_NUM_PINS, (unsigned)afmt->dprefclk_khz);
+		 connected, (unsigned)RDN_DCE8_AFMT_NUM_PINS, (unsigned)afmt->dprefclk_khz);
 }
 
 /*
@@ -244,8 +255,8 @@ static int select_pin_for_dig(struct frb_device *adev, struct frb_afmt *afmt, ui
 	unsigned i;
 	int forced = adev->audio_pin;
 
-	if (forced >= 0 && forced < FRB_AFMT_NUM_PINS) {
-		for (i = 0; i < FRB_AFMT_NUM_PINS; i++) {
+	if (forced >= 0 && forced < RDN_DCE8_AFMT_NUM_PINS) {
+		for (i = 0; i < RDN_DCE8_AFMT_NUM_PINS; i++) {
 			if ((int)i != forced && afmt->pins[i].dig_encoder == (int8_t)dig_encoder) {
 				pin_audio_enable(adev, pin_offset(i), false);
 				afmt->pins[i].dig_encoder = -1;
@@ -254,12 +265,12 @@ static int select_pin_for_dig(struct frb_device *adev, struct frb_afmt *afmt, ui
 		afmt->pins[forced].dig_encoder = (int8_t)dig_encoder;
 		return forced;
 	}
-	for (i = 0; i < FRB_AFMT_NUM_PINS; i++) {
+	for (i = 0; i < RDN_DCE8_AFMT_NUM_PINS; i++) {
 		if (afmt->pins[i].connected &&
 		    afmt->pins[i].dig_encoder == (int8_t)dig_encoder)
 			return (int)i;
 	}
-	for (i = 0; i < FRB_AFMT_NUM_PINS; i++) {
+	for (i = 0; i < RDN_DCE8_AFMT_NUM_PINS; i++) {
 		if (afmt->pins[i].connected && afmt->pins[i].dig_encoder < 0) {
 			afmt->pins[i].dig_encoder = (int8_t)dig_encoder;
 			return (int)i;
@@ -273,7 +284,7 @@ static void release_pin_for_dig(struct frb_device *adev, struct frb_afmt *afmt, 
 {
 	unsigned i;
 
-	for (i = 0; i < FRB_AFMT_NUM_PINS; i++) {
+	for (i = 0; i < RDN_DCE8_AFMT_NUM_PINS; i++) {
 		if (afmt->pins[i].dig_encoder == (int8_t)dig_encoder) {
 			pin_audio_enable(adev, pin_offset(i), false);
 			afmt->pins[i].dig_encoder = -1;
@@ -395,21 +406,21 @@ static void write_dp_avi_infoframe(struct frb_device *adev, uint32_t afmt_off, c
 		sum = (uint8_t)(sum + frame[i]);
 	frame[0] = (uint8_t)(0x100u - sum);
 
-	WREG32(AFMT_AVI_INFO0 + afmt_off,
+	WREG32(AR(adev)->afmt_avi_info0 + afmt_off,
 	       (uint32_t)frame[0] | ((uint32_t)frame[1] << 8) |
 	       ((uint32_t)frame[2] << 16) | ((uint32_t)frame[3] << 24));
-	WREG32(AFMT_AVI_INFO1 + afmt_off,
+	WREG32(AR(adev)->afmt_avi_info1 + afmt_off,
 	       (uint32_t)frame[4] | ((uint32_t)frame[5] << 8) |
 	       ((uint32_t)frame[6] << 16) | ((uint32_t)frame[7] << 24));
-	WREG32(AFMT_AVI_INFO2 + afmt_off,
+	WREG32(AR(adev)->afmt_avi_info2 + afmt_off,
 	       (uint32_t)frame[8] | ((uint32_t)frame[9] << 8) |
 	       ((uint32_t)frame[10] << 16) | ((uint32_t)frame[11] << 24));
-	WREG32(AFMT_AVI_INFO3 + afmt_off,
+	WREG32(AR(adev)->afmt_avi_info3 + afmt_off,
 	       (uint32_t)frame[12] | ((uint32_t)frame[13] << 8) | (2u << 24));
 
-	tmp = RREG32(HDMI_INFOFRAME_CONTROL1 + afmt_off);
+	tmp = RREG32(AR(adev)->hdmi_infoframe_control1 + afmt_off);
 	tmp &= ~HDMI_AVI_INFO_LINE_MASK;
-	WREG32(HDMI_INFOFRAME_CONTROL1 + afmt_off, tmp | HDMI_AVI_INFO_LINE(2));
+	WREG32(AR(adev)->hdmi_infoframe_control1 + afmt_off, tmp | HDMI_AVI_INFO_LINE(2));
 }
 
 /* rdn_dce8_afmt_dp_mode_set: DTO1, the DIG's AFMT framing, the pin's descriptors and sink info */
@@ -450,39 +461,39 @@ int frb_audio_dp_mode_set(struct frb_device *adev, struct frb_display *d, uint8_
 	pin_audio_enable(adev, pin_off, false);
 
 	/* 1. DCCG Audio DTO1 (24 MHz reference over the DP reference clock). */
-	afmt->dprefclk_khz = frb_dce8_dispclk_khz(adev);
-	WREG32(RDN_DCCG_AUDIO_DTO_SOURCE, RDN_DCCG_AUDIO_DTO0_SOURCE_SEL(crtc_id) | RDN_DCCG_AUDIO_DTO_SEL);
-	WREG32(RDN_DCE8_DCCG_AUDIO_DTO1_PHASE, 24000u);
-	WREG32(RDN_DCE8_DCCG_AUDIO_DTO1_MODULE, afmt->dprefclk_khz);
+	afmt->dprefclk_khz = AR(adev)->dto1_module_khz(adev, d);
+	WREG32(AR(adev)->dto_source, RDN_DCCG_AUDIO_DTO0_SOURCE_SEL(crtc_id) | RDN_DCCG_AUDIO_DTO_SEL);
+	WREG32(AR(adev)->dto1_phase, 24000u);
+	WREG32(AR(adev)->dto1_module, afmt->dprefclk_khz);
 
 	/* DCE 10+: the AFMT block's audio clock on before its first register (no DCE8 step) */
 	afmt_clock(adev, afmt_off, true);
 
 	/* 2. Route selected codec pin to this DIG's AFMT and frame IEC-60958 packets. */
-	WREG32(RDN_AFMT_AUDIO_SRC_CONTROL + afmt_off, (uint32_t)(pin_idx & 7));
+	WREG32(AR(adev)->afmt_audio_src_control + afmt_off, (uint32_t)(pin_idx & 7));
 
-	tmp = RREG32(RDN_AFMT_AUDIO_PACKET_CONTROL + afmt_off);
+	tmp = RREG32(AR(adev)->afmt_audio_packet_control + afmt_off);
 	tmp &= ~RDN_AFMT_AUDIO_SAMPLE_SEND;
 	tmp |= RDN_AFMT_RESET_FIFO_WHEN_AUDIO_DIS | RDN_AFMT_60958_CS_UPDATE;
-	WREG32(RDN_AFMT_AUDIO_PACKET_CONTROL + afmt_off, tmp);
+	WREG32(AR(adev)->afmt_audio_packet_control + afmt_off, tmp);
 
 	/* DP timestamp auto-generation (never touch DP_SEC_AUD_N, as RadeonNI on DCE6/DCE8). */
-	tmp = RREG32(RDN_EVERGREEN_DP_SEC_TIMESTAMP + afmt_off);
+	tmp = RREG32(AR(adev)->dp_sec_timestamp + afmt_off);
 	tmp = (tmp & ~RDN_DP_SEC_TIMESTAMP_MODE_MASK) | RDN_DP_SEC_TIMESTAMP_AUTO;
-	WREG32(RDN_EVERGREEN_DP_SEC_TIMESTAMP + afmt_off, tmp);
+	WREG32(AR(adev)->dp_sec_timestamp + afmt_off, tmp);
 
-	WREG32(RDN_HDMI_AUDIO_PACKET_CONTROL + afmt_off, 0x00030010u);
-	WREG32(RDN_AFMT_60958_0 + afmt_off, 1u << 20);
-	WREG32(RDN_AFMT_60958_1 + afmt_off, 2u << 20);
-	WREG32(RDN_AFMT_60958_2 + afmt_off, 0x00876543u);
+	WREG32(AR(adev)->hdmi_audio_packet_control + afmt_off, 0x00030010u);
+	WREG32(AR(adev)->afmt_60958_0 + afmt_off, 1u << 20);
+	WREG32(AR(adev)->afmt_60958_1 + afmt_off, 2u << 20);
+	WREG32(AR(adev)->afmt_60958_2 + afmt_off, 0x00876543u);
 
-	tmp = RREG32(RDN_AFMT_AUDIO_PACKET_CONTROL2 + afmt_off);
+	tmp = RREG32(AR(adev)->afmt_audio_packet_control2 + afmt_off);
 	tmp = (tmp & ~0x0000ff00u) | 0x0000ff00u;
-	WREG32(RDN_AFMT_AUDIO_PACKET_CONTROL2 + afmt_off, tmp);
+	WREG32(AR(adev)->afmt_audio_packet_control2 + afmt_off, tmp);
 
 	write_dp_avi_infoframe(adev, afmt_off, mode);
-	tmp = RREG32(RDN_AFMT_INFOFRAME_CONTROL0 + afmt_off);
-	WREG32(RDN_AFMT_INFOFRAME_CONTROL0 + afmt_off, tmp | RDN_AFMT_AUDIO_INFO_UPDATE);
+	tmp = RREG32(AR(adev)->afmt_infoframe_control0 + afmt_off);
+	WREG32(AR(adev)->afmt_infoframe_control0 + afmt_off, tmp | RDN_AFMT_AUDIO_INFO_UPDATE);
 
 	/* 3. Program the codec pin's speaker allocation, SADs, lipsync and sink info. */
 	spk = endpoint_rreg(adev, pin_off, RDN_AZ_PIN_CHANNEL_SPEAKER);
@@ -528,14 +539,14 @@ void frb_audio_dp_enable(struct frb_device *adev, struct frb_display *d, int dig
 		 afmt->active_dig == (int8_t)dig_encoder &&
 		 afmt->active_pin >= 0;
 
-	pkt = RREG32(RDN_AFMT_AUDIO_PACKET_CONTROL + afmt_off);
-	sec = RREG32(RDN_EVERGREEN_DP_SEC_CNTL + afmt_off);
+	pkt = RREG32(AR(adev)->afmt_audio_packet_control + afmt_off);
+	sec = RREG32(AR(adev)->dp_sec_cntl + afmt_off);
 
 	if (active) {
 		pkt |= RDN_AFMT_AUDIO_SAMPLE_SEND;
 		sec |= RDN_DP_SEC_AUDIO_MASK;
-		WREG32(RDN_AFMT_AUDIO_PACKET_CONTROL + afmt_off, pkt);
-		WREG32(RDN_EVERGREEN_DP_SEC_CNTL + afmt_off, sec);
+		WREG32(AR(adev)->afmt_audio_packet_control + afmt_off, pkt);
+		WREG32(AR(adev)->dp_sec_cntl + afmt_off, sec);
 		pin_audio_enable(adev, pin_offset((unsigned)afmt->active_pin), true);
 		afmt->enabled = true;
 	} else {
@@ -543,8 +554,8 @@ void frb_audio_dp_enable(struct frb_device *adev, struct frb_display *d, int dig
 			pin_audio_enable(adev, pin_offset((unsigned)afmt->active_pin), false);
 		sec &= ~RDN_DP_SEC_AUDIO_MASK;
 		pkt &= ~RDN_AFMT_AUDIO_SAMPLE_SEND;
-		WREG32(RDN_EVERGREEN_DP_SEC_CNTL + afmt_off, sec);
-		WREG32(RDN_AFMT_AUDIO_PACKET_CONTROL + afmt_off, pkt);
+		WREG32(AR(adev)->dp_sec_cntl + afmt_off, sec);
+		WREG32(AR(adev)->afmt_audio_packet_control + afmt_off, pkt);
 		if (afmt->active_dig == (int8_t)dig_encoder)
 			afmt->enabled = false;
 	}
@@ -563,7 +574,7 @@ void frb_audio_fini(struct frb_device *adev, struct frb_display *d)
 
 	for (i = 0; i < ndig; i++)
 		frb_audio_dp_enable(adev, d, i, false);
-	for (i = 0; i < FRB_AFMT_NUM_PINS; i++) {
+	for (i = 0; i < RDN_DCE8_AFMT_NUM_PINS; i++) {
 		pin_audio_enable(adev, pin_offset((unsigned)i), false);
 		afmt->pins[i].dig_encoder = -1;
 	}
@@ -599,3 +610,36 @@ int frb_audio_rerun(struct frb_device *adev, struct frb_display *d, bool repick)
 	frb_audio_dp_enable(adev, d, conn->dig_encoder, true);
 	return 0;
 }
+
+/* DCE 11.2's registers (Polaris): RadeonNI's DCE8 layout at these offsets (see the top of the file) */
+const struct frb_audio_regs frb_audio_regs_dce11 = {
+	.dto_source = RDN_DCCG_AUDIO_DTO_SOURCE,
+	.dto1_phase = RDN_DCE8_DCCG_AUDIO_DTO1_PHASE,
+	.dto1_module = RDN_DCE8_DCCG_AUDIO_DTO1_MODULE,
+	.ep_index = RDN_AZ_F0_CODEC_ENDPOINT_INDEX,
+	.ep_data = RDN_AZ_F0_CODEC_ENDPOINT_DATA,
+	.pin_stride = 4,		/* vid.h AUDn_REGISTER_OFFSET */
+	.num_pins = 7,			/* RadeonNI's DCE8 walk */
+	.ep_write_en = 0,
+	.num_dig = 7,
+	.dig_off = { DIG0_REGISTER_OFFSET, DIG1_REGISTER_OFFSET, DIG2_REGISTER_OFFSET, DIG3_REGISTER_OFFSET,
+		     DIG4_REGISTER_OFFSET, DIG5_REGISTER_OFFSET, DIG6_REGISTER_OFFSET },
+	.hdmi_audio_packet_control = RDN_HDMI_AUDIO_PACKET_CONTROL,
+	.afmt_audio_packet_control2 = RDN_AFMT_AUDIO_PACKET_CONTROL2,
+	.afmt_60958_0 = RDN_AFMT_60958_0,
+	.afmt_60958_1 = RDN_AFMT_60958_1,
+	.afmt_60958_2 = RDN_AFMT_60958_2,
+	.afmt_audio_packet_control = RDN_AFMT_AUDIO_PACKET_CONTROL,
+	.afmt_infoframe_control0 = RDN_AFMT_INFOFRAME_CONTROL0,
+	.afmt_audio_src_control = RDN_AFMT_AUDIO_SRC_CONTROL,
+	.dp_sec_cntl = RDN_EVERGREEN_DP_SEC_CNTL,
+	.dp_sec_timestamp = RDN_EVERGREEN_DP_SEC_TIMESTAMP,
+	.afmt_avi_info0 = AFMT_AVI_INFO0,
+	.afmt_avi_info1 = AFMT_AVI_INFO1,
+	.afmt_avi_info2 = AFMT_AVI_INFO2,
+	.afmt_avi_info3 = AFMT_AVI_INFO3,
+	.hdmi_infoframe_control1 = HDMI_INFOFRAME_CONTROL1,
+	.afmt_cntl = FRB_AFMT_CNTL,
+	.afmt_audio_clock_en = FRB_AFMT_AUDIO_CLOCK_EN,
+	.dto1_module_khz = frb_dce8_dispclk_khz,
+};

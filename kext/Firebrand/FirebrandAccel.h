@@ -128,6 +128,7 @@ public:
 
 	/* For FirebrandAccelClient. Each takes the core's lock. */
 	IOReturn getInfo(struct rdn_user_info *info);
+	IOReturn gfxInfo(struct rdn_user_gfx_info *info);
 	IOReturn vramInfo64(struct rdn_user_vram_info64 *info);
 	IOReturn hiddenInfo(UInt32 *offset, UInt32 *size);
 	IOReturn allocVram(struct frb_bo_table *bos, UInt64 size, UInt32 align, UInt32 where, UInt64 *offset);
@@ -266,6 +267,7 @@ private:
 		   UInt32 scanoutEnd);
 	void publish(IOPCIDevice *provider);
 	struct frb_ring *ringLocked(void);
+	static UInt32 frbRingFrames(const struct frb_ring *ring);
 	UInt32 completedLocked(void);
 	bool signalledLocked(UInt32 seq);
 	void updateStatusLocked(void);
@@ -329,6 +331,23 @@ private:
 	UInt32 fWatchSeen[2], fWatchStallMs[2];	/* GFX, SDMA0: the fence last seen, how long it stood */
 	UInt32 fRecoveries;
 	bool fWedged;			/* a recovery failed: only a reload resets the ASIC */
+	/*
+	 * FirebrandAccelHoldMs / frb_accel_hold: the first submission (2D or a
+	 * client's IB) and every one that comes meanwhile waits until this long
+	 * after the first asked (0: no hold). An experiment's switch: it moves
+	 * the engines' first work away from the rest of the boot.
+	 */
+	UInt32 fHoldMs;
+	UInt64 fHoldUntilNs;		/* 0 until the first submission asks */
+	bool fHoldDone;
+	void holdOffLocked(void);
+	/*
+	 * SOC15: before the first submission SDMA0 runs one empty 2D frame of
+	 * the driver's own, and is reset if that frame does not come back
+	 * (sdmaProbeLocked, docs/vega20-bring-up.md "SDMA0's first frame").
+	 */
+	bool fProbeDone;
+	void sdmaProbeLocked(void);
 	Pending *fPending;
 	Binding *fBindings;
 
@@ -339,6 +358,7 @@ private:
 	bool fSlotUsed[kIbSlots];
 	UInt32 fSlotNext;
 	UInt32 fSdmaCompleted;
+	UInt32 fSdmaMaxInFlight;	/* 2D frames SDMA0's ring holds (frbRingFrames - 2, at most kIbSlots) */
 	bool fJoinPending;		/* the GFX fence fJoinSeq is promised to cover SDMA0 up to fJoinSdma */
 	UInt32 fJoinSeq, fJoinSdma;
 	UInt32 fJoinPromised, fJoinEmitted;	/* the last join: promised and emitted numbers */
@@ -378,6 +398,7 @@ public:
 
 	/* hw/rdn_user.h, in its order */
 	IOReturn methodGetInfo(struct rdn_user_info *info, IOByteCount *size);
+	IOReturn methodGfxInfo(struct rdn_user_gfx_info *info, IOByteCount *size);
 	IOReturn methodAlloc(UInt32 size, UInt32 align, UInt32 *offset);
 	IOReturn methodFree(UInt32 offset);
 	IOReturn methodSubmit(UInt32 offset, UInt32 words, UInt32 *fence);

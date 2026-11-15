@@ -7,6 +7,8 @@
  *   frbctl log                   the driver's log ring
  *   frbctl rd <reg>              read a register (dword index, as amdgpu numbers them)
  *   frbctl wr <reg> <value>      write one (needs frb_regwrite=1 or FirebrandAllowRegWrite)
+ *   frbctl cfg <fn> <off> [val]  configuration dword of function fn of the card's device (a write
+ *                                needs the same switch)
  *   frbctl smc <addr>            read SMC space through SMC_IND_INDEX_11
  *   frbctl smcdump <a> <n> <file> SMC RAM as the SMC holds it (smc-ram-smcorder.bin form)
  *   frbctl regfile <file>        read every "mmio NAME 0xBYTEOFFSET" / "smc NAME 0xADDR"
@@ -28,6 +30,7 @@
  *   frbctl fill solid <rrggbb> | dot <x> <y> | top <lines> | left <columns>
  *   frbctl dpcd <n> <addr> [len] the sink's DPCD registers
  *   frbctl crc <n> [count]       the sink's CRC of the frames it receives (DP test CRC)
+ *   frbctl pipecrc [count]       the CRTC's own CRC of what it sends (DCE 12; no monitor needed)
  *   frbctl test gfx|sdma0|sdma1 ring|ib|copy|fill   an engine test (after stage gfx / sdma)
  *   frbctl test sdma0|sdma1 gtt  copies VRAM<->GTT and a fill into GTT (bus mastering)
  *   frbctl test gfx ibprobe      which IB swap bits run which IBs (diagnosis; docs/accel-interface.md Q4b)
@@ -35,9 +38,12 @@
  *                                create/destroy msg IB test, both UVD_LMI_SWAP_CNTL settings, the idle work
  *   frbctl fb detach             before unloading FirebrandFramebuffer: it refuses new window
  *                                server clients (then killall WindowServer, kextunload)
+ *   frbctl report [--md]         every card's status, as Firebrand Monitor's Copy Report
+ *                                (frb_status.c; any user, through the read-only 'frbs' client);
+ *                                --md wraps it in a ``` block for a GitHub issue
  *
  * Builds on Mac OS X 10.5 (IOKit only; scripts/build-mac.sh does this):
- *   gcc -std=gnu99 -I../kext/Firebrand -I../shared -o frbctl frbctl.c ../shared/frb_edid.c \
+ *   gcc -std=gnu99 -I../kext/Firebrand -I../shared -o frbctl frbctl.c frb_status.c ../shared/frb_edid.c \
  *       ../shared/frb_dmt.c -framework IOKit -framework CoreFoundation
  *
  * Copyright (c) 2026 Jordan Bettcher
@@ -50,8 +56,26 @@
 #include <stdint.h>
 #include "frb_user.h"
 #include "frb_mode.h"
+#include "frb_status.h"
 
 static io_connect_t conn;
+
+/* frbctl report [--md]: no root needed (the 'frbs' status client and the registry) */
+static int report(int argc, char **argv)
+{
+	struct frb_card cards[FRB_MAX_CARDS];
+	int n = frb_cards_open(cards, FRB_MAX_CARDS), md = argc > 2 && !strcmp(argv[2], "--md");
+	size_t need = frb_report(cards, n, "frbctl", md, 0, 0);
+	char *text = (char *)malloc(need + 1);
+
+	if (text) {
+		frb_report(cards, n, "frbctl", md, text, need + 1);
+		fputs(text, stdout);
+		free(text);
+	}
+	frb_cards_close(cards, n);
+	return n ? 0 : 1;
+}
 
 static int scalar(int method, int nin, int a, int b, int *out)
 {
@@ -134,9 +158,11 @@ int main(int argc, char **argv)
 
 	if (argc < 2) {
 		fprintf(stderr, "usage: frbctl info|log|rd|wr|smc|regfile|stage|vram|trace|"
-			"display|detect|edid|modes|mode|off|fill ...\n");
+			"display|detect|edid|modes|mode|off|fill|report ...\n");
 		return 2;
 	}
+	if (!strcmp(argv[1], "report"))
+		return report(argc, argv);
 	/* the control personality, or the framebuffer when it owns the card */
 	service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(FRB_UC_SERVICE_CLASS));
 	if (!service)
@@ -371,7 +397,9 @@ int main(int argc, char **argv)
 		int p = !strcmp(pn, "bars") ? FRB_PATTERN_BARS : !strcmp(pn, "grey") ? FRB_PATTERN_GREY :
 			!strcmp(pn, "black") ? FRB_PATTERN_BLACK : !strcmp(pn, "solid") ? FRB_PATTERN_SOLID :
 			!strcmp(pn, "dot") ? FRB_PATTERN_DOT : !strcmp(pn, "top") ? FRB_PATTERN_TOP :
-			!strcmp(pn, "left") ? FRB_PATTERN_LEFT : !strcmp(pn, "splash") ? FRB_PATTERN_SPLASH : atoi(pn);
+			!strcmp(pn, "left") ? FRB_PATTERN_LEFT : !strcmp(pn, "splash") ? FRB_PATTERN_SPLASH :
+			!strcmp(pn, "smpte") ? FRB_PATTERN_SMPTE : !strcmp(pn, "cursorref") ? FRB_PATTERN_SMPTE_CURSOR :
+			atoi(pn);
 		int a0 = argc > 3 ? (int)strtoul(argv[3], 0, p == FRB_PATTERN_SOLID ? 16 : 0) : 0;
 		int a1 = argc > 4 ? (int)strtoul(argv[4], 0, 0) : 0;
 
@@ -446,6 +474,10 @@ int main(int argc, char **argv)
 	} else if (!strcmp(argv[1], "fb") && argc == 3 && !strcmp(argv[2], "detach")) {
 		r = IOConnectMethodScalarIScalarO(conn, FRB_UC_FB_DETACH, 0, 1, &v);
 		printf("fb detach: %s, result %d\n", r ? "ERR" : "ran", v);
+	} else if (!strcmp(argv[1], "lut") && argc == 3 && (!strcmp(argv[2], "linear") || !strcmp(argv[2], "restore"))) {
+		/* frbctl lut linear|restore: an identity LUT for a sink CRC, and the ramp back */
+		r = scalar(FRB_UC_LUT_SET, 1, !strcmp(argv[2], "linear") ? FRB_LUT_OP_LINEAR : FRB_LUT_OP_RESTORE, 0, &v);
+		printf("lut %s: %s, result %d\n", argv[2], r ? "ERR" : "ran", v);
 	} else if (!strcmp(argv[1], "lut") && argc <= 3) {
 		/* frbctl lut [all]: the LUT store and, on a running CRTC, the hardware's entries */
 		struct frb_user_lut l;
@@ -464,7 +496,8 @@ int main(int argc, char **argv)
 			if (!l.hw_read && l.hw[k] == want)
 				same++;
 		}
-		printf("lut: screen %u bpp; hardware %s", l.bpp, l.hw_read ? "not read (no CRTC running)" : "read");
+		printf("lut: screen %u bpp; hardware %s", l.bpp, l.hw_read == -2 ? "LUT in bypass (the store is the identity)" :
+		       l.hw_read ? "not read (no CRTC running)" : "read");
 		if (!l.hw_read)
 			printf(", %d of 256 entries equal the store at 10 bits", same);
 		printf("\n");
@@ -477,19 +510,44 @@ int main(int argc, char **argv)
 	} else if (!strcmp(argv[1], "dpm") && argc <= 4) {
 		/*
 		 * frbctl dpm [high|low|auto|on|off] [-q]: power_dpm_force_performance_level
-		 * (or the DPM init / hw_fini by hand), then the SMC's state
+		 * (or the DPM init / hw_fini by hand), then the SMC's state.
+		 * frbctl dpm gating on|off: SOC15 clock gating gated / ungated live.
 		 */
 		static const char *ops[] = { "status", "high", "low", "auto", "on", "off" };
+		static const char *opname[] = { "status", "high", "low", "auto", "on", "off", "gating on", "gating off",
+						"fclk low", "fclk top" };
 		struct frb_user_dpm d;
 		IOByteCount n = sizeof(d);
 		int op = 0, quiet = argc == 4 && !strcmp(argv[3], "-q"), k;
 
-		if (argc >= 3)
+		if (argc >= 3 && !strcmp(argv[2], "gating")) {
+			if (argc != 4 || (strcmp(argv[3], "on") && strcmp(argv[3], "off"))) {
+				fprintf(stderr, "usage: frbctl dpm gating on|off\n");
+				return 2;
+			}
+			op = !strcmp(argv[3], "on") ? FRB_DPM_OP_GATE_ON : FRB_DPM_OP_GATE_OFF;
+			quiet = 0;
+		} else if (argc >= 3 && !strcmp(argv[2], "fclk")) {
+			/* Vega 20: FCLK's soft minimum, which a display configuration leaves at the top */
+			if (argc != 4 || (strcmp(argv[3], "low") && strcmp(argv[3], "top"))) {
+				fprintf(stderr, "usage: frbctl dpm fclk low|top\n");
+				return 2;
+			}
+			op = !strcmp(argv[3], "low") ? FRB_DPM_OP_FCLK_LOW : FRB_DPM_OP_FCLK_TOP;
+			quiet = 0;
+		} else if (argc >= 3) {
 			for (op = 0; op < 6 && strcmp(argv[2], ops[op]); op++)
 				;
-		if (op == 6) {
-			fprintf(stderr, "usage: frbctl dpm [status|high|low|auto|on|off] [-q]\n");
-			return 2;
+			if (op == 6) {	/* not FRB_DPM_OP_GATE_ON (also 6): no name matched */
+				fprintf(stderr, "usage: frbctl dpm [status|high|low|auto|on [switches]|off|gating on|gating off|"
+					"fclk low|fclk top] [-q]\n");
+				return 2;
+			}
+		}
+		/* dpm on N: Southern Islands' DPM switches for this try (si_dpm/rdn_si_dpm.h), e.g. 0x110 */
+		if (op == 4 && argc == 4 && strcmp(argv[3], "-q")) {
+			op |= (int)(strtoul(argv[3], NULL, 0) << 8);
+			quiet = 0;
 		}
 		r = IOConnectMethodScalarIStructureO(conn, FRB_UC_DPM, 1, &n, op, &d);
 		if (r) {
@@ -497,7 +555,40 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		if (op)
-			printf("dpm %s: result %d\n", ops[op], d.result);
+			printf("dpm %s: result %d\n", opname[op & 0xff], d.result);
+		if (d.version >= 2 && d.soc15) {
+			/* Vega 20: the SMU11's readout */
+			/* DPM_UVD is feature bit 4: on while the decoder is in use (vega20_power_gate_uvd) */
+			printf("dpm: %s (SMU %u.%u.%u, features %08x: UVD DPM %s); clock gating %s%s (cg_flags %08x)\n",
+			       d.enabled ? "on" : d.smu_version ? "off (the SMU runs, DPM not set up)" : "off (no SMU)",
+			       d.smu_version >> 16, (d.smu_version >> 8) & 0xff, d.smu_version & 0xff, d.smc_feature_status,
+			       d.smc_feature_status & 0x10 ? "on" : "off",
+			       d.gating & 2 ? "on" : "off", d.gating & 1 ? "" : " (FirebrandGating off)", d.cg_flags_lo);
+			if (quiet) {
+				printf("dpm: gfx %u MHz uclk %u MHz soc %u MHz fclk %u MHz %u mV edge %d C hotspot %d C hbm %d C "
+				       "%u W load %u%% mem %u%% gating %s\n", d.cur_sclk / 100, d.cur_mclk / 100,
+				       d.cur_socclk / 100, d.cur_fclk / 100, d.vddgfx_mv, d.temp_edge / 1000,
+				       d.temp_hotspot / 1000, d.temp_hbm / 1000, d.power_mw / 1000, d.gpu_load, d.mem_load,
+				       d.gating & 2 ? "on" : "off");
+			} else {
+				printf("  now: gfx %u MHz (average), uclk %u MHz, soc %u MHz, fclk %u MHz; vddgfx %u mV\n",
+				       d.cur_sclk / 100, d.cur_mclk / 100, d.cur_socclk / 100, d.cur_fclk / 100, d.vddgfx_mv);
+				printf("  temperature: edge %d C, hotspot %d C (THM CTF), HBM %d C; socket power %u W; "
+				       "load gfx %u%%, memory %u%%\n", d.temp_edge / 1000, d.temp_hotspot / 1000,
+				       d.temp_hbm / 1000, d.power_mw / 1000, d.gpu_load, d.mem_load);
+				printf("  gfx levels:");
+				for (k = 0; k < (int)d.gfx_count && k < 16; k++)
+					printf(" %u", d.gfx_levels[k]);
+				printf(" MHz\n  uclk levels:");
+				for (k = 0; k < (int)d.uclk_count && k < 16; k++)
+					printf(" %u", d.uclk_levels[k]);
+				printf(" MHz\n  soc levels:");
+				for (k = 0; k < (int)d.soc_count && k < 16; k++)
+					printf(" %u", d.soc_levels[k]);
+				printf(" MHz\n");
+			}
+			return d.result ? 1 : 0;
+		}
 		if (!d.enabled) {
 			printf("dpm: off%s (init result %d)\n", d.failed ? ", the init FAILED" : "", d.failed);
 		} else if (quiet) {
@@ -529,6 +620,54 @@ int main(int argc, char **argv)
 			printf("  display config: %u display(s), %u Hz, min vblank %u us\n", d.num_display, d.vrefresh,
 			       d.min_vblank_time);
 		}
+	} else if (!strcmp(argv[1], "cfg") && (argc == 4 || argc == 5)) {
+		/*
+		 * frbctl cfg <function> <offset> [value]: this device's configuration space, any function;
+		 * function 0x01BBDDFF reads another device of the same host bridge (bus BB, device DD,
+		 * function FF: the card's switch ports, the root port)
+		 */
+		int v = 0;
+		unsigned fn = strtoul(argv[2], 0, 0), off = strtoul(argv[3], 0, 0);
+
+		r = IOConnectMethodScalarIScalarO(conn, FRB_UC_CONFIG, 4, 1, fn, off, argc == 5,
+						  argc == 5 ? (int)strtoul(argv[4], 0, 0) : 0, &v);
+		if (r) {
+			printf("cfg %x %02x: ERR 0x%x\n", fn, off, r);
+			return 1;
+		}
+		printf("cfg %x %02x: %08x\n", fn, off, (unsigned)v);
+	} else if (!strcmp(argv[1], "smn") && (argc == 3 || argc == 4)) {
+		/* frbctl smn <address> [value]: an SMN register through PCIE_INDEX2/DATA2 (SOC15) */
+		int v = 0;
+		unsigned a = strtoul(argv[2], 0, 0);
+
+		r = IOConnectMethodScalarIScalarO(conn, FRB_UC_SMN, 3, 1, (int)a, argc == 4,
+						  argc == 4 ? (int)strtoul(argv[3], 0, 0) : 0, &v);
+		if (r) {
+			printf("smn %08x: ERR 0x%x\n", a, r);
+			return 1;
+		}
+		printf("smn %08x: %08x\n", a, (unsigned)v);
+	} else if (!strcmp(argv[1], "fn") && argc >= 3) {
+		/* frbctl fn status | scan [flags]: the device's PCI functions (the HD Audio function's straps) */
+		int op, res = 0, hdr = 0, id1 = 0, nubs = 0;
+		unsigned arg = argc >= 4 ? strtoul(argv[3], 0, 0) : 0;
+
+		if (!strcmp(argv[2], "status"))
+			op = FRB_FN_OP_STATUS;
+		else if (!strcmp(argv[2], "scan"))
+			op = FRB_FN_OP_SCAN;
+		else {
+			fprintf(stderr, "usage: frbctl fn status | scan [flags]\n");
+			return 2;
+		}
+		r = IOConnectMethodScalarIScalarO(conn, FRB_UC_FUNCTIONS, 2, 4, op, (int)arg, &res, &hdr, &id1, &nubs);
+		if (r) {
+			printf("fn %s: ERR 0x%x\n", argv[2], r);
+			return 1;
+		}
+		printf("fn %s: result 0x%x, header type %02x, function 1 reads %08x, %d new nub(s)\n", argv[2],
+		       (unsigned)res, (unsigned)hdr, (unsigned)id1, nubs);
 	} else if (!strcmp(argv[1], "audio")) {
 		/* frbctl audio [status | pin N | pin auto | rerun | off | on] */
 		int op = FRB_AUDIO_OP_STATUS, arg = 0, res = 0, dig = -1, pin = -1, flags = 0;
@@ -557,11 +696,14 @@ int main(int argc, char **argv)
 		if (((flags >> 8) & 0xff) != 0xff)
 			printf(" (%d)", (flags >> 8) & 0xff);
 		printf("\n");
-	} else if (!strcmp(argv[1], "crc") && argc >= 3) {
-		int count = argc > 3 ? atoi(argv[3]) : 1, res = 0, cr = 0, cg = 0, cb = 0;
+	} else if ((!strcmp(argv[1], "crc") && argc >= 3) || !strcmp(argv[1], "pipecrc")) {
+		int pipe = !strcmp(argv[1], "pipecrc");
+		int count = pipe ? (argc > 2 ? atoi(argv[2]) : 1) : (argc > 3 ? atoi(argv[3]) : 1);
+		int res = 0, cr = 0, cg = 0, cb = 0;
+		uint32_t target = pipe ? FRB_PIPE_CRC : (uint32_t)atoi(argv[2]);
 
 		for (i = 0; i < count; i++) {
-			r = IOConnectMethodScalarIScalarO(conn, FRB_UC_SINK_CRC, 1, 4, atoi(argv[2]), &res, &cr, &cg, &cb);
+			r = IOConnectMethodScalarIScalarO(conn, FRB_UC_SINK_CRC, 1, 4, target, &res, &cr, &cg, &cb);
 			if (r || res)
 				printf("crc: %s, result %d\n", r ? "ERR" : "ran", res);
 			else
@@ -569,7 +711,7 @@ int main(int argc, char **argv)
 		}
 	} else {
 		fprintf(stderr, "usage: frbctl info|log|rd|wr|smc|regfile|stage|vram|trace|"
-			"display|detect|edid|modes|mode|off|fill|dpcd|crc|test|recover|dpm|lut|audio ...\n");
+			"display|detect|edid|modes|mode|off|fill|dpcd|crc|pipecrc|test|recover|dpm|lut|audio|report ...\n");
 		return 2;
 	}
 	IOServiceClose(conn);

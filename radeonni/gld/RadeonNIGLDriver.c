@@ -333,6 +333,7 @@ static void setup(void)
 	/* See rdn_hook.c. The window server's context always has a drawable. */
 	if (strcmp(getprogname(), "WindowServer") != 0) {
 		rdn_hook_set_current(rdn_mesa_early_all);
+		rdn_hook_create_context(rdn_mesa_cgl_context_created);
 		if (pbuffers_on()) {
 			rdn_hook_prepare_pbuffer(rdn_mesa_prepare_pbuffer);
 			rdn_hook_tex_image_pbuffer(rdn_mesa_tex_image_pbuffer);

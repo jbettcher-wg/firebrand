@@ -185,6 +185,13 @@ int frb_atombios_init(struct frb_device *adev)
 	adev->atom = frb_atom_parse(atom_card_info, adev->bios);
 	if (!adev->atom)
 		return -ENOMEM;
+	/* amdgpu_get_bios: is_atom_fw = asic_type >= CHIP_VEGA10 */
+	adev->is_atom_fw = adev->asic_type >= CHIP_VEGA10 && adev->asic_type != CHIP_UNKNOWN_FRB;
+	if (adev->is_atom_fw) {
+		/* amdgpu_atomfirmware_scratch_regs_init has no register writes: the place only */
+		frb_atomfirmware_scratch_regs_init(adev);
+		return frb_atomfirmware_allocate_fb_scratch(adev);
+	}
 	adev->bios_scratch_reg_offset = mmBIOS_SCRATCH_0;
 	return frb_atombios_allocate_fb_scratch(adev);
 }
@@ -349,7 +356,7 @@ static void rom_copy_printable(char *dst, uint32_t cap, const uint8_t *src, uint
  * atom_get_vbios_pn / _date / _version from amdgpu's atom.c, read
  * endian-clean (upstream loads the u16 offsets through casts).
  */
-static void survey_vbios_strings(struct frb_device *adev)
+void frb_atombios_survey_strings(struct frb_device *adev)
 {
 	const uint8_t *rom = adev->bios;
 	uint32_t size = adev->bios_size;
@@ -485,7 +492,7 @@ static void survey_registers(struct frb_device *adev)
 
 void frb_atombios_survey(struct frb_device *adev)
 {
-	survey_vbios_strings(adev);
+	frb_atombios_survey_strings(adev);
 	survey_cmd_tables(adev);
 	survey_registers(adev);
 }

@@ -52,6 +52,31 @@ struct rdn_device_info {
     * no working fetch swap). The winsys swaps them as it copies them in.
     */
    bool le_ibs;
+   /*
+    * GFX9 (the kext's RDN_UC_GFX_INFO; Firebrand on SOC15): what Mesa's
+    * ac_gpu_info reads from amdgpu's device info there. GFX9 has no tiling
+    * tables, so the chip's identity, GB_ADDR_CONFIG and the CU and RB
+    * masks come from here instead of registers. has_gfx false: the kext
+    * has no such query (RadeonNI's, an older Firebrand).
+    */
+   bool has_gfx;
+   struct {
+      uint32_t family;              /* AMDGPU_FAMILY_* */
+      uint32_t chip_external_rev, chip_rev, pci_rev;
+      uint32_t ip_major, ip_minor, ip_rev;
+      uint32_t me_fw_version, me_fw_feature;
+      uint32_t pfp_fw_version, pfp_fw_feature;
+      uint32_t mec_fw_version, mec_fw_feature;
+      uint32_t gb_addr_config;
+      uint32_t num_shader_engines, num_sh_per_se, num_cu_per_sh, num_cu;
+      uint32_t cu_bitmap[4][4];
+      uint32_t enabled_rb_mask, num_rb_pipes;
+      uint32_t num_tcc_blocks;
+      uint32_t num_shader_visible_vgprs;
+      uint32_t gpu_counter_freq_khz;
+      uint32_t engine_clock_khz, memory_clock_khz;
+      bool clear_state;             /* the RLC holds the clear-state buffer */
+   } gfx;
 };
 
 /* Screen coordinates: x, y from the top left, width, height. */

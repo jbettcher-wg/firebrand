@@ -457,6 +457,7 @@ void FirebrandAccel::videoQuery(bool administrator, rdn_video_query *out)
 void FirebrandAccel::videoPoison(int error, const char *why)
 {
 	fVideoPoisoned = true;
+	fCore->setVideoState(fVideoSession ? 1 : 0, true);
 	if (fVideoSession)
 		fVideoSession->quarantined = true;
 	if (fFramebuffer)
@@ -496,7 +497,7 @@ int FirebrandAccel::videoBindLocked(FirebrandVideoMemory *memory, UInt32 *first,
 				frb_gart_free(adev, at, n);
 				return -EIO;
 			}
-			frb_gart_set_pte(adev, at + i, bus, FRB_PTE_GTT);
+			frb_gart_set_pte(adev, at + i, bus, frb_gart_gtt_flags(adev));
 			if (!i)
 				fCore->logBinding("video", memory, bus, n);
 		}
@@ -544,7 +545,7 @@ int FirebrandAccel::videoCommand(UInt32 type, const rdn_uvd_h264_picture *pictur
 		bzero(ctl + kCtlFeedback, FRB_UVD_H264_FEEDBACK_BYTES);
 		frb_put_le32(ctl + kCtlFeedback, 0, FRB_UVD_H264_FEEDBACK_BYTES);
 	}
-	n = frb_uvd_h264_build_ib(type, &b, words);
+	n = frb_uvd_h264_build_ib(type, &s->layout.hw, &b, words);
 	if (!n)
 		return -EINVAL;
 
@@ -698,6 +699,7 @@ void FirebrandAccel::videoCleanup(bool destroy, bool hardware)
 		      (unsigned long long)(s->uvdUs / s->pictures));
 	IOFree(s, sizeof(*s));
 	fVideoSession = 0;
+	fCore->setVideoState(0, fVideoPoisoned);
 }
 
 IOReturn FirebrandAccel::videoCreate(FirebrandVideoClient *owner, bool administrator, const rdn_video_create *in,
@@ -705,6 +707,8 @@ IOReturn FirebrandAccel::videoCreate(FirebrandVideoClient *owner, bool administr
 {
 	struct frb_device *adev = fCore->adev();
 	struct frb_uvd_h264_layout layout;
+	struct frb_uvd_h264_hw hw;
+	struct frb_ring *uvdRing;
 	FirebrandVideoSession *s = 0;
 	IOReturn result = kIOReturnNoMemory;
 	const char *stage = "session";
@@ -721,7 +725,17 @@ IOReturn FirebrandAccel::videoCreate(FirebrandVideoClient *owner, bool administr
 	/* RadeonNI: smaller coded frames completed with unchanged output on Turks */
 	if (in->config.coded_width < 64 || in->config.coded_height < 64)
 		return kIOReturnUnsupported;
-	if (!videoProfile(in->config.profile_idc) || frb_uvd_h264_layout_init(&in->config, &layout))
+	/*
+	 * The decoder the session will run on: its GPCOM register base (the
+	 * first UVD instance that is up) and Mesa's DPB alignment for the family
+	 * (ac_uvd_dec_dpb_alignment: 32 from Vega 10 on).
+	 */
+	fCore->lock();
+	uvdRing = frb_uvd_ring(adev);
+	hw.reg_base = frb_uvd_reg_base(adev, uvdRing ? uvdRing->me : 0);
+	fCore->unlock();
+	hw.dpb_alignment = adev->asic_type >= CHIP_VEGA10 ? 32 : 16;
+	if (!videoProfile(in->config.profile_idc) || frb_uvd_h264_layout_init(&hw, &in->config, &layout))
 		return kIOReturnUnsupported;
 
 	IOLockLock(fVideoLock);
@@ -738,6 +752,7 @@ IOReturn FirebrandAccel::videoCreate(FirebrandVideoClient *owner, bool administr
 		goto done;
 	bzero(s, sizeof(*s));
 	fVideoSession = s;
+	fCore->setVideoState(1, fVideoPoisoned);
 	s->owner = owner;
 	s->config = in->config;
 	s->layout = layout;
@@ -818,7 +833,7 @@ IOReturn FirebrandAccel::videoCreate(FirebrandVideoClient *owner, bool administr
 	/* the contexts and the DPB start out zero (Mesa clears them; nothing of another client shows) */
 	stage = "vram-clear";
 	fCore->lock();
-	r = fRetired ? -ECANCELED : frb_sdma_v3_0_fill_buffer(adev, 1, 0, vramAddr(s->vramOffset), (UInt32)s->vramBytes);
+	r = fRetired ? -ECANCELED : frb_sdma_fill_buffer(adev, 1, 0, vramAddr(s->vramOffset), (UInt32)s->vramBytes);
 	fCore->unlock();
 	if (r)
 		goto fail;

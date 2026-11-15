@@ -474,7 +474,8 @@ static int frb_gmc_layout(struct frb_device *adev)
 			(unsigned long long)(window >> 10));
 		return -ERANGE;
 	}
-	l->gart_table = (uint32_t)window - (512u << 10);	/* 64K entries x 8 */
+	l->gart_table_size = 512u << 10;			/* 64K entries x 8 */
+	l->gart_table = (uint32_t)window - l->gart_table_size;
 	l->mem_scratch = l->gart_table - AMDGPU_GPU_PAGE_SIZE;
 	l->toc = l->mem_scratch - 3 * AMDGPU_GPU_PAGE_SIZE;
 	l->smu_buffer = (uint32_t)window - (2u << 20);		/* 200 pages, as smu7_init */

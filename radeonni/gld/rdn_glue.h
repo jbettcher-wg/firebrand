@@ -86,6 +86,9 @@ void rdn_mesa_early_all(void *cgl_ctx);
 int rdn_windows_top_down(void);
 /* rdn_hook.c: call `after` whenever a context has been made current. */
 void rdn_hook_set_current(void (*after)(void *cgl_ctx));
+/* rdn_hook.c: call `after` with every context CGLCreateContext has made. */
+void rdn_hook_create_context(void (*after)(void *cgl_ctx));
+void rdn_mesa_cgl_context_created(void *cgl_ctx);
 /*
  * rdn_hook.c: let `own` answer a program's lookups of functions by name
  * in a bundle (a function, or NULL for a name that is not ours). Returns 0

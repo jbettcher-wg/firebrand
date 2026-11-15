@@ -1,7 +1,9 @@
 /*
  * See frb_ring.h: the amdgpu_ring / amdgpu_ib / amdgpu_fence / writeback
  * subset, with Linux's names in the comments. Polled fences only (no IH
- * ring yet): amdgpu_fence_wait_polling's arm.
+ * ring yet): amdgpu_fence_wait_polling's arm. The HDP flush and invalidate
+ * go to vi.c's registers on VI and to hdp_v4_0's on SOC15 (frb_is_soc15),
+ * whichever the card is; the VI arm is unchanged.
  *
  * Copyright 2014 Advanced Micro Devices, Inc.
  * Copyright (c) 2026 Jordan Bettcher
@@ -25,6 +27,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 #include "frb_ring.h"
+#include "frb_soc15.h"
 #include "include/asic_reg/bif/bif_5_0_d.h"
 #include "include/asic_reg/oss/oss_3_0_d.h"
 
@@ -65,14 +68,56 @@ int frb_vram_obj_alloc(struct frb_device *adev, uint32_t size, uint32_t align, u
 
 void frb_flush_hdp(struct frb_device *adev)
 {
+	if (frb_is_soc15(adev)) {
+		frb_soc15_flush_hdp(adev);	/* amdgpu_hdp_generic_flush */
+		return;
+	}
 	WREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
 	RREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL);
 }
 
 void frb_invalidate_hdp(struct frb_device *adev)
 {
+	if (frb_is_soc15(adev)) {
+		frb_soc15_invalidate_hdp(adev);	/* hdp_v4_0_invalidate_hdp */
+		return;
+	}
 	WREG32(mmHDP_DEBUG0, 1);
 	RREG32(mmHDP_DEBUG0);
+}
+
+/*
+ * The same two from a ring (amdgpu_ring_emit_wreg): the register and value
+ * amdgpu_hdp_generic_flush / hdp_v4_0_invalidate_hdp write on SOC15, vi's
+ * on VI.
+ */
+static void ring_emit_flush_hdp_wreg(struct frb_ring *ring)
+{
+	if (frb_is_soc15(ring->adev))
+		ring->funcs->emit_wreg(ring, frb_soc15_hdp_flush_reg(ring->adev), 0);
+	else
+		ring->funcs->emit_wreg(ring, mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
+}
+
+static void ring_emit_invalidate_hdp_wreg(struct frb_ring *ring)
+{
+	if (frb_is_soc15(ring->adev))
+		ring->funcs->emit_wreg(ring, frb_soc15_hdp_invalidate_reg(ring->adev), 1);
+	else
+		ring->funcs->emit_wreg(ring, mmHDP_DEBUG0, 1);
+}
+
+/* --- doorbells (SOC15) ----------------------------------------------------- */
+
+int frb_doorbell_usable(struct frb_device *adev)
+{
+	return frb_is_soc15(adev) && adev->os->doorbell_write64 && !adev->mmio_wptr;
+}
+
+void frb_doorbell_write64(struct frb_device *adev, uint32_t index, uint64_t v)
+{
+	if (adev->os->doorbell_write64)
+		adev->os->doorbell_write64(adev->os->cookie, index, v);
 }
 
 /* --- writeback (amdgpu_device_wb_init / _get) ------------------------------- */
@@ -124,6 +169,19 @@ uint32_t frb_wb_read(struct frb_device *adev, uint32_t wb)
 void frb_wb_write(struct frb_device *adev, uint32_t wb, uint32_t v)
 {
 	frb_vram_write32(adev, adev->wb_offset + 4 * wb, v);
+}
+
+uint64_t frb_wb_read64(struct frb_device *adev, uint32_t wb)
+{
+	frb_invalidate_hdp(adev);
+	return frb_vram_read32(adev, adev->wb_offset + 4 * wb) |
+	       (uint64_t)frb_vram_read32(adev, adev->wb_offset + 4 * (wb + 1)) << 32;
+}
+
+void frb_wb_write64(struct frb_device *adev, uint32_t wb, uint64_t v)
+{
+	frb_vram_write32(adev, adev->wb_offset + 4 * wb, (uint32_t)v);
+	frb_vram_write32(adev, adev->wb_offset + 4 * (wb + 1), (uint32_t)(v >> 32));
 }
 
 uint64_t frb_wb_gpu_addr(struct frb_device *adev, uint32_t wb)
@@ -328,13 +386,13 @@ int frb_ib_schedule_deps(struct frb_ring *ring, struct frb_ib *ib, const struct 
 		if (ring->funcs->emit_hdp_flush)
 			ring->funcs->emit_hdp_flush(ring);
 		else if (ring->funcs->emit_wreg)
-			ring->funcs->emit_wreg(ring, mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
+			ring_emit_flush_hdp_wreg(ring);
 		else
 			frb_flush_hdp(adev);
 	}
 	ring->funcs->emit_ib(ring, ib, 0, ib->flags);
 	if (ring->funcs->emit_wreg)
-		ring->funcs->emit_wreg(ring, mmHDP_DEBUG0, 1);
+		ring_emit_invalidate_hdp_wreg(ring);
 	else
 		frb_invalidate_hdp(adev);
 	*seq = ++ring->sync_seq;

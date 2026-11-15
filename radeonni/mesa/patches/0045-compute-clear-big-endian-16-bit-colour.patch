@@ -1,0 +1,31 @@
+osx-gpu: the compute clear's 16-bit colour on a big-endian host
+
+With 16-bit data (key.d16: GFX9 and later under ACO, formats of up to 11
+bits a channel and the 16-bit float and integer ones) the clear colour is
+packed as R16G16B16A16 into two user-data words with util_pack_color_union,
+i.e. in memory order, and the shader takes the channels out of the words
+low half first. On a big-endian host the first channel is the high half, so
+red and green, blue and alpha were exchanged: glClearColor(0, 1, 0, 1) on
+an RGBA8 or half-float pbuffer read back (1, 0, 1, 0) (tools/guest/pb16test
+on Vega 20, 2026-11-15; RGBA16 and float32, which do not take the 16-bit
+path, were right). The halves of each word are exchanged after the pack.
+
+diff --git a/src/amd/common/nir/ac_nir_meta_cs_blit.c b/src/amd/common/nir/ac_nir_meta_cs_blit.c
+--- a/src/amd/common/nir/ac_nir_meta_cs_blit.c
++++ b/src/amd/common/nir/ac_nir_meta_cs_blit.c
+@@ -1216,6 +1216,15 @@
+ 
+          util_pack_color_union(data_format, (union util_color *)&dispatch->user_data[4],
+                                &final_value);
++#if UTIL_ARCH_BIG_ENDIAN
++         /* osx-gpu: the shader takes the four 16-bit channels out of the two user-data words
++          * low half first (nir_unpack_64_4x16), and the pack above wrote them in memory order,
++          * which on a big-endian host puts the first channel in the high half: red and green,
++          * blue and alpha came out exchanged in every 16-bit compute clear (GFX9 and later).
++          */
++         for (unsigned w = 4; w < 6; w++)
++            dispatch->user_data[w] = (dispatch->user_data[w] >> 16) | (dispatch->user_data[w] << 16);
++#endif
+       } else {
+          memcpy(&dispatch->user_data[4], &final_value, sizeof(final_value));
+       }

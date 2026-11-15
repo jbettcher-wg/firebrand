@@ -9,6 +9,11 @@
  * table to Mesa earlier, and the one thing every program does between the
  * two is to make the context current.
  *
+ * Not every program does: one that calls through its context's table
+ * (CGLMacro.h, Core Image) never makes it current, so CGLCreateContext is
+ * hooked the same way and the table is Mesa's when it returns
+ * (rdn_hook_create_context).
+ *
  * The hook replaces the pointers through which other images call
  * CGLSetCurrentContext (their lazy and non-lazy symbol pointers), in the
  * images loaded now and in every one loaded later. No code is changed.
@@ -119,6 +124,30 @@ static int hooked_set_current(void *ctx)
 		rdn_log("CGLSetCurrentContext(%p) -> %d", ctx, err);
 	if (!err)
 		after_set_current(ctx);
+	return err;
+}
+
+/*
+ * CGLCreateContext. A program that calls OpenGL through its context's own
+ * table (CGLMacro.h: Core Image does, for the contexts it makes beside the
+ * program's) never makes that context current, and what it sets before the
+ * context has a drawable would go to the engine and be lost to Mesa (Core
+ * Image's glEnable of the rectangle texture and its glTexEnv: its
+ * intermediate pictures came out white). OpenGL has filled the table when
+ * this returns.
+ */
+static int (*real_create_context)(void *pix, void *share, void **out);
+static void (*after_create_context)(void *ctx);
+
+static int hooked_create_context(void *pix, void *share, void **out)
+{
+	int err = real_create_context(pix, share, out);
+
+	if (rdn_trace)
+		rdn_log("CGLCreateContext(%p, share %p) -> %d, %p", pix, share, err,
+			out ? *out : NULL);
+	if (!err && out && *out)
+		after_create_context(*out);
 	return err;
 }
 
@@ -527,6 +556,8 @@ static void *hooked_cgl_symbol(const char *name)
 		return NULL;
 	if (real_set_current && !strcmp(name, "CGLSetCurrentContext"))
 		return (void *)hooked_set_current;
+	if (real_create_context && !strcmp(name, "CGLCreateContext"))
+		return (void *)hooked_create_context;
 	if (real_set_parameter && !strcmp(name, "CGLSetParameter"))
 		return (void *)hooked_set_parameter;
 	if (real_tex_image && !strcmp(name, "CGLTexImagePBuffer"))
@@ -669,6 +700,7 @@ static void rebind(const struct mach_header *mh, intptr_t slide)
 					if ((real) && pointers[k] == (void *)(real)) \
 						pointers[k] = (void *)(hook)
 					BIND_RESOLVED(real_set_current, hooked_set_current);
+					BIND_RESOLVED(real_create_context, hooked_create_context);
 					BIND_RESOLVED(real_create_pbuffer, hooked_create_pbuffer);
 					BIND_RESOLVED(real_cgls_create_context, hooked_cgls_create_context);
 					BIND_RESOLVED(real_cgls_attach_pbuffer, hooked_cgls_attach_pbuffer);
@@ -695,6 +727,10 @@ static void rebind(const struct mach_header *mh, intptr_t slide)
 				    !strcmp(strings + symbols[sym].n_un.n_strx, HOOKED) &&
 				    pointers[k] != (void *)hooked_set_current)
 					pointers[k] = (void *)hooked_set_current;
+				if (real_create_context &&
+				    !strcmp(strings + symbols[sym].n_un.n_strx, "_CGLCreateContext") &&
+				    pointers[k] != (void *)hooked_create_context)
+					pointers[k] = (void *)hooked_create_context;
 				if (real_create_pbuffer &&
 				    !strcmp(strings + symbols[sym].n_un.n_strx, "_CGLCreatePBuffer") &&
 				    pointers[k] != (void *)hooked_create_pbuffer)
@@ -813,6 +849,21 @@ void rdn_hook_set_current(void (*after)(void *cgl_ctx))
 		return;
 	}
 	after_set_current = after;
+	ensure_dlsym_hook();
+	watch_images();
+}
+
+void rdn_hook_create_context(void (*after)(void *cgl_ctx))
+{
+	if (real_create_context)
+		return;
+	real_create_context = (int (*)(void *, void *, void **))
+		orig_dlsym(RTLD_DEFAULT, "CGLCreateContext");
+	if (!real_create_context) {
+		rdn_log("no CGLCreateContext to hook");
+		return;
+	}
+	after_create_context = after;
 	ensure_dlsym_hook();
 	watch_images();
 }

@@ -85,6 +85,9 @@ struct frb_ring {
 	uint64_t rptr_gpu_addr, wptr_gpu_addr, fence_gpu_addr;
 	uint32_t sync_seq;		/* the last fence sequence emitted */
 	int ready;
+	/* SOC15: amdgpu_ring use_doorbell / doorbell_index (a dword index into BAR2) */
+	int use_doorbell;
+	uint32_t doorbell_index;
 };
 
 struct frb_ib {
@@ -111,9 +114,24 @@ uint32_t frb_wb_read(struct frb_device *adev, uint32_t wb);	/* HDP invalidated f
 void frb_wb_write(struct frb_device *adev, uint32_t wb, uint32_t v);
 uint64_t frb_wb_gpu_addr(struct frb_device *adev, uint32_t wb);
 
-/* vi.c vi_flush_hdp / vi_invalidate_hdp */
+/*
+ * amdgpu_device_flush_hdp / amdgpu_device_invalidate_hdp without a ring:
+ * vi.c vi_flush_hdp / vi_invalidate_hdp, or on SOC15 hdp_v4_0's (the
+ * remapped HDP_MEM_FLUSH_CNTL, HDP_READ_CACHE_INVALIDATE: frb_soc15.c)
+ */
 void frb_flush_hdp(struct frb_device *adev);
 void frb_invalidate_hdp(struct frb_device *adev);
+
+/*
+ * SOC15 doorbells (amdgpu's WDOORBELL64 through the OS layer). A ring uses
+ * one when frb_doorbell_usable says so: the OS mapped BAR2 and the
+ * MMIO-WPTR switch (FirebrandMMIOWptr / frb_mmio_wptr=1) is off.
+ */
+int frb_doorbell_usable(struct frb_device *adev);
+void frb_doorbell_write64(struct frb_device *adev, uint32_t index, uint64_t v);
+/* a 64-bit writeback value (two little-endian dwords at wb, wb + 1), HDP invalidated first */
+uint64_t frb_wb_read64(struct frb_device *adev, uint32_t wb);
+void frb_wb_write64(struct frb_device *adev, uint32_t wb, uint64_t v);
 
 /* amdgpu_ring.c */
 int frb_ring_init(struct frb_device *adev, struct frb_ring *ring, const char *name,

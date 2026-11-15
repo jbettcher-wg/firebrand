@@ -67,7 +67,7 @@ enum { POWER_STATE_UNKNOWN, POWER_STATE_ON, POWER_STATE_OFF };
  * GPU's and the upstream port's Link Capabilities (not a root-bus device,
  * not passthrough, no amdgpu_pcie_gen_cap/lane_cap overrides).
  */
-static void amdgpu_device_get_pcie_info(struct frb_device *adev)
+void frb_device_get_pcie_info(struct frb_device *adev)
 {
 	uint32_t speed_cap = adev->pcie_caps.asic_speed, platform_speed_cap = adev->pcie_caps.platform_speed;
 	uint32_t link_width = adev->pcie_caps.asic_width, platform_link_width = adev->pcie_caps.platform_width;
@@ -154,8 +154,13 @@ int frb_pm_hw_init(struct frb_device *adev)
 
 	if (adev->pm)
 		return 0;
+	if (frb_is_soc15(adev))
+		return -ENOSYS;	/* SOC15's DPM is frb_vega20_hwmgr.c, run in stage smu */
 	if (adev->stage_done < FRB_STAGE_SDMA)
 		return -EPERM;
+	/* powerplay is VI's (smu7_hwmgr); SI runs radeon's si_dpm (frb_si_dpm.c) */
+	if (frb_is_si(adev))
+		return frb_si_dpm_hw_init(adev);
 	frb_pp_log_os = adev->os;
 
 	pm = adev->os->alloc(adev->os->cookie, sizeof(*pm));
@@ -164,7 +169,7 @@ int frb_pm_hw_init(struct frb_device *adev)
 	adev->pm = pm;
 	hwmgr = &pm->hwmgr;
 
-	amdgpu_device_get_pcie_info(adev);
+	frb_device_get_pcie_info(adev);
 	frb_info(adev, "dpm: PCIe gen mask %08x, width mask %08x (GPU %u/x%u, upstream %u/x%u)",
 		 adev->pcie_gen_mask, adev->pcie_mlw_mask, adev->pcie_caps.asic_speed, adev->pcie_caps.asic_width,
 		 adev->pcie_caps.platform_speed, adev->pcie_caps.platform_width);
@@ -225,7 +230,15 @@ fail:
 
 int frb_pm_enabled(struct frb_device *adev)
 {
+	if (frb_is_si(adev))
+		return frb_si_dpm_enabled(adev);
 	return adev->pm && adev->pm->dpm_enabled;
+}
+
+int frb_pm_dpm_running(struct frb_device *adev)
+{
+	/* frb_pm_enabled answers for VI and SI */
+	return frb_is_soc15(adev) ? frb_vega20_dpm_running(adev) : frb_pm_enabled(adev);
 }
 
 /* pp_dpm_powergate_uvd */
@@ -251,6 +264,8 @@ int frb_pm_enable_uvd(struct frb_device *adev, int enable)
 	struct frb_pm *pm = adev->pm;
 	int pwr_state = enable ? POWER_STATE_ON : POWER_STATE_OFF;
 
+	if (frb_is_si(adev))
+		return -ENODEV;	/* si_dpm's UVD clocks: with uvd_v3_1 */
 	if (!pm || !pm->dpm_enabled)
 		return -ENODEV;
 	if (pm->uvd_pwr_state == pwr_state)
@@ -265,6 +280,10 @@ void frb_pm_fini(struct frb_device *adev)
 {
 	struct frb_pm *pm = adev->pm;
 
+	if (frb_is_si(adev)) {
+		frb_si_dpm_fini(adev);
+		return;
+	}
 	if (!pm)
 		return;
 	if (pm->dpm_enabled) {
@@ -287,6 +306,10 @@ void frb_pm_compute_clocks(struct frb_device *adev, const struct amd_pp_display_
 {
 	struct frb_pm *pm = adev->pm;
 
+	if (frb_is_si(adev)) {
+		frb_si_dpm_compute_clocks(adev, cfg);
+		return;
+	}
 	if (!pm || !pm->dpm_enabled)
 		return;
 	pm->pm_display_cfg = *cfg;
@@ -326,6 +349,8 @@ int frb_pm_force_performance_level(struct frb_device *adev, enum amd_dpm_forced_
 {
 	struct pp_hwmgr *hwmgr;
 
+	if (frb_is_si(adev))
+		return frb_si_dpm_force_performance_level(adev, level);
 	if (!adev->pm || !adev->pm->dpm_enabled)
 		return -ENODEV;
 	hwmgr = &adev->pm->hwmgr;
@@ -350,6 +375,8 @@ uint32_t frb_pm_get_sclk(struct frb_device *adev, int low)
 {
 	struct pp_hwmgr *hwmgr;
 
+	if (frb_is_si(adev))
+		return frb_si_dpm_get_sclk(adev, low);
 	if (!adev->pm || !adev->pm->dpm_enabled)
 		return 0;
 	hwmgr = &adev->pm->hwmgr;
@@ -362,6 +389,8 @@ uint32_t frb_pm_get_mclk(struct frb_device *adev, int low)
 {
 	struct pp_hwmgr *hwmgr;
 
+	if (frb_is_si(adev))
+		return frb_si_dpm_get_mclk(adev, low);
 	if (!adev->pm || !adev->pm->dpm_enabled)
 		return 0;
 	hwmgr = &adev->pm->hwmgr;
@@ -394,6 +423,8 @@ int frb_pm_get_status(struct frb_device *adev, struct frb_pm_status *st)
 	uint32_t v, i;
 	int size;
 
+	if (frb_is_si(adev))
+		return frb_si_dpm_get_status(adev, st);
 	memset(st, 0, sizeof(*st));
 	if (!adev->pm || !adev->pm->dpm_enabled)
 		return -ENODEV;
@@ -448,5 +479,123 @@ int frb_pm_get_status(struct frb_device *adev, struct frb_pm_status *st)
 	st->num_display = adev->pm->pm_display_cfg.num_display;
 	st->vrefresh = adev->pm->pm_display_cfg.vrefresh;
 	st->min_vblank_time = adev->pm->pm_display_cfg.min_vblank_time;
+	return 0;
+}
+
+/*
+ * frb_pm_read_sensors (frb_pm.h), the families' arms. VI: the reads
+ * frb_pm_get_status makes for its numbers, each one's bit set only when it
+ * answered; the fan only on a card that has one (amdgpu's pm.no_fan); no
+ * PCIe link here (the status call reads it from configuration space).
+ */
+/*
+ * The SI arm: the temperature from CG_MULT_THERMAL_STATUS (radeon's
+ * si_get_temp, byte 0x714: a register read that needs no DPM, as radeon's
+ * hwmon has it), then with SI's DPM running what frb_si_dpm_get_status reads
+ * without a message: the current level's clocks and VDDC, the two levels.
+ */
+static int frb_si_read_sensors(struct frb_device *adev, struct frb_pm_sensors *s)
+{
+	struct frb_pm_status st;
+	uint32_t t = (frb_rreg(adev, 0x714 >> 2) & 0x0003fe00) >> 9;	/* CTF_TEMP */
+
+	s->temp_mc = (t & 0x200) ? 255000 : (int32_t)(t & 0x1ff) * 1000;
+	s->valid |= FRB_PMS_TEMP;
+	if (!frb_si_dpm_enabled(adev) || frb_si_dpm_get_status(adev, &st))
+		return -ENODEV;
+	s->dpm_enabled = 1;
+	if (st.cur_sclk_index >= 0) {
+		s->gfx_mhz = st.cur_sclk / 100;
+		s->mem_mhz = st.cur_mclk / 100;
+		s->valid |= FRB_PMS_CLOCKS;
+		if (st.vddgfx_mv) {
+			s->vddgfx_mv = st.vddgfx_mv;
+			s->valid |= FRB_PMS_VDDGFX;
+		}
+	}
+	s->gfx_count = st.sclk_count < 16 ? st.sclk_count : 16;
+	s->mem_count = st.mclk_count < 16 ? st.mclk_count : 16;
+	for (t = 0; t < s->gfx_count; t++)
+		s->gfx_levels[t] = st.sclk_levels[t] / 100;
+	for (t = 0; t < s->mem_count; t++)
+		s->mem_levels[t] = st.mclk_levels[t] / 100;
+	if (s->gfx_count || s->mem_count)
+		s->valid |= FRB_PMS_LEVELS;
+	return 0;
+}
+
+int frb_pm_read_sensors(struct frb_device *adev, struct frb_pm_sensors *s)
+{
+	struct pp_hwmgr *hwmgr;
+	struct smu7_hwmgr *data;
+	uint32_t v, w, i;
+	int size;
+
+	memset(s, 0, sizeof(*s));
+	if (frb_is_soc15(adev))
+		return frb_vega20_read_sensors(adev, s);
+	if (frb_is_si(adev))
+		return frb_si_read_sensors(adev, s);
+	if (adev->family != AMDGPU_FAMILY_VI || !adev->pm || !adev->pm->dpm_enabled)
+		return -ENODEV;
+	hwmgr = &adev->pm->hwmgr;
+	data = (struct smu7_hwmgr *)hwmgr->backend;
+	s->dpm_enabled = 1;
+
+	size = 4;
+	if (!hwmgr->hwmgr_func->read_sensor(hwmgr, AMDGPU_PP_SENSOR_GFX_SCLK, &v, &size)) {
+		size = 4;
+		if (!hwmgr->hwmgr_func->read_sensor(hwmgr, AMDGPU_PP_SENSOR_GFX_MCLK, &w, &size)) {
+			s->gfx_mhz = v / 100;
+			s->mem_mhz = w / 100;
+			s->valid |= FRB_PMS_CLOCKS;
+		}
+	}
+	size = 4;
+	if (!hwmgr->hwmgr_func->read_sensor(hwmgr, AMDGPU_PP_SENSOR_GPU_LOAD, &v, &size)) {
+		size = 4;
+		if (!hwmgr->hwmgr_func->read_sensor(hwmgr, AMDGPU_PP_SENSOR_MEM_LOAD, &w, &size)) {
+			s->gpu_load = v;
+			s->mem_load = w;
+			s->valid |= FRB_PMS_LOAD;
+		}
+	}
+	size = 4;
+	if (!hwmgr->hwmgr_func->read_sensor(hwmgr, AMDGPU_PP_SENSOR_GPU_TEMP, &v, &size)) {
+		s->temp_mc = (int32_t)v;
+		s->valid |= FRB_PMS_TEMP;
+	}
+	size = 4;
+	if (!hwmgr->hwmgr_func->read_sensor(hwmgr, AMDGPU_PP_SENSOR_VDDGFX, &v, &size)) {
+		s->vddgfx_mv = v;
+		s->valid |= FRB_PMS_VDDGFX;
+	}
+	if (!hwmgr->thermal_controller.fanInfo.bNoFan && hwmgr->hwmgr_func->get_fan_speed_rpm &&
+	    !hwmgr->hwmgr_func->get_fan_speed_rpm(hwmgr, &v)) {
+		s->fan_rpm = v;
+		if (hwmgr->hwmgr_func->get_fan_speed_pwm && !hwmgr->hwmgr_func->get_fan_speed_pwm(hwmgr, &w))
+			s->fan_pwm = w;
+		s->valid |= FRB_PMS_FAN;
+	}
+	v = 0;
+	if (!smum_send_msg_to_smc_with_parameter(hwmgr, PPSMC_MSG_GetCurrPkgPwr, 0, &v) && v) {
+		s->power_mw = (uint32_t)(((uint64_t)v * 1000) >> 8);	/* 8.8 W */
+		s->valid |= FRB_PMS_POWER;
+	}
+	if (hwmgr->default_power_limit) {
+		s->power_limit_w = hwmgr->default_power_limit;	/* usMaximumPowerDeliveryLimit, W */
+		s->valid |= FRB_PMS_POWER_LIMIT;
+	}
+	s->gfx_count = data->dpm_table.sclk_table.count < 16 ? data->dpm_table.sclk_table.count : 16;
+	s->mem_count = data->dpm_table.mclk_table.count < 16 ? data->dpm_table.mclk_table.count : 16;
+	for (i = 0; i < s->gfx_count; i++)
+		s->gfx_levels[i] = data->dpm_table.sclk_table.dpm_levels[i].value / 100;
+	for (i = 0; i < s->mem_count; i++)
+		s->mem_levels[i] = data->dpm_table.mclk_table.dpm_levels[i].value / 100;
+	if (s->gfx_count || s->mem_count)
+		s->valid |= FRB_PMS_LEVELS;
+	s->features_kind = FRB_PMS_FEATURES_SMU7;
+	s->features = cgs_read_ind_register(adev, CGS_IND_REG__SMC, ixFEATURE_STATUS);
+	s->valid |= FRB_PMS_SMU;
 	return 0;
 }

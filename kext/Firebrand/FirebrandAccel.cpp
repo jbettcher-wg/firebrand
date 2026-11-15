@@ -112,11 +112,14 @@ bool FirebrandAccel::setUp(IOService *owner, FirebrandCore *core, IOFramebuffer 
 	fScanoutEnd = scanoutEnd;
 
 	core->lock();
-	ring = frb_gfx_v8_0_ring(adev);
+	/* gfx_v8_0's ring on Polaris, gfx_v6_0's on SI, gfx_v9_0's on Vega 20 (frb_engines.c's family dispatch) */
+	ring = frb_gfx_ring(adev);
 	if (adev->stage_done < FRB_STAGE_SDMA)
 		why = "the stages did not reach sdma";
 	else if (!ring)
 		why = "the GFX ring is not up";
+	else if (frbRingFrames(ring) < kMaxInFlight + 2)
+		why = "the GFX ring holds too few submissions";
 	else if (!adev->aper || !adev->gart.ready)
 		why = "no VRAM window or no GART";
 	if (!why) {
@@ -127,18 +130,28 @@ bool FirebrandAccel::setUp(IOService *owner, FirebrandCore *core, IOFramebuffer 
 			why = "no room for a heap between the scanout and the driver's region";
 		else if (frb_vram_mgr_init(&fVram, adev->os, scanoutEnd, reserved, window, vram))
 			why = "no memory for the heaps";
+		else
+			core->setVramMgr(&fVram);	/* the status call's heap figures */
 	}
 	if (!why) {
-		struct frb_ring *sdma = frb_sdma_v3_0_ring(adev, 0);
+		struct frb_ring *sdma = frb_sdma_ring(adev, 0);
 
 		fCompleted = frb_fence_read(ring);
 		fSdmaCompleted = sdma ? frb_fence_read(sdma) : 0;
+		/*
+		 * How many 2D frames SDMA0's ring holds at once (two spare): every
+		 * IB slot on SDMA 3 (16-dword fetches), fewer on SDMA 4, whose
+		 * 256-dword fetch makes every frame 256 dwords of the 2048.
+		 */
+		fSdmaMaxInFlight = sdma && frbRingFrames(sdma) >= 4 ? frbRingFrames(sdma) - 2 : 0;
+		if (fSdmaMaxInFlight > kIbSlots)
+			fSdmaMaxInFlight = kIbSlots;
 		/*
 		 * The 2D path's IBs: GTT, snooped, written by the CPU through its
 		 * cache (frb_rect.c). Measured on the RX 550: IBs in VRAM made no
 		 * difference to SDMA0's pace (~11 us a submission, ~2 us a packet).
 		 */
-		if (sdma && !core->gttAlloc(kIbSlots * kIbSlotBytes, &fIbArena))
+		if (sdma && fSdmaMaxInFlight && !core->gttAlloc(kIbSlots * kIbSlotBytes, &fIbArena))
 			fIbArenaUp = true;
 	}
 	core->unlock();
@@ -156,8 +169,14 @@ bool FirebrandAccel::setUp(IOService *owner, FirebrandCore *core, IOFramebuffer 
 		int arg = 1;
 
 		fVideoLock = IOLockAlloc();
-		fVideoOffered = fVideoLock && owner->getProperty("FirebrandVideo") != kOSBooleanFalse &&
+		/* 'rdnv' only where this driver has the UVD block (uvd_v6_0; SI's uvd_v3_1 is not ported) */
+		fVideoOffered = fVideoLock && frb_has_uvd(adev) && owner->getProperty("FirebrandVideo") != kOSBooleanFalse &&
 			!(PE_parse_boot_arg("frb_video", &arg) && !arg);
+		/* the decoder is uvd_v6_0's on Polaris and uvd_v7_0's on Vega 20; no 'rdnv' on a family without one */
+		if (fVideoOffered && !frb_has_uvd(adev)) {
+			fVideoOffered = false;
+			frb_info(adev, "accel: video not offered: this family's UVD is not ported");
+		}
 	}
 
 	/* the status page: rdn_user_status in the CPU's order, read-only to the clients */
@@ -245,9 +264,10 @@ bool FirebrandAccel::setUp(IOService *owner, FirebrandCore *core, IOFramebuffer 
 	}
 	publish(provider);
 	startWatchdog();
-	frb_info(adev, "accel: 2D on sdma0 %s (IBs %u x %u KB in GTT at 0x%llx); surface clients %s",
+	frb_info(adev, "accel: 2D on sdma0 %s (IBs %u x %u KB in GTT at 0x%llx, %u in flight); surface clients %s",
 		 fIbArenaUp ? "up" : "NOT up", (unsigned)kIbSlots, (unsigned)(kIbSlotBytes >> 10),
-		 (unsigned long long)fIbArena.gpu_addr, fSurfaces ? "offered" : "not offered");
+		 (unsigned long long)fIbArena.gpu_addr, (unsigned)fSdmaMaxInFlight,
+		 fSurfaces ? "offered" : "not offered");
 	frb_info(adev, "accel: up: VRAM heap %lu MB visible at 0x%08lx, %lu MB beyond the window at 0x%08lx; "
 		 "GART %lu MB at 0x%llx%s; GFX fence %lu; %s",
 		 (unsigned long)((reserved - scanoutEnd) >> 20), (unsigned long)scanoutEnd,
@@ -281,10 +301,28 @@ void FirebrandAccel::publish(IOPCIDevice *provider)
 	 * layout for device 699f", 2026-11-13). RadeonNI's own gate
 	 * withholds IOAccelTypes the same way where GL is not validated.
 	 */
+	{
+		OSNumber *hold = OSDynamicCast(OSNumber, fOwner->getProperty("FirebrandAccelHoldMs"));
+		int arg;
+
+		fHoldMs = hold ? hold->unsigned32BitValue() : 0;
+		if (PE_parse_boot_arg("frb_accel_hold", &arg))
+			fHoldMs = (UInt32)arg;
+		fHoldUntilNs = 0;
+		fProbeDone = false;
+		fHoldDone = false;
+	}
 	bool gl = fOwner->getProperty("FirebrandAccelGL") == kOSBooleanTrue ||
 		(PE_parse_boot_arg("frb_gl", &arg) && arg);
 
 	setName("FirebrandAccel");
+	/*
+	 * The card's name, as the PCI device carries it (FirebrandCore's
+	 * "model", from the family-table row): what a tool that lists the
+	 * IOAccelerators reads there. The name stays FirebrandAccel.
+	 */
+	if (OSData *model = OSDynamicCast(OSData, provider->getProperty("model")))
+		setProperty("model", model);
 	setProperty("IOMatchCategory", "IOAccelerator");
 	setProperty("IOGLBundleName", FRB_GL_BUNDLE_NAME);
 	setProperty(kIOAccelRevisionKey, (UInt64)kCurrentGraphicsInterfaceRevision, 32);
@@ -368,9 +406,15 @@ void FirebrandAccel::publish(IOPCIDevice *provider)
 			char fw[64];
 			OSData *d;
 
-			snprintf(fw, sizeof(fw), "polaris12_uvd.bin %u.%u family %u (embedded)",
-				 (unsigned)(uvd->fw_version >> 24) & 0xff, (unsigned)(uvd->fw_version >> 16) & 0xff,
-				 (unsigned)(uvd->fw_version >> 8) & 0xff);
+			if (frb_is_soc15(fCore->adev()))
+				/* amdgpu_uvd_sw_init's reading from Vega 20 on: ENC major.minor, DEC minor, family */
+				snprintf(fw, sizeof(fw), "vega20_uvd.bin ENC %u.%u DEC .%u family %u (embedded, PSP)",
+					 (unsigned)(uvd->fw_version >> 30) & 0x3, (unsigned)(uvd->fw_version >> 24) & 0x3f,
+					 (unsigned)(uvd->fw_version >> 8) & 0xff, (unsigned)uvd->fw_version & 0xff);
+			else
+				snprintf(fw, sizeof(fw), "polaris12_uvd.bin %u.%u family %u (embedded)",
+					 (unsigned)(uvd->fw_version >> 24) & 0xff, (unsigned)(uvd->fw_version >> 16) & 0xff,
+					 (unsigned)(uvd->fw_version >> 8) & 0xff);
 			d = OSData::withBytes(fw, strlen(fw));
 			if (d) {
 				fFramebuffer->setProperty("FW_UVD", d);
@@ -473,6 +517,7 @@ void FirebrandAccel::retire(void)
 		}
 		IOFree(p, sizeof(*p));
 	}
+	fCore->setVramMgr(0);
 	frb_vram_mgr_fini(&fVram);
 	fStatus = 0;
 	if (fShapes) {
@@ -503,6 +548,9 @@ void FirebrandAccel::free(void)
 	stopWatchdog();
 	if (fCore && !fReleased && fOwner) {
 		/* setUp failed part way: nothing was submitted, nothing is bound; the core still runs */
+		fCore->lock();
+		fCore->setVramMgr(0);
+		fCore->unlock();
 		frb_vram_mgr_fini(&fVram);
 		if (fIbArenaUp) {
 			fCore->lock();
@@ -598,7 +646,22 @@ IOReturn FirebrandAccel::newUserClient(task_t owningTask, void *securityID, UInt
 
 struct frb_ring *FirebrandAccel::ringLocked(void)
 {
-	return fCore ? frb_gfx_v8_0_ring(fCore->adev()) : 0;
+	return fCore ? frb_gfx_ring(fCore->adev()) : 0;
+}
+
+/*
+ * Frames the ring holds at once: a frame's packets (pipeline sync, a wait,
+ * the HDP flush, the IB, the invalidate, the fence) are at most 44 dwords on
+ * every engine here, counted as 64, padded to the engine's fetch size
+ * (align_mask + 1: 16 dwords on SDMA 3, 256 on GFX 8/9 and SDMA 4).
+ * frb_ring_alloc does not look at the read pointer, so the callers keep
+ * below this.
+ */
+UInt32 FirebrandAccel::frbRingFrames(const struct frb_ring *ring)
+{
+	UInt32 align = ring->funcs->align_mask + 1, frame = (64 + align - 1) / align * align;
+
+	return (ring->buf_mask + 1) / frame;
 }
 
 /* the newest signalled sequence (wrap-safe), with the status page and the deferred frees brought up to it */
@@ -768,8 +831,9 @@ int FirebrandAccel::recoverLocked(UInt32 force, UInt32 stalled, const char *why)
 	struct frb_ring *sdma;
 	int r;
 
-	frb_err(adev, "accel: %s: GFX fence %u of %u, SDMA0 fence %u of %u; recovering",
-		why, (unsigned)fCompleted, ringLocked() ? (unsigned)ringLocked()->sync_seq : 0,
+	frb_err(adev, "accel: %s at %llu ms: GFX fence %u of %u, SDMA0 fence %u of %u; recovering",
+		why, (unsigned long long)adev->os->time_ms(adev->os->cookie), (unsigned)fCompleted,
+		ringLocked() ? (unsigned)ringLocked()->sync_seq : 0,
 		(unsigned)fSdmaCompleted, sdmaLocked() ? (unsigned)sdmaLocked()->sync_seq : 0);
 	r = fCore->recoverLocked(force, &rep);
 	if (!r && !force && !rep.soft_recovered && !rep.hung && stalled) {
@@ -822,13 +886,16 @@ void FirebrandAccel::reportHang(const char *what, UInt32 seq)
 		return;
 	fCore->lock();
 	ring = ringLocked();
-	if (ring && !fRetired)
+	if (ring && !fRetired) {
+		uint32_t grbm = 0, cpStat = 0, stalled = 0;
+
+		frb_gfx_hang_status(adev, &grbm, &cpStat, &stalled);
 		frb_err(adev, "accel: %s: fence %u not reached; signalled %u, emitted %u, rptr %u wptr %u, "
 			"GRBM_STATUS %08x CP_STAT %08x CP_STALLED_STAT1 %08x (%u reports)",
 			what, (unsigned)seq, (unsigned)frb_fence_read(ring), (unsigned)ring->sync_seq,
 			(unsigned)ring->funcs->get_rptr(ring), (unsigned)ring->funcs->get_wptr(ring),
-			frb_rreg(adev, mmGRBM_STATUS), frb_rreg(adev, mmCP_STAT), frb_rreg(adev, mmCP_STALLED_STAT1),
-			(unsigned)fHangReports);
+			grbm, cpStat, stalled, (unsigned)fHangReports);
+	}
 	fCore->unlock();
 }
 
@@ -893,7 +960,7 @@ IOReturn FirebrandAccel::getInfo(struct rdn_user_info *info)
 		fCore->unlock();
 		return kIOReturnNoDevice;
 	}
-	frb_gfx_v8_0_get_info(adev, &gfx);
+	frb_gfx_get_info(adev, &gfx);
 	info->version = RDN_USER_VERSION;
 	info->pci_device_id = adev->device;
 	info->vram_gpu_base_hi = (UInt32)(adev->gmc.vram_start >> 32);
@@ -913,10 +980,22 @@ IOReturn FirebrandAccel::getInfo(struct rdn_user_info *info)
 	case 4:		info->tile_config = 2; break;
 	default:	info->tile_config = 3; break;
 	}
-	info->tile_config |= ((gfx.mc_arb_ramcfg & MC_ARB_RAMCFG__NOOFBANK_MASK) >> MC_ARB_RAMCFG__NOOFBANK__SHIFT) << 4;
-	info->tile_config |= ((gfx.gb_addr_config & GB_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE_MASK) >>
-			      GB_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE__SHIFT) << 8;
-	info->tile_config |= ((gfx.gb_addr_config & GB_ADDR_CONFIG__ROW_SIZE_MASK) >> GB_ADDR_CONFIG__ROW_SIZE__SHIFT) << 12;
+	if (gfx.gfx_level >= 9) {
+		/*
+		 * GFX9: no MC_ARB_RAMCFG and no ROW_SIZE; GB_ADDR_CONFIG's
+		 * PIPE_INTERLEAVE_SIZE is bits 5:3 (gc_9_0_sh_mask.h, Mesa's
+		 * G_0098F8_PIPE_INTERLEAVE_SIZE_GFX9). A GFX9 client takes
+		 * gb_addr_config whole from RDN_UC_GFX_INFO instead.
+		 */
+		info->tile_config |= ((gfx.gb_addr_config >> 3) & 7) << 8;
+	} else {
+		info->tile_config |= ((gfx.mc_arb_ramcfg & MC_ARB_RAMCFG__NOOFBANK_MASK) >>
+				      MC_ARB_RAMCFG__NOOFBANK__SHIFT) << 4;
+		info->tile_config |= ((gfx.gb_addr_config & GB_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE_MASK) >>
+				      GB_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE__SHIFT) << 8;
+		info->tile_config |= ((gfx.gb_addr_config & GB_ADDR_CONFIG__ROW_SIZE_MASK) >>
+				      GB_ADDR_CONFIG__ROW_SIZE__SHIFT) << 12;
+	}
 	info->backend_map = gfx.backend_enable_mask;
 	info->max_backends = gfx.max_backends_per_se * gfx.num_se;
 	info->max_tile_pipes = gfx.max_tile_pipes;
@@ -937,6 +1016,57 @@ IOReturn FirebrandAccel::getInfo(struct rdn_user_info *info)
 	return kIOReturnSuccess;
 }
 
+/*
+ * RDN_UC_GFX_INFO (rdn_user.h): amdgpu_info_ioctl's AMDGPU_INFO_DEV_INFO
+ * as far as Mesa's ac_gpu_info reads it on GFX9 (the chip's identity,
+ * GB_ADDR_CONFIG, the CU and RB masks, the CP firmware, the counter clock).
+ */
+IOReturn FirebrandAccel::gfxInfo(struct rdn_user_gfx_info *info)
+{
+	struct frb_device *adev = fCore->adev();
+	struct frb_gfx_info gfx;
+	UInt32 se, sh;
+
+	bzero(info, sizeof(*info));
+	fCore->lock();
+	if (fRetired) {
+		fCore->unlock();
+		return kIOReturnNoDevice;
+	}
+	frb_gfx_get_info(adev, &gfx);
+	info->version = RDN_USER_GFX_INFO_VERSION;
+	info->size = sizeof(*info);
+	info->family = adev->family;
+	info->chip_external_rev = adev->external_rev_id;
+	info->chip_rev = adev->rev_id;
+	info->pci_rev = adev->revision;
+	info->gfx_ip_version = gfx.gfx_level >= 9 ? (9u << 16) | (4u << 8) : (8u << 16);	/* GC 9.4.0; VI 8.0 */
+	info->me_fw_version = gfx.me_fw_version;
+	info->me_fw_feature = gfx.me_fw_feature;
+	info->pfp_fw_version = gfx.pfp_fw_version;
+	info->pfp_fw_feature = gfx.pfp_fw_feature;
+	info->mec_fw_version = gfx.mec_fw_version;
+	info->mec_fw_feature = gfx.mec_fw_feature;
+	info->gb_addr_config = gfx.gb_addr_config;
+	info->num_shader_engines = gfx.num_se;
+	info->num_sh_per_se = gfx.num_sh_per_se;
+	info->num_cu_per_sh = gfx.max_cu_per_sh;
+	info->num_cu = gfx.num_cu;
+	for (se = 0; se < 4; se++)
+		for (sh = 0; sh < 4; sh++)
+			info->cu_bitmap[se][sh] = gfx.cu_bitmap[se][sh];
+	info->enabled_rb_mask = gfx.backend_enable_mask;
+	info->num_rb_pipes = gfx.max_backends_per_se * gfx.num_se;
+	info->num_tcc_blocks = gfx.num_tcc_blocks;
+	info->num_shader_visible_vgprs = gfx.max_gprs;
+	info->gpu_counter_freq_khz = frb_get_xclk(adev) * 10;
+	info->engine_clock_khz = adev->default_sclk * 10;
+	info->memory_clock_khz = adev->default_mclk * 10;
+	info->flags = RDN_GFX_INFO_LE_IBS | (gfx.csb_loaded ? RDN_GFX_INFO_CLEAR_STATE : 0);
+	fCore->unlock();
+	return kIOReturnSuccess;
+}
+
 IOReturn FirebrandAccel::vramInfo64(struct rdn_user_vram_info64 *info)
 {
 	struct frb_device *adev = fCore->adev();
@@ -951,7 +1081,10 @@ IOReturn FirebrandAccel::vramInfo64(struct rdn_user_vram_info64 *info)
 	info->version = 1;
 	info->slice_count = 0;		/* no resizable BAR: the aperture is the whole CPU view */
 	info->slice_bytes = RDN_UC_VRAM_SLICE_BYTES;
-	/* GFX8's CP has no working fetch swap: command buffers are little-endian (frb_gfx_v8_0.c ib probe) */
+	/*
+	 * GFX8's CP has no working fetch swap: command buffers are little-endian (frb_gfx_v8_0.c ib probe).
+	 * GFX9 runs them so too: the IB packet's swap bits stay 0 (frb_gfx_v9_0.c, docs/byte-order.md).
+	 */
 	info->flags = (fStatus ? RDN_VRAM_INFO64_STATUS : 0) | RDN_VRAM_INFO64_LE_IBS;
 	info->total_vram_hi = (UInt32)(adev->gmc.real_vram_size >> 32);
 	info->total_vram_lo = (UInt32)adev->gmc.real_vram_size;
@@ -1057,6 +1190,7 @@ IOReturn FirebrandAccel::submit(struct frb_bo_table *bos, UInt64 offset, UInt32 
 	if (!words || words > FRB_MAX_IB_WORDS || (offset & 3))
 		return kIOReturnBadArgument;
 	fCore->lock();
+	holdOffLocked();
 	for (;;) {
 		IOReturn room;
 
@@ -1167,8 +1301,10 @@ IOReturn FirebrandAccel::syncForCPU(void)
 
 /*
  * RDN_UC_REG_READ, a BYTE offset: vi_read_register's allowlist for
- * everyone (gfx_v8_0's copies of the tiling tables and RB registers), the
- * register itself for an administrator otherwise (docs/accel-interface.md 2.4).
+ * everyone (gfx_v8_0's copies of the tiling tables and RB registers), on
+ * SOC15 soc15_read_register's (status registers, GB_ADDR_CONFIG, DB_DEBUG2:
+ * frb_read_register), the register itself for an administrator otherwise
+ * (docs/accel-interface.md 2.4).
  */
 IOReturn FirebrandAccel::regRead(UInt32 byteOffset, bool admin, UInt32 *value)
 {
@@ -1182,7 +1318,7 @@ IOReturn FirebrandAccel::regRead(UInt32 byteOffset, bool admin, UInt32 *value)
 	fCore->lock();
 	if (fRetired)
 		ret = kIOReturnNoDevice;
-	else if (!frb_vi_read_register(adev, 0xffffffff, 0xffffffff, byteOffset / 4, &v))
+	else if (!frb_read_register(adev, 0xffffffff, 0xffffffff, byteOffset / 4, &v))
 		*value = v;
 	else if (admin)
 		*value = frb_rreg(adev, byteOffset / 4);
@@ -1229,7 +1365,8 @@ IOReturn FirebrandAccel::gartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages)
 /*
  * RDN_UC_GART_BIND(64): wire a piece of the program's memory (it stays the
  * program's: no kernel address space is spent on it) and enter its pages
- * in VMID 0's GART, cached and snooped (FRB_PTE_GTT), at their bus
+ * in VMID 0's GART, cached and snooped (frb_gart_gtt_flags: FRB_PTE_GTT, and
+ * on SOC15 gmc_v9_0's MTYPE UC and EXECUTABLE besides), at their bus
  * addresses through inbound window 2. Returns the byte offset in the GART.
  */
 IOReturn FirebrandAccel::gartBind(void *owner, task_t task, UInt64 address, UInt32 size, UInt32 *offset)
@@ -1281,7 +1418,7 @@ IOReturn FirebrandAccel::gartBind(void *owner, task_t task, UInt64 address, UInt
 				ret = kIOReturnVMError;
 				break;
 			}
-			frb_gart_set_pte(adev, first + i, bus, FRB_PTE_GTT);
+			frb_gart_set_pte(adev, first + i, bus, frb_gart_gtt_flags(adev));
 			if (!i)
 				fCore->logBinding("GART_BIND", memory, bus, npages);
 		}
@@ -1458,7 +1595,8 @@ void FirebrandAccelClient::free(void)
  * surfaces and screen blits (6-9, 17, 18, 33, 34, 44-46, 51); power
  * answers kIOReturnUnsupported until G3, the decoder kIOReturnNotReady
  * (RadeonNI without FW_UVD), the diagnostics kIOReturnNotPrivileged
- * unless the caller is an administrator.
+ * unless the caller is an administrator. Beyond the table: RDN_UC_GFX_INFO
+ * (0x3e, anyone; RadeonNI has no such index).
  */
 IOExternalMethod *FirebrandAccelClient::getTargetAndMethodForIndex(IOService **target_, UInt32 index)
 {
@@ -1520,12 +1658,17 @@ IOExternalMethod *FirebrandAccelClient::getTargetAndMethodForIndex(IOService **t
 		FRB_SISO(methodUnsupported, 0, 4),						/* POWER_DETAIL */
 	};
 	static const IOExternalMethod target = FRB_SISO(methodScreenTarget, 5, 0);
+	static const IOExternalMethod gfxInfo = FRB_M(methodGfxInfo, kIOUCScalarIStructO, 0, kIOUCVariableStructureSize);
 #undef FRB_SISO
 #undef FRB_M
 
 	if (fV2 && index == FRB_UC_SCREEN_TARGET) {
 		*target_ = this;
 		return (IOExternalMethod *)&target;
+	}
+	if (fV2 && index == RDN_UC_GFX_INFO) {
+		*target_ = this;
+		return (IOExternalMethod *)&gfxInfo;
 	}
 	if (index >= (fV2 ? (UInt32)RDN_UC_METHOD_COUNT : (UInt32)RDN_UC_V1_METHOD_COUNT))
 		return 0;
@@ -1564,6 +1707,23 @@ IOReturn FirebrandAccelClient::methodGetInfo(struct rdn_user_info *info, IOByteC
 		return kIOReturnBadArgument;
 	*size = sizeof(*info);
 	return fAccel->getInfo(info);
+}
+
+/* variable size: a client built against an older (shorter) struct gets its part of it */
+IOReturn FirebrandAccelClient::methodGfxInfo(struct rdn_user_gfx_info *info, IOByteCount *size)
+{
+	struct rdn_user_gfx_info all;
+	IOReturn r;
+
+	if (*size < 2 * sizeof(uint32_t))
+		return kIOReturnBadArgument;
+	r = fAccel->gfxInfo(&all);
+	if (r != kIOReturnSuccess)
+		return r;
+	if (*size > sizeof(all))
+		*size = sizeof(all);
+	bcopy(&all, info, *size);
+	return kIOReturnSuccess;
 }
 
 IOReturn FirebrandAccelClient::methodAlloc(UInt32 size, UInt32 align, UInt32 *offset)

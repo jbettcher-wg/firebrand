@@ -2686,6 +2686,7 @@ int frb_gfx_v8_0_get_info(struct frb_device *adev, struct frb_gfx_info *info)
 	memset(info, 0, sizeof(*info));
 	if (!g || !g->sw_done)
 		return -ENODEV;
+	info->gfx_level = 8;
 	info->num_se = g->config.max_shader_engines;
 	info->num_sh_per_se = g->config.max_sh_per_se;
 	info->max_cu_per_sh = g->config.max_cu_per_sh;

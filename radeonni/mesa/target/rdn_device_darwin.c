@@ -1115,6 +1115,44 @@ struct rdn_device *rdn_device_open(void)
 			}
 		}
 	}
+	/* GFX9: the chip as amdgpu's device info describes it (Firebrand on SOC15); other kexts refuse the method. */
+	{
+		struct rdn_user_gfx_info g;
+		IOByteCount g_size = sizeof(g);
+
+		memset(&g, 0, sizeof(g));
+		if (!IOConnectMethodScalarIStructureO(d->conn, RDN_UC_GFX_INFO, 0, &g_size, &g) &&
+		    g.version == RDN_USER_GFX_INFO_VERSION && g_size >= sizeof(g)) {
+			d->base.info.has_gfx = true;
+			d->base.info.gfx.family = g.family;
+			d->base.info.gfx.chip_external_rev = g.chip_external_rev;
+			d->base.info.gfx.chip_rev = g.chip_rev;
+			d->base.info.gfx.pci_rev = g.pci_rev;
+			d->base.info.gfx.ip_major = (g.gfx_ip_version >> 16) & 0xff;
+			d->base.info.gfx.ip_minor = (g.gfx_ip_version >> 8) & 0xff;
+			d->base.info.gfx.ip_rev = g.gfx_ip_version & 0xff;
+			d->base.info.gfx.me_fw_version = g.me_fw_version;
+			d->base.info.gfx.me_fw_feature = g.me_fw_feature;
+			d->base.info.gfx.pfp_fw_version = g.pfp_fw_version;
+			d->base.info.gfx.pfp_fw_feature = g.pfp_fw_feature;
+			d->base.info.gfx.mec_fw_version = g.mec_fw_version;
+			d->base.info.gfx.mec_fw_feature = g.mec_fw_feature;
+			d->base.info.gfx.gb_addr_config = g.gb_addr_config;
+			d->base.info.gfx.num_shader_engines = g.num_shader_engines;
+			d->base.info.gfx.num_sh_per_se = g.num_sh_per_se;
+			d->base.info.gfx.num_cu_per_sh = g.num_cu_per_sh;
+			d->base.info.gfx.num_cu = g.num_cu;
+			memcpy(d->base.info.gfx.cu_bitmap, g.cu_bitmap, sizeof(g.cu_bitmap));
+			d->base.info.gfx.enabled_rb_mask = g.enabled_rb_mask;
+			d->base.info.gfx.num_rb_pipes = g.num_rb_pipes;
+			d->base.info.gfx.num_tcc_blocks = g.num_tcc_blocks;
+			d->base.info.gfx.num_shader_visible_vgprs = g.num_shader_visible_vgprs;
+			d->base.info.gfx.gpu_counter_freq_khz = g.gpu_counter_freq_khz;
+			d->base.info.gfx.engine_clock_khz = g.engine_clock_khz;
+			d->base.info.gfx.memory_clock_khz = g.memory_clock_khz;
+			d->base.info.gfx.clear_state = (g.flags & RDN_GFX_INFO_CLEAR_STATE) != 0;
+		}
+	}
 	d->base.info.tile_config = info.tile_config;
 	d->base.info.backend_map = info.backend_map;
 	d->base.info.max_backends = info.max_backends;

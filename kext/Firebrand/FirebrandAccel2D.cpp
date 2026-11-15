@@ -69,7 +69,7 @@ static bool screenRange(int32_t v)
 
 struct frb_ring *FirebrandAccel::sdmaLocked(void)
 {
-	return fCore && fIbArenaUp ? frb_sdma_v3_0_ring(fCore->adev(), 0) : 0;
+	return fCore && fIbArenaUp ? frb_sdma_ring(fCore->adev(), 0) : 0;
 }
 
 /*
@@ -236,9 +236,12 @@ UInt32 FirebrandAccel::currentFenceLocked(void)
 }
 
 /*
- * `count` IB slots in a row, each once SDMA0 has passed its last use; lets
- * go of the lock while it waits, and takes them all before it returns (a
- * move's two IBs share the scratch: nothing else may come between them).
+ * `count` IB slots in a row, each once SDMA0 has passed its last use, and
+ * room on SDMA0's ring for `count` more frames (fSdmaMaxInFlight: on SDMA 4
+ * a frame takes 256 of the ring's 2048 dwords, so fewer frames than slots
+ * fit); lets go of the lock while it waits, and takes them all before it
+ * returns (a move's IBs share the scratch: nothing else may come between
+ * them; the lock stays until they are submitted).
  */
 IOReturn FirebrandAccel::slotLocked(UInt32 count, UInt32 *slots, struct frb_rect_ib *ibs)
 {
@@ -246,17 +249,27 @@ IOReturn FirebrandAccel::slotLocked(UInt32 count, UInt32 *slots, struct frb_rect
 
 	UInt64 t0 = nowNs();
 
-	if (!count || count > 2)
+	/*
+	 * up to every slot: a region move on SI's DMA can take several IBs a
+	 * phase (movesLocked); never more frames than the ring holds (SDMA 4: 6),
+	 * which the wait below could not make room for
+	 */
+	if (!count || count > kIbSlots || (fSdmaMaxInFlight && count > fSdmaMaxInFlight))
 		return kIOReturnBadArgument;
 	for (;;) {
 		bool idle = true;
 
-		if (fRetired || !sdmaLocked())
+		struct frb_ring *sdma = sdmaLocked();
+
+		if (fRetired || !sdma)
 			return kIOReturnNoDevice;
 		for (i = 0; i < count && idle; i++) {
 			s = (fSlotNext + i) % kIbSlots;
 			idle = !fSlotUsed[s] || sdmaSignalledLocked(fSlotSeq[s]);
 		}
+		/* the frame count + fSdmaMaxInFlight back has to be done (wrap-safe) */
+		if (idle && (SInt32)(sdma->sync_seq + count - fSdmaCompleted) > (SInt32)fSdmaMaxInFlight)
+			idle = sdmaSignalledLocked(sdma->sync_seq + count - fSdmaMaxInFlight);
 		if (idle)
 			break;
 		profSlotWaits++;
@@ -281,11 +294,111 @@ IOReturn FirebrandAccel::slotLocked(UInt32 count, UInt32 *slots, struct frb_rect
 		slots[i] = s;
 		ibs[i].buf = (uint8_t *)fIbArena.cpu + s * kIbSlotBytes;
 		ibs[i].len_dw = 0;
-		ibs[i].cap_dw = kIbSlotBytes / 4 - 8;	/* sdma_v3_0_ring_pad_ib's room */
+		ibs[i].cap_dw = kIbSlotBytes / 4 - 8;	/* sdma_v3_0 / sdma_v4_0 / si_dma_ring_pad_ib's room */
+		ibs[i].sdma4 = frb_is_soc15(fCore->adev());	/* SDMA 4's packet encodings (frb_rect.h) */
+		ibs[i].si_dma = frb_is_si(fCore->adev());	/* SI DMA packets (frb_rect.h) */
 	}
 	fSlotNext = (fSlotNext + count) % kIbSlots;
 	profSlotNs += nowNs() - t0;
 	return kIOReturnSuccess;
+}
+
+/* FirebrandAccelHoldMs (FirebrandAccel.h): drops the core's lock while it waits */
+void FirebrandAccel::holdOffLocked(void)
+{
+	UInt64 now;
+
+	if (fHoldDone)
+		return;
+	if (!fHoldMs) {
+		fHoldDone = true;
+		sdmaProbeLocked();
+		return;
+	}
+	now = nowNs();
+	if (!fHoldUntilNs) {
+		fHoldUntilNs = now + (UInt64)fHoldMs * 1000000ULL;
+		frb_info(fCore->adev(), "accel: the first submission is held for %u ms (FirebrandAccelHoldMs)",
+			 (unsigned)fHoldMs);
+	}
+	while (!fHoldDone && now < fHoldUntilNs) {
+		fCore->unlock();
+		IOSleep(50);
+		fCore->lock();
+		now = nowNs();
+	}
+	if (!fHoldDone) {
+		fHoldDone = true;
+		frb_info(fCore->adev(), "accel: the hold is over; submissions go on");
+		sdmaProbeLocked();
+	}
+}
+
+/*
+ * SDMA0's first frame (SOC15). On the MI50 the engine's first 2D frame of a
+ * boot does not come back in a good part of the boots: its UTCL1 write path
+ * stops with an RPTR writeback in it (docs/vega20-bring-up.md), nothing of
+ * the frame is fetched, and the window server's first frames and the GFX
+ * ring that waits on them (the join) stand until the watchdog resets the
+ * engine 2 s later and drops them. So the driver sends that first frame
+ * itself, before any client's: the same frame as a 2D one (the pipeline
+ * sync, an IB from the GTT arena, the invalidate, the fence), its IB eight
+ * NOPs. A frame takes well under a millisecond; one that is not back in
+ * kProbeMs gets SDMA's soft reset (62 ms, measured) and the next try. No
+ * client frame is lost and nothing waits for the watchdog.
+ */
+void FirebrandAccel::sdmaProbeLocked(void)
+{
+	enum { kProbeTries = 4, kProbeMs = 50 };
+	struct frb_device *adev = fCore->adev();
+	struct frb_ring *sdma;
+	struct frb_ib_deps deps;
+	struct frb_ib ib;
+	uint32_t seq;
+	UInt64 t0;
+	int tries, r;
+
+	if (fProbeDone)
+		return;
+	fProbeDone = true;
+	if (!frb_is_soc15(adev) || fRetired || fWedged || fSlotUsed[0])
+		return;
+	for (tries = 1; tries <= kProbeTries; tries++) {
+		sdma = sdmaLocked();
+		if (!sdma)
+			return;
+		bzero(&ib, sizeof(ib));
+		ib.cpu = (uint8_t *)fIbArena.cpu;
+		ib.gpu_addr = fIbArena.gpu_addr;
+		ib.size_dw = kIbSlotBytes / 4;
+		ib.length_dw = 8;
+		bzero(ib.cpu, 8 * 4);		/* SDMA's NOP is 0 */
+		bzero(&deps, sizeof(deps));
+		deps.pipeline_sync = 1;
+		deps.no_hdp_flush = 1;
+		__asm__ __volatile__("sync" : : : "memory");
+		seq = 0;
+		t0 = nowNs();
+		r = frb_ib_schedule_deps(sdma, &ib, &deps, &seq);
+		if (r) {
+			frb_err(adev, "accel: sdma0: the first frame was not scheduled (%d)", r);
+			return;
+		}
+		r = frb_fence_wait(sdma, seq, kProbeMs * 1000);
+		if (!r) {
+			sdmaSignalledLocked(seq);
+			frb_info(adev, "accel: sdma0: its first frame came back after %u us%s",
+				 (unsigned)((nowNs() - t0) / 1000), tries > 1 ? " (after a reset)" : "");
+			return;
+		}
+		frb_err(adev, "accel: sdma0: its first frame of the boot is not back after %u ms (try %d of %d, "
+			"%llu ms after boot); resetting the engine", (unsigned)kProbeMs, tries, (int)kProbeTries,
+			(unsigned long long)adev->os->time_ms(adev->os->cookie));
+		frb_sdma_v4_0_log_state(adev, "first frame");
+		if (recoverLocked(FRB_RECOVER_SDMA, 0, "first frame"))
+			return;		/* wedged: said there */
+	}
+	frb_err(adev, "accel: sdma0: no first frame in %d tries; the watchdog takes it from here", (int)kProbeTries);
 }
 
 /*
@@ -295,8 +408,10 @@ IOReturn FirebrandAccel::slotLocked(UInt32 count, UInt32 *slots, struct frb_rect
  */
 void FirebrandAccel::gfxWrapLocked(void)
 {
-	UInt32 g = fClientGfxSeq;
+	UInt32 g;
 
+	holdOffLocked();
+	g = fClientGfxSeq;
 	if ((SInt32)(fCompleted - g) >= 0)
 		return;			/* done, as last seen */
 	completedLocked();
@@ -327,7 +442,7 @@ IOReturn FirebrandAccel::sdmaSubmitLocked(UInt32 slot, struct frb_rect_ib *rib, 
 	ib.gpu_addr = fIbArena.gpu_addr + (UInt64)slot * kIbSlotBytes;
 	ib.size_dw = kIbSlotBytes / 4;
 	ib.length_dw = rib->len_dw;
-	frb_sdma_v3_0_pad_ib(sdma, &ib);
+	frb_sdma_pad_ib(sdma, &ib);
 	bzero(&deps, sizeof(deps));
 	deps.pipeline_sync = 1;
 	deps.no_hdp_flush = 1;		/* frb_ring_commit's MMIO flush comes before the WPTR moves */
@@ -506,34 +621,82 @@ IOReturn FirebrandAccel::movesLocked(struct frb_bo_table *bos, const struct frb_
 				     const struct frb_rect_move *m, UInt32 n)
 {
 	struct frb_rect_surface s, scratch;
-	struct frb_rect_ib ib[2];
-	UInt32 slot[2], k;
+	struct frb_rect_ib ib[kIbSlots], like;
+	UInt32 slot[kIbSlots], k, first, need[3];
+	uint32_t at, row;
 	IOReturn ret;
 	bool through = frb_rect_moves_overlap(m, n);
+	int phase, c;
 
-	gfxWrapLocked();
-	ret = slotLocked(through ? 2 : 1, slot, ib);
-	if (ret != kIOReturnSuccess)
-		return ret;
-	/* from here on the lock stays: the surface, the scratch and both IBs are this move's */
+	/*
+	 * How many IBs: one a phase on SDMA 3 (a sub-window packet a rectangle);
+	 * on SI's DMA, which copies a row a packet, as many as the rows take
+	 * (frb_rect_moves_ibs). The screen and scratch as they are now; all the
+	 * slots are taken at once, so the phases' IBs follow each other on SDMA0
+	 * with nothing between them.
+	 */
 	if (!screenLocked(bos, target, &s))
 		return target ? kIOReturnBadArgument : kIOReturnUnsupported;
-	if (!through) {
-		if (frb_rect_emit_moves(&ib[0], &s, 0, m, n, 0))
-			return kIOReturnBadArgument;
-		fCopies++;
-		return sdmaSubmitLocked(slot[0], &ib[0], 0);
+	if (through) {
+		ret = scratchLocked(&s, &scratch);
+		if (ret != kIOReturnSuccess)
+			return ret;
 	}
-	ret = scratchLocked(&s, &scratch);
+	bzero(&like, sizeof(like));
+	like.cap_dw = kIbSlotBytes / 4 - 8;
+	like.sdma4 = frb_is_soc15(fCore->adev());
+	like.si_dma = frb_is_si(fCore->adev());
+	need[0] = need[1] = need[2] = 0;
+	for (phase = through ? 1 : 0; phase <= (through ? 2 : 0); phase++) {
+		c = frb_rect_moves_ibs(&like, &s, through ? &scratch : 0, m, n, phase);
+		if (c <= 0) {
+			frb_err(fCore->adev(), "accel: %u moves, phase %d: no IBs for them (%d)", (unsigned)n, phase, c);
+			return kIOReturnBadArgument;
+		}
+		need[phase] = (UInt32)c;
+	}
+	if (need[0] + need[1] + need[2] > kIbSlots) {
+		frb_err(fCore->adev(), "accel: %u moves take %u IBs, more than the %u slots", (unsigned)n,
+			(unsigned)(need[0] + need[1] + need[2]), (unsigned)kIbSlots);
+		return kIOReturnBadArgument;
+	}
+	gfxWrapLocked();
+	ret = slotLocked(need[0] + need[1] + need[2], slot, ib);
 	if (ret != kIOReturnSuccess)
 		return ret;
-	for (k = 0; k < 2; k++)
-		if (frb_rect_emit_moves(&ib[k], &s, &scratch, m, n, (int)k + 1))
-			return kIOReturnBadArgument;
-	fScratchMoves++;
-	ret = sdmaSubmitLocked(slot[0], &ib[0], 0);
-	if (ret == kIOReturnSuccess)
-		ret = sdmaSubmitLocked(slot[1], &ib[1], 0);
+	/* from here on the lock stays: the surface, the scratch and the IBs are this move's */
+	if (!screenLocked(bos, target, &s))
+		return target ? kIOReturnBadArgument : kIOReturnUnsupported;
+	if (through) {
+		ret = scratchLocked(&s, &scratch);
+		if (ret != kIOReturnSuccess)
+			return ret;
+	}
+	first = 0;
+	for (phase = through ? 1 : 0; phase <= (through ? 2 : 0); phase++) {
+		at = row = 0;
+		for (k = 0; k < need[phase]; k++) {
+			c = frb_rect_emit_moves_from(&ib[first + k], &s, through ? &scratch : 0, m, n, phase, &at, &row);
+			if (c) {
+				frb_err(fCore->adev(), "accel: %u moves, phase %d, IB %u of %u: %d (at %u row %u, cap %u)",
+					(unsigned)n, phase, (unsigned)k, (unsigned)need[phase], c, at, row,
+					(unsigned)ib[first + k].cap_dw);
+				return kIOReturnBadArgument;
+			}
+		}
+		if (at < n) {
+			frb_err(fCore->adev(), "accel: %u moves, phase %d: %u left after %u IBs", (unsigned)n, phase,
+				(unsigned)(n - at), (unsigned)need[phase]);
+			return kIOReturnBadArgument;	/* the screen changed between the count and here */
+		}
+		first += need[phase];
+	}
+	if (through)
+		fScratchMoves++;
+	else
+		fCopies++;
+	for (k = 0, ret = kIOReturnSuccess; k < first && ret == kIOReturnSuccess; k++)
+		ret = sdmaSubmitLocked(slot[k], &ib[k], 0);
 	return ret;
 }
 

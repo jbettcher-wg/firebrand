@@ -23,3 +23,18 @@ polaris12_rlc.bin
 polaris12_sdma.bin
 polaris12_sdma1.bin
 polaris12_uvd.bin
+# Southern Islands, the R7 450 (Cape Verde): gmc_v6_0 picks si58 for its memory
+# (MC_SEQ_MISC0[31:24] = 0x58), verde otherwise; si_dpm the kicker SMC image for
+# 682b rev 87 (verde_k), verde otherwise.
+verde_mc.bin
+si58_mc.bin
+verde_smc.bin
+verde_k_smc.bin
+# gfx_v6_0: the CP's three engines and the RLC, by amdgpu's names (headered;
+# verde_ce.bin is linux-firmware's link to hainan_ce.bin). uvd_v3_1: the VCPU
+# image (amdgpu_uvd.c FIRMWARE_VERDE). si_dma has no microcode.
+verde_pfp.bin
+verde_me.bin
+verde_ce.bin
+verde_rlc.bin
+verde_uvd.bin

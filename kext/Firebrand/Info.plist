@@ -31,7 +31,7 @@
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 			<key>IOPCIMatch</key>
-			<string>0x699f1002</string>
+			<string>0x699f1002 0x682b1002</string>
 			<key>IOMatchCategory</key>
 			<string>Firebrand</string>
 			<key>QorIQDMACommand</key>
@@ -56,6 +56,22 @@
 			<true/>
 			<key>FirebrandAudio</key>
 			<true/>
+			<key>FirebrandAudioFunction</key>
+			<true/>
+			<key>FirebrandPSPOnly</key>
+			<false/>
+			<key>FirebrandMMIOWptr</key>
+			<false/>
+			<key>FirebrandUVDOneInstance</key>
+			<false/>
+			<key>FirebrandGating</key>
+			<true/>
+			<key>FirebrandGatingExclude</key>
+			<integer>0</integer>
+			<key>FirebrandAccelHoldMs</key>
+			<integer>0</integer>
+			<key>FirebrandForceTMDS</key>
+			<false/>
 			<key>FirebrandUpstreamLinkCap</key>
 			<integer>130</integer>
 		</dict>
@@ -68,7 +84,7 @@
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 			<key>IOPCIMatch</key>
-			<string>0x699f1002</string>
+			<string>0x699f1002 0x682b1002</string>
 			<key>IOMatchCategory</key>
 			<string>IOFramebuffer</string>
 			<key>QorIQDMACommand</key>
@@ -109,6 +125,22 @@
 			<true/>
 			<key>FirebrandAudio</key>
 			<true/>
+			<key>FirebrandAudioFunction</key>
+			<true/>
+			<key>FirebrandPSPOnly</key>
+			<false/>
+			<key>FirebrandMMIOWptr</key>
+			<false/>
+			<key>FirebrandUVDOneInstance</key>
+			<false/>
+			<key>FirebrandGating</key>
+			<true/>
+			<key>FirebrandGatingExclude</key>
+			<integer>0</integer>
+			<key>FirebrandAccelHoldMs</key>
+			<integer>0</integer>
+			<key>FirebrandForceTMDS</key>
+			<false/>
 			<key>FirebrandUpstreamLinkCap</key>
 			<integer>130</integer>
 			<key>GAPlugin</key>

@@ -121,9 +121,28 @@ bool FirebrandFramebuffer::buildModes(void)
 
 	fModeCount = 0;
 	fSurfaceBytes = 0;
-	if (conn->edid_len < 128)
-		return false;
-	n = frb_edid_modes(conn->edid, conn->edid_len, fModes, kMaxModes, &pref);
+	if (conn->edid_len < 128) {
+		/*
+		 * A sink with no EDID (FirebrandForceTMDS): DRM's
+		 * drm_add_modes_noedid, the DMT modes the link takes, with
+		 * drm_set_preferred_mode(1024, 768).
+		 */
+		static const UInt16 sizes[][2] = { { 1024, 768 }, { 640, 480 }, { 800, 600 }, { 1280, 1024 },
+						   { 1600, 1200 }, { 1920, 1080 } };
+		UInt32 k;
+
+		for (k = 0, n = 0; k < sizeof(sizes) / sizeof(sizes[0]) && n < (int)kMaxModes; k++)
+			for (i = 0; i < (int)frb_dmt_mode_count; i++)
+				if (frb_dmt_modes[i].hdisplay == sizes[k][0] && frb_dmt_modes[i].vdisplay == sizes[k][1] &&
+				    frb_mode_hz(&frb_dmt_modes[i]) == 60) {
+					fModes[n++] = frb_dmt_modes[i];
+					break;
+				}
+		pref = 0;
+		IOLog("FirebrandFramebuffer: the sink has no EDID: DMT modes, 1024x768 preferred\n");
+	} else {
+		n = frb_edid_modes(conn->edid, conn->edid_len, fModes, kMaxModes, &pref);
+	}
 	if (n <= 0)
 		return false;
 	fModeCount = n;
@@ -331,7 +350,7 @@ bool FirebrandFramebuffer::start(IOService *provider)
 	{
 		UInt32 i;
 
-		/* hw_init's ramp, i << 8 (frb_dce_v11_0_load_lut), and a grey colour table */
+		/* hw_init's ramp, i << 8 (the DCE's load_lut), and a grey colour table */
 		for (i = 0; i < 256; i++)
 			fGamma[0][i] = fGamma[1][i] = fGamma[2][i] = fClut[0][i] = fClut[1][i] = fClut[2][i] =
 				(UInt16)(i << 8);
@@ -379,6 +398,25 @@ bool FirebrandFramebuffer::start(IOService *provider)
 		fCore.stop();
 		fCoreStarted = false;
 		return false;
+	}
+	/*
+	 * The card's name on the framebuffer, as RadeonNI's setName(model)
+	 * after IOFramebuffer::start: the PCI device's "model", which
+	 * FirebrandCore::publishMemory takes from the family-table row (every
+	 * family), becomes this entry's name and its "model". A tool that lists
+	 * the framebuffers (the boards' fastfetch prints the entry's name)
+	 * then shows the card, not the driver's class; the class is still
+	 * FirebrandFramebuffer for everything that matches on it. No row, no
+	 * "model": the name stays the class's.
+	 */
+	{
+		OSData *model = OSDynamicCast(OSData, dev->getProperty("model"));
+		const char *name = model ? (const char *)model->getBytesNoCopy() : 0;
+
+		if (name && model->getLength() > 1 && !name[model->getLength() - 1]) {
+			setProperty("model", model);
+			setName(name);
+		}
 	}
 	m = modeForID(fPreferred);
 	IOLog("FirebrandFramebuffer: started on connector %d%s: %lu modes, startup %ux%u@%u, "
@@ -510,7 +548,7 @@ bool FirebrandFramebuffer::serializeProperties(OSSerialize *s) const
 IOReturn FirebrandFramebuffer::newUserClient(task_t task, void *security, UInt32 type,
 					     IOUserClient **handler)
 {
-	if (type == FRB_UC_TYPE)
+	if (type == FRB_UC_TYPE || type == FRB_UC_TYPE_STATUS)
 		return FirebrandNewControlClient(this, task, security, type, handler);
 	if (fCore.detaching()) {
 		IOLog("FirebrandFramebuffer: detached: refusing IOGraphics client type %lu\n", (unsigned long)type);
@@ -923,13 +961,14 @@ IOReturn FirebrandFramebuffer::getAttribute(IOSelect attribute, UInt32 *value)
  * A new cursor picture: IOGraphics converts it to 32-bit ARGB with the
  * colours premultiplied (its software cursor blends it that way), which is
  * the plane's CURSOR_MODE 2. Refused (the software cursor takes over):
- * bigger than FRB_CURSOR_MAX, or no conversion.
+ * bigger than the DCE's plane (frb_display_cursor_max), or no conversion.
  */
 IOReturn FirebrandFramebuffer::setCursorImage(void *cursorImage)
 {
 	IOHardwareCursorDescriptor desc;
 	IOHardwareCursorInfo info;
 	struct frb_display *d;
+	UInt32 m = frb_display_cursor_max(fCore.adev());
 	int r = -ENODEV;
 
 	if (!fHWCursor)
@@ -937,15 +976,15 @@ IOReturn FirebrandFramebuffer::setCursorImage(void *cursorImage)
 	bzero(&desc, sizeof(desc));
 	desc.majorVersion = kHardwareCursorDescriptorMajorVersion;
 	desc.minorVersion = kHardwareCursorDescriptorMinorVersion;
-	desc.height = FRB_CURSOR_MAX;
-	desc.width = FRB_CURSOR_MAX;
+	/* the DCE's plane: 64 x 64 on DCE 6, 128 x 128 on DCE 8-11 */
+	desc.height = m;
+	desc.width = m;
 	desc.bitDepth = 32;
 	bzero(&info, sizeof(info));
 	info.majorVersion = kHardwareCursorInfoMajorVersion;
 	info.minorVersion = kHardwareCursorInfoMinorVersion;
 	info.hardwareCursorData = (UInt8 *)fCursorData;
-	if (convertCursorImage(cursorImage, &desc, &info) && info.cursorWidth <= FRB_CURSOR_MAX &&
-	    info.cursorHeight <= FRB_CURSOR_MAX) {
+	if (convertCursorImage(cursorImage, &desc, &info) && info.cursorWidth <= m && info.cursorHeight <= m) {
 		fCore.lock();
 		r = fCore.loadCursorLocked(fCursorOffset, fCursorData, info.cursorWidth, info.cursorHeight);
 		fCore.unlock();
@@ -1127,10 +1166,14 @@ int FirebrandFramebuffer::senseLocked(void)
 
 	if (!d)
 		return 0;
-	if (fConnected && fConn >= 0)
-		return frb_dce_v11_0_hpd_sense(fCore.adev(), d->conn[fConn].hpd) ? 1 : 0;
+	if (fConnected && fConn >= 0) {
+		/* the test aid's sink is there whatever the line says (FirebrandForceTMDS) */
+		if (fCore.adev()->force_tmds && frb_connector_is_tmds(&d->conn[fConn]) && !d->conn[fConn].edid_len)
+			return 1;
+		return frb_display_hpd_sense(fCore.adev(), &d->conn[fConn]) ? 1 : 0;
+	}
 	for (i = 0; i < d->num_connectors; i++)
-		if (frb_dce_v11_0_hpd_sense(fCore.adev(), d->conn[i].hpd))
+		if (frb_display_hpd_sense(fCore.adev(), &d->conn[i]))
 			return 1;
 	return 0;
 }

@@ -1,0 +1,27 @@
+osx-gpu: glQueryCounter flushes immediate-mode vertices first
+
+glBeginQuery and glEndQuery flush what glBegin/glEnd has buffered before
+they act (FLUSH_VERTICES); glQueryCounter did not, so a GL_TIMESTAMP query
+was stamped before the draws issued ahead of it, and two glQueryCounter
+calls around immediate-mode drawing bracketed nothing. Found with
+tools/guest/begl33test (bridge, "D1 timer query GL_TIMESTAMP": a stamp, 100
+quads, a stamp) on Vega 20, 2026-11-15: its command processor runs the two
+bottom-of-pipe events inside one step of the GPU's counter (160 ns), so the
+stamps came out equal in about half the runs; slower cards had always
+separated them by the events' own cost and passed.
+
+diff --git a/src/mesa/main/queryobj.c b/src/mesa/main/queryobj.c
+--- a/src/mesa/main/queryobj.c
++++ b/src/mesa/main/queryobj.c
+@@ -945,6 +945,11 @@
+    q->Ready = GL_FALSE;
+    q->EverBound = GL_TRUE;
+ 
++   /* osx-gpu: the timestamp is taken where the command stands in the stream:
++    * after what was drawn before it, immediate-mode vertices included.
++    */
++   FLUSH_VERTICES(ctx, 0, 0);
++
+    /* QueryCounter is implemented using EndQuery without BeginQuery
+     * in drivers. This is actually Direct3D and Gallium convention.
+     */

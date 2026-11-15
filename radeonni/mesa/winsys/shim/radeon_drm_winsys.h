@@ -17,6 +17,7 @@
 #include "rdn_device.h"
 
 struct radeon_surface_manager;
+struct ac_addrlib;
 
 enum radeon_generation {
    DRV_R300,
@@ -30,6 +31,8 @@ struct radeon_drm_winsys {
 
    /* What radeon_drm_surface.c uses. */
    struct radeon_surface_manager *surf_man;
+   /* GFX9: addrlib instead (rdn_winsys.c, rdn_gfx9_surface_init); surf_man is NULL then. */
+   struct ac_addrlib *addrlib;
    struct radeon_info info;
    enum radeon_generation gen;
 

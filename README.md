@@ -3,9 +3,11 @@
 # Firebrand
 
 Firebrand is a graphics driver for AMD Radeon cards on Mac OS X 10.5 Leopard on PowerPC.
-It brings Polaris-generation cards (GCN 4) to Leopard: the desktop at up to 3840x2160 at
-60 Hz over DisplayPort, Quartz Extreme and Core Image on the GPU, OpenGL 3.3 through Mesa's
-radeonsi driver, hardware H.264 decoding, DisplayPort audio and power management.
+It brings three generations of GCN cards to Leopard: Polaris (GCN 4), Vega 20 (GCN 5) and
+Southern Islands (GCN 1); [Status](#status) says what works on each. On Polaris: the desktop
+at up to 3840x2160 at 60 Hz over DisplayPort, Quartz Extreme and Core Image on the GPU,
+OpenGL 3.3 through Mesa's radeonsi driver, hardware H.264 decoding, DisplayPort audio and
+power management.
 
 The kernel driver is written after Linux's **amdgpu**: one file per hardware block
 (`gmc_v8_0`, `gfx_v8_0`, `sdma_v3_0`, `uvd_v6_0`, `dce_v11_0`, the SMU7 powerplay code), with
@@ -22,12 +24,27 @@ Firebrand's accelerator speaks, with Mesa's radeonsi made to run on a big-endian
 > [roadmap](#roadmap). There is no installer package or binary release yet; see
 > [Building](#building).
 
+## Status
+
+What has been verified on hardware, by card family:
+
+| Family | Verified card | Works | Known issues, not yet |
+|---|---|---|---|
+| **Polaris** (GCN 4) | RX 550, E9173 | Everything under [Features](#features): the display over DisplayPort, 2D, Quartz Extreme, Core Image, OpenGL 3.3, H.264 decoding (UVD 6.3), power management, DisplayPort audio, recovery | HDMI and DVI not tried on a monitor yet. The current OpenGL bundle (its Core Image and index-buffer fixes) has not been re-run on Polaris yet. |
+| **Vega 20** (GCN 5) | Instinct MI50 | The display over DisplayPort, Quartz Extreme, Core Image, OpenGL 3.3, DisplayPort audio, H.264 decoding (UVD 7), power management and clock gating | The DMA engine occasionally stalls on its first frame after boot; the driver detects that and recovers it automatically. (Fixed in this version: draws that followed a pixel readback could go missing, which made Doom 3 flash geometry.) |
+| **Southern Islands** (GCN 1) | Radeon R7 450 | The display over DisplayPort, 2D, Quartz Extreme, Core Image, OpenGL 3.3 | Power management is off: the card runs at its boot clocks. Video decoding (UVD 3.1) and DisplayPort audio are ported but not yet tested. Acceleration was verified with `FirebrandBringUp` on: the card's row in `amdgpu/frb_drv.c` still stops at the display stage, so a default install drives the display only. |
+
+Other cards in these families do not load yet: the driver matches only the device IDs below.
+The plan is for them to load display-only (stage `dce`) until each one is verified.
+
 ## Supported cards
 
 | Card | GPU | PCI IDs | Status |
 |---|---|---|---|
 | AMD Radeon RX 550 (4 GB, DP + HDMI + DVI) | Polaris 12 | `1002:699f` rev `c7`, subsystem `1002:0b04` | verified |
 | AMD Embedded Radeon E9173 (2 GB, 3x DP) | Polaris 12 | `1002:699f` rev `81`, subsystem `1002:ea73` | verified |
+| AMD Instinct MI50 (16 GB HBM2, mini-DP, Radeon Pro VII firmware) | Vega 20 | `1002:66a1` rev `06`, subsystem `1002:081e` | verified |
+| AMD Radeon R7 450 (Dell, 4 GB, DP + DP + DVI) | Cape Verde (Southern Islands) | `1002:682b` rev `87`, subsystem `1028:1004` | verified (see [Status](#status)) |
 | AMD Radeon RX 570 | Polaris 10 | `1002:67df` | expected next; not enabled yet |
 
 Firebrand only drives cards it has been verified on. Each one has a row in
@@ -38,6 +55,8 @@ Firebrand installed, the kernel log shows such a card's IDs (`dmesg | grep Fireb
 Please open an issue with them.
 
 ## Features
+
+On Polaris; [Status](#status) has the other families.
 
 - **Display:** DisplayPort from 1.62 to 5.4 Gbit/s per lane (RBR to HBR2), up to 3840x2160 at
   60 Hz, with modes from the monitor's EDID. A monitor can be plugged into any port at any
@@ -122,6 +141,30 @@ Graphics/Displays ("Quartz Extreme: Supported", "Core Image: Hardware Accelerate
   `mount -uw /`, `rm -rf /System/Library/Extensions/Firebrand.kext`,
   `touch /System/Library/Extensions`, `reboot`.
 
+## Firebrand Monitor
+
+`Firebrand Monitor.app`, in the same `build/dist/Firebrand` folder (copy it to Applications),
+shows what the card is doing:
+
+- **In the menu bar:** the card's temperature, GPU clock and GPU load, such as
+  "48° 1.7 GHz 85%". Its menu lists each card's clocks, loads, temperatures and power.
+- **In its window:** a minute of history for the GPU clock and load, the memory clock,
+  the temperature and the power, one page per card, and under the graphs the driver's state:
+  the bring-up stage, power management, the displays and their DisplayPort links, the video
+  decoder, the PCIe link and video memory in use.
+- **Copy Report** puts all of it on the clipboard, ready to paste into a GitHub issue. Please
+  add it to any problem you report. `frbctl report --md` prints the same in Terminal.
+
+It needs no administrator password: it only reads, through a read-only connection to the
+driver that any user may open. Every control stays in `frbctl`. To start it at login, add it
+under System Preferences > Accounts > Login Items: started that way it shows no window, only
+its menu-bar item and Dock icon; click the Dock icon, or choose "Open Firebrand Monitor…" from
+its menu, for the window.
+
+The readings depend on the card: all of them on Vega 20 and Polaris. On the R7 450, with power
+management off, there are no clock, load or power readings, only the temperature and the
+driver's state; that card has not been run with the monitor yet.
+
 ## Uninstalling
 
 ```sh
@@ -139,7 +182,7 @@ The pieces are built in three places:
 |---|---|---|
 | AMD microcode (`firmware/`) | a Linux or macOS machine | `curl`, `sha256sum` or `shasum`, `zstd` or `xz` |
 | `RadeonNIGLDriver.bundle` (Mesa) | a Linux or macOS machine | a `powerpc-apple-darwin9` GCC 15.3 cross toolchain and the Mac OS X 10.5 SDK |
-| `Firebrand.kext`, `HDAudio.kext`, `RadeonNIGA.plugin`, `frbctl` | the Mac: Mac OS X 10.5.8 | Xcode 3.1 (Apple gcc 4.0.1, the 10.5 SDK) |
+| `Firebrand.kext`, `HDAudio.kext`, `RadeonNIGA.plugin`, `frbctl`, `Firebrand Monitor.app` | the Mac: Mac OS X 10.5.8 | Xcode 3.1 (Apple gcc 4.0.1, the 10.5 SDK) |
 
 The kexts need Apple's gcc 4.0.1: the kernel's C++ ABI is that compiler's. Mesa needs a
 current GCC. The microcode download needs a current TLS stack, which 10.5 lacks.
@@ -163,6 +206,8 @@ FROSTBYTE=~/frostbyte ./build.sh gl fat       # the OpenGL bundle, 32- and 64-bi
 `./build.sh mac` copies the tree (with `firmware/` and the OpenGL bundle) to the Mac, runs
 `scripts/build-mac.sh` there and brings back `build/dist/Firebrand`. On the Mac itself,
 `./build.sh native` does the same once `firmware/` and `build/gl/` are there.
+The kext includes the Instinct MI50 and its microcode by default (`FRB_BRINGUP=vega20`);
+`FRB_BRINGUP=` builds it for the Polaris and Southern Islands cards alone.
 
 Leopard's sshd (OpenSSH 4.5) only speaks algorithms a current OpenSSH client has turned off,
 so enable them for the Mac in `~/.ssh/config`:
@@ -202,7 +247,7 @@ be stopped at:
 | 7 uvd | the video decoder |
 
 `install.sh` sets the installed driver to stage 7 with everything on. A card's row in
-`amdgpu/frb_drv.c` caps the stage, and a Polaris card without a row only gets the survey.
+`amdgpu/frb_drv.c` caps the stage, and a card without a row only gets the survey.
 
 **Settings.** The installed driver reads its settings from its personalities in
 `Firebrand.kext/Contents/Info.plist` (restart after editing):
@@ -226,7 +271,8 @@ OpenGL, video or power management), `frb_hwcursor=0`, `frb_video=0`, `frb_hotplu
 `detect`, `modes N`, `dpm [status|auto|high|low]`, `audio [status]`, `crc N` (the monitor's
 checksum of what it receives), `test gfx|sdma0|sdma1|uvd ...` (engine tests), `recover`, and
 register-level commands for bring-up work. The comment at the top of `tools/frbctl.c` lists
-them all.
+them all. `frbctl report` needs no administrator: it prints what
+[Firebrand Monitor](#firebrand-monitor)'s Copy Report copies.
 
 **Byte order.** The GPU is little-endian and the PowerPC is big-endian. Firebrand writes
 every structure the GPU reads (rings, page tables, command buffers, the SMU's tables, the UVD
@@ -242,7 +288,7 @@ which do not cover all of them. The Mesa patches do the same for radeonsi.
 | `kext/Firebrand/` | the IOKit side: the card's owner, the framebuffer, the accelerator and its user clients, the surfaces, video; `Info.plist`, `Makefile` |
 | `kexts/HDAudio/` | the HD Audio driver for the card's DisplayPort audio |
 | `radeonni/` | the userland: the OpenGL bundle and the Mesa patches, the 2D plug-in, the video library ([radeonni/README.md](radeonni/README.md)) |
-| `tools/` | `frbctl`; `mk-splash-logo.py`, which makes the boot logo header from `art/C-chip.svg` |
+| `tools/` | `frbctl`; `frb_status.c`, the status reading `frbctl report` and Firebrand Monitor share; `FirebrandMonitor/`, the app; `mk-splash-logo.py`, which makes the boot logo header from `art/C-chip.svg` |
 | `scripts/` | `fetch-firmware.sh`, `build-mac.sh`, `build-remote.sh`, `install.sh`, `uninstall.sh` |
 | `art/` | the logo |
 
@@ -258,11 +304,14 @@ font installed.
 - **Power Mac G5:** the DMA side is done (addresses through IOKit, so the DART translates them);
   next is a test run on G5 hardware, then an Open Firmware boot path so the card shows the boot
   screen from power-on.
-- **Vega 20** (Radeon VII, Radeon Pro VII): the next GPU. It brings the PSP,
-  GMC 9, GFX 9, SMU 11 and DCE 12 blocks.
-- **Southern and Sea Islands** (for example the R7 450 and the FirePro W8100): fold RadeonNI's
-  support for these GCN 1 and 2 cards into Firebrand as amdgpu's SI and CIK blocks, so one
-  driver covers GCN 1 to 5.
+- **Vega 20:** running on the Instinct MI50 with the PSP, GMC 9, GFX 9, SDMA 4, SMU 11,
+  UVD 7 and DCE 12 blocks (see [Status](#status)). Next: other Vega 20 cards (Radeon VII,
+  Radeon Pro VII).
+- **Southern and Sea Islands:** the R7 450 runs as amdgpu's SI blocks (see [Status](#status));
+  next, its power management, video decoding and DisplayPort audio, then Sea Islands (CIK, for
+  example the FirePro W8100) from RadeonNI, so one driver covers GCN 1 to 5.
+- **Cards without their own row:** load display-only until verified, with a command to turn
+  the rest on and a report to send back.
 - **More Polaris cards:** the RX 570 (Polaris 10) and other makers' boards.
 - **Vulkan:** Mesa's RADV on a new Firebrand kernel interface (per-program GPU address spaces,
   command submission with buffer lists, sync objects), with a Vulkan loader and window-system

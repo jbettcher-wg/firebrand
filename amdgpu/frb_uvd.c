@@ -1,18 +1,22 @@
 /*
- * amdgpu_uvd.c (Linux 7.0.2), the parts the decode ring of Polaris 12
- * needs: sw_init (the firmware file, its version, the handle count, the
- * VCPU bo), resume (the firmware copied into the VCPU bo), the kernel's
- * create/destroy messages and their IB (send_msg), the IB test amdgpu runs
- * from late_init, begin_use and the idle work without powerplay.
+ * amdgpu_uvd.c (Linux 7.0.2; the Vega 20 arms from 7.1.1, the kernel of
+ * that card's capture), the parts the decode rings of Polaris 12 (UVD 6.3)
+ * and Vega 20 (UVD 7.2, two instances) need: sw_init (the firmware file,
+ * its version, the handle count, each instance's VCPU bo), resume (the
+ * firmware copied into the VCPU bo; on Vega 20 the PSP has loaded it into
+ * its TMR and the bo is only zeroed), the kernel's create/destroy messages
+ * and their IB (send_msg), the IB test amdgpu runs from late_init,
+ * begin_use and the idle work with and without powerplay.
  *
  * DEVIATIONS from amdgpu, each with its consequence:
- * - PLACEMENT. The VCPU bo and the msg bo (amdgpu: ib_bo, GTT) live in a
+ * - PLACEMENT. The VCPU bos and the msg bo (amdgpu: ib_bo, GTT) live in a
  *   VRAM region of their own at the top of the CPU window (frb_gmc_v8_0.c
- *   frb_gmc_layout, layout.uvd); amdgpu allocates the VCPU bo top-down in
- *   VRAM (0xF4_7F80_0000 on the E9173). UVD 6 addresses 64 bits
- *   (address_64_bit), so neither needs the 256 MB segment older UVD did.
- *   The IB test's IB comes out of frb_ring.c's VRAM IB pool (amdgpu: the
- *   direct pool, GTT).
+ *   frb_gmc_layout / frb_gmc_v9_0.c frb_gmc_v9_0_layout, layout.uvd);
+ *   amdgpu allocates the VCPU bo top-down in VRAM (0xF4_7F80_0000 on the
+ *   E9173; 0x83_FE80_0000 and 0x83_FE40_0000 on the MI50). UVD 6 and 7
+ *   address 64 bits (address_64_bit), so neither needs the 256 MB segment
+ *   older UVD did. The IB test's IB comes out of frb_ring.c's VRAM IB pool
+ *   (amdgpu: the direct pool, GTT).
  * - FENCES are the ring's writeback slot (frb_ring_init), polled; amdgpu
  *   puts UVD's fence word behind the firmware in the VCPU bo
  *   (amdgpu_fence_driver_start_ring). Either is an address the VCPU
@@ -30,6 +34,12 @@
  *   (frb_smu7_clockpowergating.c, replay-uvd-dpm); without it, the fixed
  *   arm, whose CG_VCLK/DCLK_CNTL writes are where the capture has SMC
  *   messages (replay-uvd, docs/stage-verification.md, uvd).
+ *   Vega 20: with FirebrandDPM, vega20_power_gate_uvd (the SMU's DPM_UVD
+ *   feature on at begin_use, off in the idle work: frb_vega20_hwmgr.c);
+ *   without it nothing at all, as amdgpu's arm there is three no-ops
+ *   (soc15_set_uvd_clocks is commented out, uvd_v7_0 has no power gating
+ *   and its clock gating state function is empty). Either way the VCPUs
+ *   stay up between uses: only Polaris stops its VCPU in the idle work.
  * - MEMORY. The VCPU bo is written through BAR0 with little-endian words
  *   (memcpy_toio of the file's bytes); the messages are little-endian
  *   words (cpu_to_le32), whatever the ring's own byte order.
@@ -59,31 +69,114 @@
  */
 #include "frb_uvd.h"
 #include "frb_pm.h"
+#include "frb_psp.h"
+#include "frb_smu11.h"
+#include "frb_soc15.h"
 
 /* Polaris10/11 firmware version */
 #define FW_1_66_16	((1 << 24) | (66 << 16) | (16 << 8))
 
 #define FIRMWARE_POLARIS12	"polaris12_uvd.bin"
+#define FIRMWARE_VEGA20		"vega20_uvd.bin"
+
+static inline uint32_t swab32(uint32_t v)
+{
+	return (v << 24) | ((v & 0xff00) << 8) | ((v >> 8) & 0xff00) | (v >> 24);
+}
+
+/* --- what both UVD versions share with the sessions -------------------------- */
+
+struct frb_ring *frb_uvd_ring(struct frb_device *adev)
+{
+	struct frb_uvd *uvd = adev->uvd;
+	uint32_t i;
+
+	if (!uvd)
+		return NULL;
+	for (i = 0; i < uvd->num_uvd_inst; i++) {
+		if (uvd->harvest_config & (1 << i))
+			continue;
+		return uvd->inst[i].ring.funcs && uvd->inst[i].ring.ready ? &uvd->inst[i].ring : NULL;
+	}
+	return NULL;
+}
+
+uint32_t frb_uvd_reg_base(struct frb_device *adev, int me)
+{
+	if (adev->asic_type >= CHIP_VEGA10)
+		return adev->reg_offset[UVD_HWIP][me][1];
+	return UVD_BASE_SI;
+}
 
 /*
- * amdgpu_uvd_sw_init: the firmware, its version and handle count, the
- * VCPU bo (VRAM, the region frb_gmc_layout keeps) and the msg bo.
+ * amdgpu_ring_write for a UVD ring. Default: little-endian dwords, LMI swap
+ * 0. Swapped (amdgpu's __BIG_ENDIAN arm): the CPU's order on a big-endian
+ * host, which LMI swap 0xa turns round on the fetch; the dword is stored
+ * byte-swapped relative to little-endian so the result is the same on any
+ * host the library is built for.
+ */
+void frb_uvd_ring_write(struct frb_ring *ring, uint32_t v)
+{
+	frb_ring_write(ring, ring->adev->uvd->swapped ? swab32(v) : v);
+}
+
+void frb_uvd_ib_write(struct frb_device *adev, struct frb_ib *ib, uint32_t v)
+{
+	frb_ib_write(adev, ib, adev->uvd->swapped ? swab32(v) : v);
+}
+
+void frb_uvd_ib_pad(struct frb_device *adev, struct frb_ib *ib)
+{
+	uint32_t nop = FRB_UVD_PACKET0(frb_uvd_reg_base(adev, frb_uvd_ring(adev) ? frb_uvd_ring(adev)->me : 0) +
+				       UVD_NO_OP);
+
+	if (ib->length_dw & 1)
+		frb_uvd_ib_write(adev, ib, 0);
+	while (ib->length_dw & 0xf) {
+		frb_uvd_ib_write(adev, ib, nop);
+		frb_uvd_ib_write(adev, ib, 0);
+	}
+}
+#define FIRMWARE_TAHITI		"tahiti_uvd.bin"
+#define FIRMWARE_VERDE		"verde_uvd.bin"
+#define FIRMWARE_PITCAIRN	"pitcairn_uvd.bin"
+
+/*
+ * amdgpu_uvd_sw_init: the firmware, its version and handle count, each
+ * instance's VCPU bo (VRAM, the region the GMC's layout keeps) and the msg
+ * bo. The caller's early_init has set num_uvd_inst and harvest_config.
  */
 int frb_uvd_sw_init(struct frb_device *adev)
 {
 	struct frb_uvd *uvd = adev->uvd;
-	uint32_t bo_size, family_id, version_major, version_minor;
+	uint32_t bo_size, family_id, version_major, version_minor, j, next, need;
 	const char *fw_name;
 	int r;
 
 	switch (adev->asic_type) {
+	case CHIP_TAHITI:
+		fw_name = FIRMWARE_TAHITI;
+		break;
+	case CHIP_VERDE:
+		fw_name = FIRMWARE_VERDE;
+		break;
+	case CHIP_PITCAIRN:
+		fw_name = FIRMWARE_PITCAIRN;
+		break;
 	case CHIP_POLARIS12:
 		fw_name = FIRMWARE_POLARIS12;
 		break;
+	case CHIP_VEGA20:
+		fw_name = FIRMWARE_VEGA20;
+		break;
 	default:
-		frb_err(adev, "amdgpu_uvd: only Polaris 12 is wired up");
+		frb_err(adev, "amdgpu_uvd: only Polaris 12, Vega 20 and SI are wired up");
 		return -EINVAL;
 	}
+	if (!uvd->num_uvd_inst)
+		uvd->num_uvd_inst = 1;
+	/* adev->firmware.load_type: the PSP loads on SOC15 (stage smu did), the driver on VI */
+	uvd->psp_load = frb_is_soc15(adev);
 
 	uvd->fw.data = 0;
 	uvd->fw.size = 0;
@@ -99,46 +192,77 @@ int frb_uvd_sw_init(struct frb_device *adev)
 	uvd->max_handles = AMDGPU_DEFAULT_UVD_HANDLES;
 
 	family_id = uvd->ucode.ucode_version & 0xff;
-	version_major = (uvd->ucode.ucode_version >> 24) & 0xff;
-	version_minor = (uvd->ucode.ucode_version >> 8) & 0xff;
-	frb_info(adev, "Found UVD firmware Version: %u.%u Family ID: %u",
-		 version_major, version_minor, family_id);
+	version_major = version_minor = 0;
 
-	/*
-	 * Limit the number of UVD handles depending on microcode major
-	 * and minor versions. The firmware version which has 40 UVD
-	 * instances support is 1.80. So all subsequent versions should
-	 * also have the same support.
-	 */
-	if ((version_major > 0x01) ||
-	    ((version_major == 0x01) && (version_minor >= 0x50)))
+	if (adev->asic_type < CHIP_VEGA20) {
+		version_major = (uvd->ucode.ucode_version >> 24) & 0xff;
+		version_minor = (uvd->ucode.ucode_version >> 8) & 0xff;
+		frb_info(adev, "Found UVD firmware Version: %u.%u Family ID: %u",
+			 version_major, version_minor, family_id);
+
+		/*
+		 * Limit the number of UVD handles depending on microcode major
+		 * and minor versions. The firmware version which has 40 UVD
+		 * instances support is 1.80. So all subsequent versions should
+		 * also have the same support.
+		 */
+		if ((version_major > 0x01) ||
+		    ((version_major == 0x01) && (version_minor >= 0x50)))
+			uvd->max_handles = AMDGPU_MAX_UVD_HANDLES;
+
+		uvd->fw_version = ((version_major << 24) | (version_minor << 16) |
+				   (family_id << 8));
+	} else {
+		unsigned int enc_major, enc_minor, dec_minor;
+
+		dec_minor = (uvd->ucode.ucode_version >> 8) & 0xff;
+		enc_minor = (uvd->ucode.ucode_version >> 24) & 0x3f;
+		enc_major = (uvd->ucode.ucode_version >> 30) & 0x3;
+		frb_info(adev, "Found UVD firmware ENC: %u.%u DEC: .%u Family ID: %u",
+			 enc_major, enc_minor, dec_minor, family_id);
+
 		uvd->max_handles = AMDGPU_MAX_UVD_HANDLES;
 
-	uvd->fw_version = ((version_major << 24) | (version_minor << 16) |
-			   (family_id << 8));
+		uvd->fw_version = uvd->ucode.ucode_version;
+	}
 
 	bo_size = AMDGPU_UVD_STACK_SIZE + AMDGPU_UVD_HEAP_SIZE
 		  + AMDGPU_UVD_SESSION_SIZE * uvd->max_handles;
-	/* no PSP on VI: the driver loads the firmware */
-	bo_size += AMDGPU_GPU_PAGE_ALIGN(uvd->ucode.ucode_size_bytes + 8);
+	/* the PSP's TMR holds the image on SOC15; on VI the driver loads it into the bo */
+	if (!uvd->psp_load)
+		bo_size += AMDGPU_GPU_PAGE_ALIGN(uvd->ucode.ucode_size_bytes + 8);
 
-	/* amdgpu_bo_create_kernel(VRAM | GTT): the layout's UVD region */
+	/* amdgpu_bo_create_kernel(VRAM | GTT) per instance: the layout's UVD region, then the msg bo */
+	need = 0;
+	for (j = 0; j < uvd->num_uvd_inst; j++)
+		if (!(uvd->harvest_config & (1 << j)))
+			need += AMDGPU_GPU_PAGE_ALIGN(bo_size);
 	if (!adev->layout.uvd_size ||
-	    bo_size + FRB_UVD_IB_BO_SIZE > adev->layout.uvd_size ||
-	    !frb_vram_ok(adev, adev->layout.uvd, bo_size + FRB_UVD_IB_BO_SIZE)) {
+	    need + FRB_UVD_IB_BO_SIZE > adev->layout.uvd_size ||
+	    !frb_vram_ok(adev, adev->layout.uvd, need + FRB_UVD_IB_BO_SIZE)) {
 		frb_err(adev, "(%d) failed to allocate UVD bo (%u bytes, region %u at 0x%08x)", -ENOMEM,
-			bo_size, adev->layout.uvd_size, adev->layout.uvd);
+			need + FRB_UVD_IB_BO_SIZE, adev->layout.uvd_size, adev->layout.uvd);
 		return -ENOMEM;
 	}
-	uvd->vcpu_bo = adev->layout.uvd;
 	uvd->vcpu_bo_size = bo_size;
-	uvd->gpu_addr = frb_vram_gpu_addr(adev, uvd->vcpu_bo);
+	next = adev->layout.uvd;
+	for (j = 0; j < uvd->num_uvd_inst; j++) {
+		if (uvd->harvest_config & (1 << j))
+			continue;
+		uvd->inst[j].vcpu_bo = next;
+		uvd->inst[j].gpu_addr = frb_vram_gpu_addr(adev, next);
+		next += AMDGPU_GPU_PAGE_ALIGN(bo_size);
+	}
 
-	/* from uvd v5.0 HW addressing capacity increased to 64 bits */
-	uvd->address_64_bit = 1;
+	/* from uvd v5.0 HW addressing capacity increased to 64 bits (SI's 3.1: 32 + segments) */
+	uvd->address_64_bit = !frb_is_si(adev);
 
-	/* amdgpu_uvd_create_msg_bo_helper(128 KB): address_64_bit, so no segment rule */
-	uvd->ib_bo = uvd->vcpu_bo + AMDGPU_GPU_PAGE_ALIGN(bo_size);
+	/*
+	 * amdgpu_uvd_create_msg_bo_helper(128 KB): without address_64_bit (SI)
+	 * the msg bo goes into the UVD segment (amdgpu_uvd_force_into_uvd_segment:
+	 * VRAM's first 256 MB); right after the VCPU bo(s) it is there either way
+	 */
+	uvd->ib_bo = next;
 	uvd->ib_bo_gpu_addr = frb_vram_gpu_addr(adev, uvd->ib_bo);
 
 	/* default: CHIP_POLARIS10 and later */
@@ -149,9 +273,14 @@ int frb_uvd_sw_init(struct frb_device *adev)
 		frb_err(adev, "POLARIS10/11 UVD firmware version %u.%u is too old.",
 			version_major, version_minor);
 
-	frb_info(adev, "uvd: VCPU bo %u bytes at %llx (BAR0 0x%08x), msg bo at %llx; %u handles",
-		 bo_size, (unsigned long long)uvd->gpu_addr, uvd->vcpu_bo,
-		 (unsigned long long)uvd->ib_bo_gpu_addr, uvd->max_handles);
+	for (j = 0; j < uvd->num_uvd_inst; j++) {
+		if (uvd->harvest_config & (1 << j))
+			continue;
+		frb_info(adev, "uvd: instance %u: VCPU bo %u bytes at %llx (BAR0 0x%08x)", j, bo_size,
+			 (unsigned long long)uvd->inst[j].gpu_addr, uvd->inst[j].vcpu_bo);
+	}
+	frb_info(adev, "uvd: msg bo at %llx; %u handles; firmware %s", (unsigned long long)uvd->ib_bo_gpu_addr,
+		 uvd->max_handles, uvd->psp_load ? "in the PSP's TMR" : "loaded by the driver");
 	return 0;
 }
 
@@ -164,28 +293,40 @@ int frb_uvd_sw_init(struct frb_device *adev)
 int frb_uvd_resume(struct frb_device *adev)
 {
 	struct frb_uvd *uvd = adev->uvd;
-	uint32_t size = uvd->vcpu_bo_size, ptr = uvd->vcpu_bo, offset, i;
+	uint32_t size = 0, ptr, offset, i, j, copied = 0;
 	uint64_t t0 = adev->os->time_ms(adev->os->cookie);
 
-	if (!uvd->vcpu_bo)
-		return -EINVAL;
+	for (j = 0; j < uvd->num_uvd_inst; j++) {
+		if (uvd->harvest_config & (1 << j))
+			continue;
+		if (!uvd->inst[j].vcpu_bo)
+			return -EINVAL;
 
-	offset = uvd->ucode.ucode_array_offset;
-	for (i = 0; i < uvd->ucode.ucode_size_bytes; i += 4)
-		frb_vram_write32(adev, ptr + i, frb_get_le32(uvd->fw.data, offset + i));
-	size -= uvd->ucode.ucode_size_bytes;
-	ptr += uvd->ucode.ucode_size_bytes;
-	for (i = 0; i < size; i += 4)
-		frb_vram_write32(adev, ptr + i, 0);
-	/* the VCPU fetches it through the MC: the CPU's BAR0 writes out of the HDP first */
-	frb_flush_hdp(adev);
+		size = uvd->vcpu_bo_size;
+		ptr = uvd->inst[j].vcpu_bo;
+		if (!uvd->psp_load) {
+			offset = uvd->ucode.ucode_array_offset;
+			for (i = 0; i < uvd->ucode.ucode_size_bytes; i += 4)
+				frb_vram_write32(adev, ptr + i, frb_get_le32(uvd->fw.data, offset + i));
+			size -= uvd->ucode.ucode_size_bytes;
+			ptr += uvd->ucode.ucode_size_bytes;
+			copied = uvd->ucode.ucode_size_bytes;
+		}
+		for (i = 0; i < size; i += 4)
+			frb_vram_write32(adev, ptr + i, 0);
+		/* the VCPU fetches it through the MC: the CPU's BAR0 writes out of the HDP first */
+		frb_flush_hdp(adev);
 
-	/* to restore uvd fence seq */
-	if (uvd->ring.funcs)
-		frb_fence_driver_force_completion(&uvd->ring);
-	frb_info(adev, "uvd: firmware %u bytes into the VCPU bo, %u zeroed after it (%llu ms)",
-		 uvd->ucode.ucode_size_bytes, size,
-		 (unsigned long long)(adev->os->time_ms(adev->os->cookie) - t0));
+		/* to restore uvd fence seq */
+		if (uvd->inst[j].ring.funcs)
+			frb_fence_driver_force_completion(&uvd->inst[j].ring);
+	}
+	if (uvd->psp_load)
+		frb_info(adev, "uvd: VCPU bo(s) zeroed, %u bytes each (the firmware is the PSP's to load; %llu ms)",
+			 size, (unsigned long long)(adev->os->time_ms(adev->os->cookie) - t0));
+	else
+		frb_info(adev, "uvd: firmware %u bytes into the VCPU bo, %u zeroed after it (%llu ms)",
+			 copied, size, (unsigned long long)(adev->os->time_ms(adev->os->cookie) - t0));
 	return 0;
 }
 
@@ -205,7 +346,8 @@ static int amdgpu_uvd_send_msg(struct frb_ring *ring, uint64_t addr, struct frb_
 	if (r)
 		return r;
 
-	offset = UVD_BASE_SI;
+	/* adev->reg_offset[UVD_HWIP][ring->me][1] from Vega 10 on, UVD_BASE_SI before */
+	offset = frb_uvd_reg_base(adev, ring->me);
 
 	data[0] = FRB_UVD_PACKET0(offset + UVD_GPCOM_VCPU_DATA0);
 	data[1] = FRB_UVD_PACKET0(offset + UVD_GPCOM_VCPU_DATA1);
@@ -295,18 +437,38 @@ int frb_uvd_get_destroy_msg(struct frb_ring *ring, uint32_t handle, struct frb_i
 int frb_uvd_idle_work_handler(struct frb_device *adev)
 {
 	struct frb_uvd *uvd = adev->uvd;
-	uint32_t fences;
+	uint32_t fences = 0, i, rings = 0;
 
-	if (!uvd || !uvd->ring.funcs)
+	if (!uvd)
 		return -ENODEV;
-	fences = uvd->ring.sync_seq - frb_fence_read(&uvd->ring);	/* amdgpu_fence_count_emitted */
+	for (i = 0; i < uvd->num_uvd_inst; ++i) {
+		if ((uvd->harvest_config & (1 << i)) || !uvd->inst[i].ring.funcs)
+			continue;
+		rings++;
+		/* amdgpu_fence_count_emitted */
+		fences += uvd->inst[i].ring.sync_seq - frb_fence_read(&uvd->inst[i].ring);
+	}
+	if (!rings)
+		return -ENODEV;
 	if (fences)
 		return -EBUSY;
 	if (!uvd->powered)
 		return 0;
 
-	if (frb_pm_enabled(adev)) {
+	if (frb_is_soc15(adev)) {
+		/*
+		 * adev->pm.dpm_enabled: amdgpu_dpm_enable_uvd(false) ->
+		 * vega20_power_gate_uvd(true): the SMU's DPM_UVD feature off. Else
+		 * soc15_set_uvd_clocks(0, 0) (empty), no set_powergating_state on
+		 * uvd_v7_0, an empty set_clockgating_state: nothing.
+		 */
+		if (adev->smu11 && adev->smu11->dpm_enabled)
+			frb_vega20_power_gate_uvd(adev, 1);
+	} else if (frb_pm_enabled(adev)) {
 		frb_pm_enable_uvd(adev, 0);
+	} else if (frb_is_si(adev)) {
+		/* amdgpu_asic_set_uvd_clocks(0, 0): the UPLL in bypass; uvd_v3_1's gating calls are empty */
+		frb_si_set_uvd_clocks(adev, 0, 0);
 	} else {
 		frb_vi_set_uvd_clocks(adev, 0, 0);
 		/* shutdown the UVD block */
@@ -333,9 +495,22 @@ void frb_uvd_ring_begin_use(struct frb_ring *ring)
 		return;
 	/* the flag first: start()'s failure is the ring test's to report, as on Linux */
 	uvd->powered = 1;
+	if (frb_is_soc15(adev)) {
+		/* amdgpu_dpm_enable_uvd(true) -> vega20_power_gate_uvd(false); without DPM three no-ops */
+		if (adev->smu11 && adev->smu11->dpm_enabled)
+			frb_vega20_power_gate_uvd(adev, 0);
+		return;
+	}
 	if (frb_pm_enabled(adev)) {
 		/* smu7_powergate_uvd(false): ungated, the VCPU started, UVD's DPM levels on */
 		frb_pm_enable_uvd(adev, 1);
+		return;
+	}
+	if (frb_is_si(adev)) {
+		/* si_set_uvd_clocks; uvd_v3_1's set_clockgating/powergating_state are empty */
+		r = frb_si_set_uvd_clocks(adev, 53300, 40000);
+		if (r)
+			frb_err(adev, "uvd: si_set_uvd_clocks(533, 400 MHz) failed (%d)", r);
 		return;
 	}
 	r = frb_vi_set_uvd_clocks(adev, 53300, 40000);

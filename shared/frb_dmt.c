@@ -64,6 +64,8 @@ const struct frb_mode frb_dmt_modes[] = {
 	{ 148500, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125, FRB_MODE_NHSYNC | FRB_MODE_NVSYNC },
 	{ 154000, 1920, 1968, 2000, 2080, 1200, 1203, 1209, 1235, FRB_MODE_NVSYNC },
 	{ 162000, 2048, 2074, 2154, 2250, 1152, 1153, 1156, 1200, 0 },
+	/* DMT 0x51, 3840x2160 60 Hz reduced blanking (a mode set without an EDID, e.g. a bring-up pipe test) */
+	{ 533250, 3840, 3888, 3920, 4000, 2160, 2163, 2168, 2222, FRB_MODE_NVSYNC },
 };
 
 const unsigned frb_dmt_mode_count = sizeof(frb_dmt_modes) / sizeof(frb_dmt_modes[0]);

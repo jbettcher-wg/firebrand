@@ -274,6 +274,21 @@ enum {
 	RDN_UC_METHOD_COUNT
 };
 
+/*
+ * Beyond RadeonNI's table (Firebrand only; RadeonNI answers
+ * kIOReturnUnsupported, as for any index past RDN_UC_METHOD_COUNT, so
+ * nothing above changes for its clients). 'rdn2' clients. Next to
+ * Firebrand's FRB_UC_SCREEN_TARGET (0x3f), below the 0x40 range its
+ * design keeps for an amdgpu-shaped client type.
+ *
+ * RDN_UC_GFX_INFO: struct out: struct rdn_user_gfx_info. What a GFX9
+ * client (radeonsi through addrlib's Gfx9Lib) needs and RDN_UC_GET_INFO
+ * cannot carry: GFX9 has no tiling tables, so the chip's identity,
+ * GB_ADDR_CONFIG, the CU and RB masks and the CP firmware come from here.
+ * RDN_UC_GET_INFO stays as it is (its struct is a fixed-size output).
+ */
+#define RDN_UC_GFX_INFO			0x3e
+
 #define RDN_UVD_FIXTURE_VERSION 1u
 #define RDN_UVD_FIXTURE_ID 1u
 #define RDN_UVD_FIXTURE_CHUNK_BYTES 4096u
@@ -374,6 +389,41 @@ struct rdn_user_info {
 	uint32_t fb_height;
 	uint32_t fb_pitch_pixels;
 	uint32_t fb_bits_per_pixel;
+};
+
+/*
+ * RDN_UC_GFX_INFO's answer, version RDN_USER_GFX_INFO_VERSION, size bytes
+ * long (a later version only grows it at the end). The fields are those of
+ * amdgpu's drm_amdgpu_info_device that Mesa's ac_gpu_info reads on GFX9;
+ * on GFX8 the ones the kext does not keep are 0.
+ */
+#define RDN_USER_GFX_INFO_VERSION	1
+#define RDN_GFX_INFO_CLEAR_STATE	(1u << 0)	/* the RLC holds the clear-state buffer */
+#define RDN_GFX_INFO_LE_IBS		(1u << 1)	/* command buffers little-endian (as VRAM_INFO64) */
+
+struct rdn_user_gfx_info {
+	uint32_t version;		/* RDN_USER_GFX_INFO_VERSION */
+	uint32_t size;			/* sizeof(struct rdn_user_gfx_info) of the kext */
+	uint32_t family;		/* AMDGPU_FAMILY_* (130 VI, 141 AI) */
+	uint32_t chip_external_rev;	/* amdgpu external_rev_id (Vega 20: rev_id + 0x28) */
+	uint32_t chip_rev;		/* rev_id */
+	uint32_t pci_rev;		/* the PCI revision */
+	uint32_t gfx_ip_version;	/* major << 16 | minor << 8 | revision (9.4.0) */
+	uint32_t me_fw_version, me_fw_feature;
+	uint32_t pfp_fw_version, pfp_fw_feature;
+	uint32_t mec_fw_version, mec_fw_feature;
+	uint32_t gb_addr_config;	/* GB_ADDR_CONFIG as the driver set it (the golden value) */
+	uint32_t num_shader_engines, num_sh_per_se, num_cu_per_sh, num_cu;
+	uint32_t cu_bitmap[4][4];	/* active CUs per SE and SH */
+	uint32_t enabled_rb_mask;	/* the RBs left on (all SEs) */
+	uint32_t num_rb_pipes;		/* RBs in all, harvested ones included */
+	uint32_t num_tcc_blocks;
+	uint32_t num_shader_visible_vgprs;
+	uint32_t gpu_counter_freq_khz;	/* the GPU's reference clock (RLC timestamps) */
+	uint32_t engine_clock_khz;	/* the clocks the card runs at (no DPM: the VBIOS's boot clocks) */
+	uint32_t memory_clock_khz;
+	uint32_t flags;			/* RDN_GFX_INFO_* */
+	uint32_t reserved[8];
 };
 
 /* A surface's shape: screen coordinates, y from the top. */

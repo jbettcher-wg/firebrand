@@ -1,0 +1,192 @@
+osx-gpu: addrlib on a big-endian host: the ADDR2 set unions bit-compatible with their masks
+
+ADDR2_BLOCK_SET, ADDR2_SWTYPE_SET and ADDR2_SWMODE_SET are unions of
+one-bit fields and a 32-bit `value`. Gfx9Lib (HwlGetPreferredSurfaceSetting,
+GetAllowedBlockSet, GetAllowedSwSet, addrlib2.cpp's FilterInvalidEqSwizzleMode)
+builds and narrows the sets through `value` with masks of 1u << ADDR_SW_*,
+takes Log2 and IsPow2 of them, and reads and writes the same sets by field
+name, as does ac_surface.c (forbiddenBlock, preferredSwSet). That holds only
+where the first field is bit 0 of `value`. A big-endian ABI allocates
+bit-fields from the top bit down, so the fields named one swizzle mode and
+the masks another: on PowerPC every depth/stencil surface was refused
+(ADDR_INVALIDPARAMS from Addr2ComputeSurfaceInfo: "no GFX9 layout (3) for a
+512x512 z24_unorm_s8_uint") and a colour surface got whatever mode the
+scrambled set left. First GFX9 run on a big-endian host: Vega 20 (MI50) on
+Firebrand, 2026-11-15; GFX6-8 use the legacy V1 library or libdrm's
+radeon_surface and never came here.
+
+The three unions declare their fields in the opposite order on a big-endian
+host (ADDR_BITFIELDS_MSB_FIRST, from the compiler's own macros, since
+ac_surface.c includes the header without addrlib's BIGENDIAN_CPU). Nothing
+initialises them by position. The other bit-field unions of the interface
+(surface, meta and create flags, ADDR_CHANNEL_SETTING) are only ever set and
+read by field name or as a whole (value = 0, comparisons), and the register
+unions (gfx9_gb_reg.h) already have both layouts.
+
+diff --git a/src/amd/addrlib/inc/addrinterface.h b/src/amd/addrlib/inc/addrinterface.h
+--- a/src/amd/addrlib/inc/addrinterface.h
++++ b/src/amd/addrlib/inc/addrinterface.h
+@@ -18,6 +18,21 @@
+ // Includes should be before extern "C"
+ #include "addrtypes.h"
+ 
++/*
++ * osx-gpu: the ADDR2_*_SET unions below are used both by field name and as a
++ * mask in `value` (Gfx9Lib's swizzle-mode masks, 1u << ADDR_SW_*, Log2 and
++ * IsPow2 of the sets): bit n of `value` must be the n-th field. A big-endian
++ * ABI allocates bit-fields from the top bit down, so there the fields are
++ * declared in the opposite order. Tested by the compiler's own macros, not
++ * BIGENDIAN_CPU: this header is also compiled into C code that does not
++ * define it (ac_surface.c), and both must see one layout.
++ */
++#if defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
++#define ADDR_BITFIELDS_MSB_FIRST 1
++#else
++#define ADDR_BITFIELDS_MSB_FIRST 0
++#endif
++
+ #if defined(__cplusplus)
+ extern "C"
+ {
+@@ -3963,6 +3978,17 @@
+ {
+     struct
+     {
++#if ADDR_BITFIELDS_MSB_FIRST
++        UINT_32 reserved       : 24;
++        UINT_32 linear         : 1;   // Linear block
++        UINT_32                : 1;
++        UINT_32 var            : 1;   // VAR block
++        UINT_32 macroThick64KB : 1;   // Thick 64KB for 3D resource
++        UINT_32 macroThin64KB  : 1;   // Thin 64KB for 2D/3D resource
++        UINT_32 macroThick4KB  : 1;   // Thick 4KB for 3D resource
++        UINT_32 macroThin4KB   : 1;   // Thin 4KB for 2D/3D resource
++        UINT_32 micro          : 1;   // 256B block for 2D resource
++#else
+         UINT_32 micro          : 1;   // 256B block for 2D resource
+         UINT_32 macroThin4KB   : 1;   // Thin 4KB for 2D/3D resource
+         UINT_32 macroThick4KB  : 1;   // Thick 4KB for 3D resource
+@@ -3972,14 +3998,22 @@
+         UINT_32                : 1;
+         UINT_32 linear         : 1;   // Linear block
+         UINT_32 reserved       : 24;
++#endif
+     };
+ 
+     struct
+     {
++#if ADDR_BITFIELDS_MSB_FIRST
++        UINT_32                : 25;
++        UINT_32 thick256KB     : 1;   // Thick 256KB block
++        UINT_32 thin256KB      : 1;   // Thin 256KB block
++        UINT_32                : 5;
++#else
+         UINT_32                : 5;
+         UINT_32 thin256KB      : 1;   // Thin 256KB block
+         UINT_32 thick256KB     : 1;   // Thick 256KB block
+         UINT_32                : 25;
++#endif
+     } gfx11;
+ 
+     UINT_32 value;
+@@ -3997,11 +4031,19 @@
+ {
+     struct
+     {
++#if ADDR_BITFIELDS_MSB_FIRST
++        UINT_32 reserved : 28;
++        UINT_32 sw_R     : 1;   // SW_*_R_*
++        UINT_32 sw_D     : 1;   // SW_*_D_*
++        UINT_32 sw_S     : 1;   // SW_*_S_*
++        UINT_32 sw_Z     : 1;   // SW_*_Z_*
++#else
+         UINT_32 sw_Z     : 1;   // SW_*_Z_*
+         UINT_32 sw_S     : 1;   // SW_*_S_*
+         UINT_32 sw_D     : 1;   // SW_*_D_*
+         UINT_32 sw_R     : 1;   // SW_*_R_*
+         UINT_32 reserved : 28;
++#endif
+     };
+ 
+     UINT_32 value;
+@@ -4019,6 +4061,40 @@
+ {
+     struct
+     {
++#if ADDR_BITFIELDS_MSB_FIRST
++        UINT_32 swMiscDef31 : 1;
++        UINT_32 swMiscDef30 : 1;
++        UINT_32 swMiscDef29 : 1;
++        UINT_32 swMiscDef28 : 1;
++        UINT_32 sw64KB_R_X  : 1;
++        UINT_32 sw64KB_D_X  : 1;
++        UINT_32 sw64KB_S_X  : 1;
++        UINT_32 sw64KB_Z_X  : 1;
++        UINT_32 sw4KB_R_X   : 1;
++        UINT_32 sw4KB_D_X   : 1;
++        UINT_32 sw4KB_S_X   : 1;
++        UINT_32 sw4KB_Z_X   : 1;
++        UINT_32 sw64KB_R_T  : 1;
++        UINT_32 sw64KB_D_T  : 1;
++        UINT_32 sw64KB_S_T  : 1;
++        UINT_32 sw64KB_Z_T  : 1;
++        UINT_32 swMiscDef15 : 1;
++        UINT_32 swMiscDef14 : 1;
++        UINT_32 swMiscDef13 : 1;
++        UINT_32 swMiscDef12 : 1;
++        UINT_32 sw64KB_R    : 1;
++        UINT_32 sw64KB_D    : 1;
++        UINT_32 sw64KB_S    : 1;
++        UINT_32 sw64KB_Z    : 1;
++        UINT_32 sw4KB_R     : 1;
++        UINT_32 sw4KB_D     : 1;
++        UINT_32 sw4KB_S     : 1;
++        UINT_32 sw4KB_Z     : 1;
++        UINT_32 sw256B_R    : 1;
++        UINT_32 sw256B_D    : 1;
++        UINT_32 sw256B_S    : 1;
++        UINT_32 swLinear    : 1;
++#else
+         UINT_32 swLinear    : 1;
+         UINT_32 sw256B_S    : 1;
+         UINT_32 sw256B_D    : 1;
+@@ -4051,23 +4127,39 @@
+         UINT_32 swMiscDef29 : 1;
+         UINT_32 swMiscDef30 : 1;
+         UINT_32 swMiscDef31 : 1;
++#endif
+     };
+ 
+     struct
+     {
++#if ADDR_BITFIELDS_MSB_FIRST
++        UINT_32 swVar_R_X   : 1;
++        UINT_32             : 2;
++        UINT_32 swVar_Z_X   : 1;
++        UINT_32             : 28;
++#else
+         UINT_32             : 28;
+         UINT_32 swVar_Z_X   : 1;
+         UINT_32             : 2;
+         UINT_32 swVar_R_X   : 1;
++#endif
+     } gfx10;
+ 
+     struct
+     {
++#if ADDR_BITFIELDS_MSB_FIRST
++        UINT_32 sw256KB_R_X : 1;
++        UINT_32 sw256KB_D_X : 1;
++        UINT_32 sw256KB_S_X : 1;
++        UINT_32 sw256KB_Z_X : 1;
++        UINT_32             : 28;
++#else
+         UINT_32             : 28;
+         UINT_32 sw256KB_Z_X : 1;
+         UINT_32 sw256KB_S_X : 1;
+         UINT_32 sw256KB_D_X : 1;
+         UINT_32 sw256KB_R_X : 1;
++#endif
+     } gfx11;
+ 
+     UINT_32 value;

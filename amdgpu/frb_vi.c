@@ -473,3 +473,37 @@ int frb_vi_read_register(struct frb_device *adev, uint32_t se_num, uint32_t sh_n
 	}
 	return -EINVAL;
 }
+
+/* --- vi_set_ip_blocks, the Polaris set Firebrand has ----------------------- */
+
+static void vi_gmc_early_init(struct frb_device *adev)
+{
+	frb_gmc_v8_0_early_init(adev);
+}
+
+extern const struct frb_display_funcs frb_dce_v11_0_funcs;	/* frb_dce_v11_0.c */
+
+const struct frb_asic_funcs frb_vi_asic_funcs = {
+	.name = "vi",
+	.rmmio_bar = 0x24,		/* BAR5 */
+	.family = AMDGPU_FAMILY_VI,
+	.pcie_index = mmPCIE_INDEX,	/* 0xe */
+	.pcie_data = mmPCIE_DATA,
+	.early_init = frb_vi_common_early_init,
+	.smc_rreg = frb_vi_smc_rreg,
+	.smc_wreg = frb_vi_smc_wreg,
+	.get_config_memsize = frb_vi_get_config_memsize,
+	.need_reset_on_init = frb_vi_need_reset_on_init,
+	.asic_reset = frb_vi_asic_reset,
+	.common_hw_init = frb_vi_common_hw_init,
+	.gmc_early_init = vi_gmc_early_init,
+	.gmc_sw_init = frb_gmc_v8_0_sw_init,
+	.gmc_hw_init = frb_gmc_v8_0_hw_init,
+	.smu_start = frb_smu7_start,
+	.display = &frb_dce_v11_0_funcs,
+	.gfx_init = frb_gfx_v8_0_init,
+	.sdma_init = frb_sdma_v3_0_init,
+	.uvd_init = frb_uvd_v6_0_init,
+	.read_register = frb_vi_read_register,
+	.num_crtc = 6,			/* DCE 11.2 (FirebrandCore's value) */
+};

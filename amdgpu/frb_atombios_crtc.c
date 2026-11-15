@@ -206,6 +206,9 @@ static uint32_t adjust_pll(struct frb_device *adev, struct frb_crtc *c)
 		frb_err(adev, "display: AdjustDisplayPll %u.%u not handled", frev, crev);
 		return adjusted;
 	}
+	c->pll_flags = FRB_PLL_USE_FRAC_FB_DIV;
+	c->pll_reference_div = 0;
+	c->pll_post_div = 0;
 	frb_ps_init(&ps);
 	if (c->ss_enabled && c->ss.percentage)
 		config |= DISPPLL_CONFIG_SS_ENABLE;
@@ -225,6 +228,14 @@ static uint32_t adjust_pll(struct frb_device *adev, struct frb_crtc *c)
 	frb_ps_u8(&ps, OFS(ADJUST_DISPLAY_PLL_INPUT_PARAMETERS_V3, ucExtTransmitterID), 0);
 	frb_ps_exec(adev, index, &ps);
 	adjusted = frb_ps_get_le32(&ps, OFS(ADJUST_DISPLAY_PLL_OUTPUT_PARAMETERS_V3, ulDispPllFreq)) * 10;
+	if (frb_ps_get_u8(&ps, OFS(ADJUST_DISPLAY_PLL_OUTPUT_PARAMETERS_V3, ucRefDiv))) {
+		c->pll_flags |= FRB_PLL_USE_FRAC_FB_DIV | FRB_PLL_USE_REF_DIV;
+		c->pll_reference_div = frb_ps_get_u8(&ps, OFS(ADJUST_DISPLAY_PLL_OUTPUT_PARAMETERS_V3, ucRefDiv));
+	}
+	if (frb_ps_get_u8(&ps, OFS(ADJUST_DISPLAY_PLL_OUTPUT_PARAMETERS_V3, ucPostDiv))) {
+		c->pll_flags |= FRB_PLL_USE_FRAC_FB_DIV | FRB_PLL_USE_POST_DIV;
+		c->pll_post_div = frb_ps_get_u8(&ps, OFS(ADJUST_DISPLAY_PLL_OUTPUT_PARAMETERS_V3, ucPostDiv));
+	}
 	return adjusted;
 }
 
@@ -258,4 +269,220 @@ int frb_atombios_crtc_prepare_pll(struct frb_device *adev, struct frb_display *d
 		 c->mode.clock, c->adjusted_clock, c->ss_enabled ? "on" : "off",
 		 c->ss.percentage, c->ss.percentage_divider);
 	return 0;
+}
+
+/* amdgpu_atombios_crtc_program_ss, the v3 table (DCE5+) */
+static void program_ss(struct frb_device *adev, struct frb_display *d, int enable, int pll_id, int crtc_id,
+		       struct frb_atom_ss *ss)
+{
+	int index = GetIndexIntoMasterTable(COMMAND, EnableSpreadSpectrumOnPPLL);
+	struct frb_ps ps;
+	uint8_t type;
+
+	(void)d;
+	(void)crtc_id;
+	if (enable) {
+		/*
+		 * Don't mess with SS if percentage is 0 or external ss. SS is
+		 * already disabled previously, and disabling it again can cause
+		 * display problems if the pll is already programmed.
+		 */
+		if (ss->percentage == 0)
+			return;
+		if (ss->type & ATOM_EXTERNAL_SS_MASK)
+			return;
+	}
+	/* (one CRTC here: no other one can share the PLL) */
+	type = ss->type & ATOM_SS_CENTRE_SPREAD_MODE_MASK;
+	switch (pll_id) {
+	case ATOM_PPLL1:
+		type |= ATOM_PPLL_SS_TYPE_V3_P1PLL;
+		break;
+	case ATOM_PPLL2:
+		type |= ATOM_PPLL_SS_TYPE_V3_P2PLL;
+		break;
+	case ATOM_DCPLL:
+		type |= ATOM_PPLL_SS_TYPE_V3_DCPLL;
+		break;
+	case ATOM_PPLL_INVALID:
+		return;
+	}
+	frb_ps_init(&ps);
+	frb_ps_le16(&ps, OFS(ENABLE_SPREAD_SPECTRUM_ON_PPLL_V3, usSpreadSpectrumAmountFrac), 0);
+	frb_ps_u8(&ps, OFS(ENABLE_SPREAD_SPECTRUM_ON_PPLL_V3, ucSpreadSpectrumType), type);
+	frb_ps_le16(&ps, OFS(ENABLE_SPREAD_SPECTRUM_ON_PPLL_V3, usSpreadSpectrumAmount), ss->amount);
+	frb_ps_le16(&ps, OFS(ENABLE_SPREAD_SPECTRUM_ON_PPLL_V3, usSpreadSpectrumStep), ss->step);
+	frb_ps_u8(&ps, OFS(ENABLE_SPREAD_SPECTRUM_ON_PPLL_V3, ucEnable), enable);
+	frb_ps_exec(adev, index, &ps);
+}
+
+/* is_pixel_clock_source_from_pll */
+static int is_pixel_clock_source_from_pll(uint32_t encoder_mode, int pll_id)
+{
+	if (encoder_mode == ATOM_ENCODER_MODE_DP || encoder_mode == ATOM_ENCODER_MODE_DP_MST)
+		return pll_id < ATOM_EXT_PLL1;
+	return 1;
+}
+
+/* amdgpu_atombios_crtc_program_pll, the 1.5 and 1.6 arms (no HDMI deep colour: bpc 8) */
+static void program_pll_div(struct frb_device *adev, int crtc_id, int pll_id, uint32_t encoder_mode,
+			    uint32_t encoder_id, uint32_t clock, uint32_t ref_div, uint32_t fb_div,
+			    uint32_t frac_fb_div, uint32_t post_div, int ss_enabled, const struct frb_atom_ss *ss)
+{
+	int index = GetIndexIntoMasterTable(COMMAND, SetPixelClock);
+	struct frb_ps ps;
+	uint8_t frev, crev, misc = 0;
+
+	if (frb_cmd_rev(adev, index, &frev, &crev) || frev != 1 || (crev != 5 && crev != 6)) {
+		frb_err(adev, "display: SetPixelClock %u.%u not handled", frev, crev);
+		return;
+	}
+	frb_ps_init(&ps);
+	if (crev == 5) {
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, ucCRTC), crtc_id);
+		frb_ps_le16(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, usPixelClock), clock / 10);
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, ucRefDiv), ref_div);
+		frb_ps_le16(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, usFbDiv), fb_div);
+		frb_ps_le32(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, ulFbDivDecFrac), frac_fb_div * 100000);
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, ucPostDiv), post_div);
+		if ((ss_enabled && (ss->type & ATOM_EXTERNAL_SS_MASK)) && (pll_id < ATOM_EXT_PLL1))
+			misc |= PIXEL_CLOCK_V5_MISC_REF_DIV_SRC;
+		if (encoder_mode == ATOM_ENCODER_MODE_HDMI)
+			misc |= PIXEL_CLOCK_V5_MISC_HDMI_24BPP;
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, ucMiscInfo), misc);
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, ucTransmitterID), encoder_id);
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, ucEncoderMode), encoder_mode);
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, ucPpll), pll_id);
+	} else {
+		/* ulCrtcPclkFreq: ulPixelClock:24 (10 kHz), ucCRTC:8 in the top byte (little-endian) */
+		frb_ps_le32(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ulDispEngClkFreq), ((uint32_t)crtc_id << 24) | (clock / 10));
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ucRefDiv), ref_div);
+		frb_ps_le16(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, usFbDiv), fb_div);
+		frb_ps_le32(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ulFbDivDecFrac), frac_fb_div * 100000);
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ucPostDiv), post_div);
+		if ((ss_enabled && (ss->type & ATOM_EXTERNAL_SS_MASK)) && (pll_id < ATOM_EXT_PLL1) &&
+		    !is_pixel_clock_source_from_pll(encoder_mode, pll_id))
+			misc |= PIXEL_CLOCK_V6_MISC_REF_DIV_SRC;
+		if (encoder_mode == ATOM_ENCODER_MODE_HDMI)
+			misc |= PIXEL_CLOCK_V6_MISC_HDMI_24BPP;
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ucMiscInfo), misc);
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ucTransmitterID), encoder_id);
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ucEncoderMode), encoder_mode);
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ucPpll), pll_id);
+	}
+	frb_info(adev, "display: SetPixelClock 1.%u: %u kHz, crtc %d, pll %d, fb %u.%u ref %u post %u, "
+		 "transmitter 0x%02x, mode %u", crev, clock, crtc_id, pll_id, fb_div, frac_fb_div, ref_div,
+		 post_div, encoder_id, encoder_mode);
+	frb_ps_exec(adev, index, &ps);
+}
+
+/* amdgpu_atombios_crtc_set_pll */
+void frb_atombios_crtc_set_pll(struct frb_device *adev, struct frb_display *d, struct frb_crtc *c)
+{
+	struct frb_connector *conn = c->conn;
+	uint32_t pll_clock = c->mode.clock, clock = c->mode.clock;
+	uint32_t ref_div = 0, fb_div = 0, frac_fb_div = 0, post_div = 0;
+	int encoder_mode = frb_atombios_encoder_get_encoder_mode(conn);
+	struct frb_pll *pll;
+	uint8_t frev, crev;
+
+	if (frb_cmd_rev(adev, GetIndexIntoMasterTable(COMMAND, SetPixelClock), &frev, &crev) == 0 &&
+	    frev == 1 && crev == 7) {
+		/* the VBIOS works out the dividers and the spread itself */
+		frb_atombios_crtc_program_pll(adev, c->crtc_id, c->pll_id, encoder_mode, conn->encoder_id,
+					      c->mode.clock, c->bpc, frb_dig_monitor_is_duallink(conn, c->mode.clock));
+		return;
+	}
+
+	switch (c->pll_id) {
+	case ATOM_PPLL1:
+		pll = &d->ppll[0];
+		break;
+	case ATOM_PPLL2:
+		pll = &d->ppll[1];
+		break;
+	case ATOM_PPLL0:
+	case ATOM_PPLL_INVALID:
+	default:
+		pll = &d->ppll[2];
+		break;
+	}
+
+	/* update pll params */
+	pll->flags = c->pll_flags;
+	pll->reference_div = c->pll_reference_div;
+	pll->post_div = c->pll_post_div;
+
+	frb_pll_compute(adev, pll, c->adjusted_clock, &pll_clock, &fb_div, &frac_fb_div, &ref_div, &post_div);
+
+	program_ss(adev, d, ATOM_DISABLE, c->pll_id, c->crtc_id, &c->ss);
+
+	program_pll_div(adev, c->crtc_id, c->pll_id, encoder_mode, conn->encoder_id, clock,
+			ref_div, fb_div, frac_fb_div, post_div, c->ss_enabled, &c->ss);
+
+	if (c->ss_enabled) {
+		/* calculate ss amount and step size */
+		uint32_t step_size;
+		uint32_t amount = (((fb_div * 10) + frac_fb_div) * (uint32_t)c->ss.percentage) /
+			(100 * (uint32_t)c->ss.percentage_divider);
+
+		c->ss.amount = (amount / 10) & ATOM_PPLL_SS_AMOUNT_V2_FBDIV_MASK;
+		c->ss.amount |= ((amount - (amount / 10)) << ATOM_PPLL_SS_AMOUNT_V2_NFRAC_SHIFT) &
+			ATOM_PPLL_SS_AMOUNT_V2_NFRAC_MASK;
+		if (c->ss.type & ATOM_PPLL_SS_TYPE_V2_CENTRE_SPREAD)
+			step_size = (4 * amount * ref_div * ((uint32_t)c->ss.rate * 2048)) /
+				(125 * 25 * pll->reference_freq / 100);
+		else
+			step_size = (2 * amount * ref_div * ((uint32_t)c->ss.rate * 2048)) /
+				(125 * 25 * pll->reference_freq / 100);
+		c->ss.step = step_size;
+
+		program_ss(adev, d, ATOM_ENABLE, c->pll_id, c->crtc_id, &c->ss);
+	}
+}
+
+/* amdgpu_atombios_crtc_set_disp_eng_pll (dispclk in 10 kHz) */
+void frb_atombios_crtc_set_disp_eng_pll(struct frb_device *adev, uint32_t dispclk)
+{
+	int index = GetIndexIntoMasterTable(COMMAND, SetPixelClock);
+	struct frb_ps ps;
+	uint8_t frev, crev;
+
+	if (frb_cmd_rev(adev, index, &frev, &crev))
+		return;
+	frb_ps_init(&ps);
+	if (frev == 1 && crev == 5) {
+		/* if the default dcpll clock is specified, SetPixelClock provides the dividers */
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, ucCRTC), ATOM_CRTC_INVALID);
+		frb_ps_le16(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, usPixelClock), dispclk);
+		frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V5, ucPpll), ATOM_DCPLL);
+	} else if (frev == 1 && crev == 6) {
+		/* if the default dcpll clock is specified, SetPixelClock provides the dividers */
+		frb_ps_le32(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ulDispEngClkFreq), dispclk);
+		switch (adev->asic_type) {
+		case CHIP_TAHITI:
+		case CHIP_PITCAIRN:
+		case CHIP_VERDE:
+		case CHIP_OLAND:
+			frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ucPpll), ATOM_PPLL0);
+			break;
+		default:
+			frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ucPpll), ATOM_EXT_PLL1);
+			break;
+		}
+	} else {
+		frb_err(adev, "display: SetPixelClock %u.%u for the display engine clock not handled", frev, crev);
+		return;
+	}
+	frb_info(adev, "display: display engine clock %u kHz (SetPixelClock %u.%u)", dispclk * 10, frev, crev);
+	frb_ps_exec(adev, index, &ps);
+}
+
+/* dce_v6_0_crtc_disable's amdgpu_atombios_crtc_program_pll(crtc, id, pll, 0, 0, ATOM_DISABLE, 0, ...) */
+void frb_atombios_crtc_pll_off(struct frb_device *adev, int crtc_id, int pll_id)
+{
+	struct frb_atom_ss ss;
+
+	memset(&ss, 0, sizeof(ss));
+	program_pll_div(adev, crtc_id, pll_id, 0, 0, ATOM_DISABLE, 0, 0, 0, 0, 0, &ss);
 }

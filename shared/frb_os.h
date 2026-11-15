@@ -85,6 +85,16 @@ struct frb_os {
 	 */
 	int (*gtt_alloc)(void *cookie, uint32_t size, struct frb_gtt *gtt);
 	void (*gtt_free)(void *cookie, struct frb_gtt *gtt);
+
+	/*
+	 * SOC15 doorbells (BAR2): amdgpu's WDOORBELL64. index is the dword
+	 * index into the doorbell BAR (ring->doorbell_index); the value goes
+	 * out little-endian, the low dword at index and the high dword at
+	 * index + 1, in that order. NULL where there is no doorbell BAR (VI
+	 * rings write their WPTR registers; a SOC15 ring then takes amdgpu's
+	 * use_doorbell = false arm).
+	 */
+	void (*doorbell_write64)(void *cookie, uint32_t index, uint64_t value);
 };
 
 static inline void frb_log(struct frb_os *os, enum frb_log_level level,

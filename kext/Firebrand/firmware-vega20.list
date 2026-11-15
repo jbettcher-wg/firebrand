@@ -1,0 +1,22 @@
+# The microcode a Vega 20 build (make BRINGUP=vega20, scripts/build-mac.sh's
+# default) carries besides firmware.list's: the files amdgpu loads on the MI50,
+# less what Firebrand does not use yet: vega20_ta.bin (the RAS/XGMI trusted
+# applications) and vega20_ip_discovery.bin (sysfs only on Vega 20).
+#
+# PSP (MP0 11.0.2): the bootloader's system driver and secure OS, the ASD.
+vega20_sos.bin
+vega20_asd.bin
+# Loaded by the PSP (LOAD_IP_FW), in amdgpu's order: SDMA0/1, CP CE/PFP/ME,
+# MEC (and its jump table) twice, the RLC (its save/restore lists too), the
+# SMC, UVD for both instances, VCE.
+vega20_sdma.bin
+vega20_sdma1.bin
+vega20_ce.bin
+vega20_pfp.bin
+vega20_me.bin
+vega20_mec.bin
+vega20_mec2.bin
+vega20_rlc.bin
+vega20_smc.bin
+vega20_uvd.bin
+vega20_vce.bin

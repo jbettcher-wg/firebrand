@@ -38,11 +38,16 @@
 #include "rdn_trace.h"
 #include "radeon_surface.h"
 #include "ac_gpu_info.h"
+#include "ac_linux_drm.h"
+#include "ac_surface.h"
+#include "addrlib/src/amdgpu_asic_addr.h"
 #include "sid.h"
 
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
+#include "util/format/u_format.h"
 #include "util/os_time.h"
+#include "util/u_debug.h"
 #include "util/u_cpu_detect.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
@@ -2196,6 +2201,8 @@ static void rdn_winsys_destroy(struct radeon_winsys *rws)
    rdn_cache_trim(ws, true);
    if (ws->surf_man)
       radeon_surface_manager_free(ws->surf_man);
+   if (ws->addrlib)
+      ac_addrlib_destroy(ws->addrlib);
    ws->dev->destroy(ws->dev);
    simple_mtx_destroy(&ws->lock);
    FREE(ws);
@@ -2310,6 +2317,22 @@ static enum radeon_family rdn_gcn_family(uint32_t pci_id)
    }
 }
 
+/*
+ * GFX9 (Firebrand on SOC15): the chip is what the kext's RDN_UC_GFX_INFO says,
+ * identified as ac_identify_chip() does from amdgpu's family and external
+ * revision; no device-id table. Vega 20 is the one brought up (the MI50,
+ * 2026-11-15); the other Vega dies are the same code in Mesa but
+ * have not run here, so they are not served.
+ */
+static enum radeon_family rdn_gfx9_family(const struct rdn_device_info *dev)
+{
+   if (!dev->has_gfx || dev->gfx.ip_major != 9 || dev->gfx.family != FAMILY_AI)
+      return CHIP_UNKNOWN;
+   if (ASICREV_IS(dev->gfx.chip_external_rev, VEGA20))
+      return CHIP_VEGA20;
+   return CHIP_UNKNOWN;
+}
+
 static enum amd_gfx_level rdn_gcn_gfx_level(enum radeon_family family)
 {
    switch (family) {
@@ -2335,7 +2358,8 @@ static enum amd_gfx_level rdn_gcn_gfx_level(enum radeon_family family)
 
 bool rdn_device_is_gcn(const struct rdn_device *dev)
 {
-   return rdn_gcn_gfx_level(rdn_gcn_family(dev->info.pci_device_id)) != CLASS_UNKNOWN;
+   return rdn_gfx9_family(&dev->info) != CHIP_UNKNOWN ||
+          rdn_gcn_gfx_level(rdn_gcn_family(dev->info.pci_device_id)) != CLASS_UNKNOWN;
 }
 
 /*
@@ -2548,6 +2572,248 @@ static bool rdn_init_info_gcn(struct radeon_drm_winsys *ws)
    return true;
 }
 
+/*
+ * GFX9 (Vega on Firebrand's SOC15 path). What ac_query_gpu_info() derives
+ * from amdgpu's ioctls, through the same helpers, from a device-info
+ * structure filled with the kext's RDN_UC_GFX_INFO: nothing is read from
+ * registers (GFX9 has no tiling tables; GB_ADDR_CONFIG is the kext's golden
+ * value) and nothing is per device id. Then what this winsys is not: no
+ * sparse buffers, no sync objects, no SDMA or compute queue of its own.
+ */
+static bool rdn_init_info_gfx9(struct radeon_drm_winsys *ws)
+{
+   const struct rdn_device_info *dev = &ws->dev->info;
+   struct radeon_info *info = &ws->info;
+   struct drm_amdgpu_info_device di;
+   struct drm_amdgpu_memory_info mem;
+   struct amdgpu_gpu_info gi;
+   uint64_t total_vram = dev->total_vram_size ? dev->total_vram_size
+                                              : (dev->vram_size + dev->hidden_size);
+   unsigned ip;
+
+   if (!dev->le_ibs) {
+      fprintf(stderr, "rdn: GFX9 card %04x without little-endian command buffers from the kext\n",
+              dev->pci_device_id);
+      return false;
+   }
+   memset(&di, 0, sizeof(di));
+   memset(&mem, 0, sizeof(mem));
+   memset(&gi, 0, sizeof(gi));
+
+   di.device_id = dev->pci_device_id;
+   di.chip_rev = dev->gfx.chip_rev;
+   di.external_rev = dev->gfx.chip_external_rev;
+   di.pci_rev = dev->gfx.pci_rev;
+   di.family = dev->gfx.family;
+   di.num_shader_engines = dev->gfx.num_shader_engines;
+   di.num_shader_arrays_per_engine = dev->gfx.num_sh_per_se;
+   di.gpu_counter_freq = dev->gfx.gpu_counter_freq_khz;
+   di.max_engine_clock = dev->gfx.engine_clock_khz;
+   di.max_memory_clock = dev->gfx.memory_clock_khz;
+   di.cu_active_number = dev->gfx.num_cu;
+   memcpy(di.cu_bitmap, dev->gfx.cu_bitmap, sizeof(di.cu_bitmap));
+   di.enabled_rb_pipes_mask = dev->gfx.enabled_rb_mask;
+   di.num_rb_pipes = dev->gfx.num_rb_pipes;
+   di.num_hw_gfx_contexts = 8;
+   di.pcie_gen = 2;
+   di.pcie_num_lanes = 4;
+   di.virtual_address_alignment = 4096;
+   di.pte_fragment_size = 64 * 1024;
+   di.gart_page_size = 4096;
+   di.vram_type = AMDGPU_VRAM_TYPE_HBM;   /* every Vega 10/20 board */
+   di.vram_bit_width = 4096;
+   di.wave_front_size = 64;
+   di.num_shader_visible_vgprs = dev->gfx.num_shader_visible_vgprs;
+   di.num_cu_per_sh = dev->gfx.num_cu_per_sh;
+   di.num_tcc_blocks = dev->gfx.num_tcc_blocks;
+
+   mem.vram.total_heap_size = total_vram;
+   mem.cpu_accessible_vram.total_heap_size = MIN2(total_vram, ws->dev->aperture_size);
+   mem.gtt.total_heap_size = dev->gart_size ? dev->gart_size : dev->vram_size;
+
+   gi.gb_addr_cfg = dev->gfx.gb_addr_config;
+
+   info->drm_major = 2;
+   info->drm_minor = 51;
+   info->drm_patchlevel = 0;
+   info->is_amdgpu = false;
+   for (ip = 0; ip < AMD_NUM_IP_TYPES; ip++) {
+      info->ip[ip].ib_alignment = 4096;
+      info->ip[ip].ib_pad_dw_mask = 0x7;
+   }
+   info->ip[AMD_IP_GFX].num_queues = 1;
+   info->ip[AMD_IP_GFX].num_instances = 1;
+   info->ip[AMD_IP_GFX].ver_major = dev->gfx.ip_major;
+   info->ip[AMD_IP_GFX].ver_minor = dev->gfx.ip_minor;
+   info->ip[AMD_IP_GFX].ver_rev = dev->gfx.ip_rev;
+   info->has_graphics = true;
+   info->me_fw_version = dev->gfx.me_fw_version;
+   info->me_fw_feature = dev->gfx.me_fw_feature;
+   info->pfp_fw_version = dev->gfx.pfp_fw_version;
+   info->pfp_fw_feature = dev->gfx.pfp_fw_feature;
+   info->mec_fw_version = dev->gfx.mec_fw_version;
+   info->mec_fw_feature = dev->gfx.mec_fw_feature;
+
+   if (!ac_identify_chip(info, &di) || info->gfx_level != GFX9 ||
+       info->family != rdn_gfx9_family(dev))
+      return false;
+   snprintf(info->marketing_name, sizeof(info->marketing_name), "AMD Radeon (%04x)", dev->pci_device_id);
+   ws->gen = DRV_SI;
+
+   ac_fill_memory_info(info, &di, &mem);
+   ac_fill_hw_info(info, &di);
+   ac_fill_tiling_info(info, &gi);
+   ac_fill_feature_info(info, &di);
+   ac_fill_bug_info(info);
+   ac_fill_tess_info(info);
+   ac_fill_compiler_info(info, &di, false);
+
+   info->scratch_wavesize_granularity_shift = 10;
+   info->scratch_wavesize_granularity = 1024;
+   info->max_scratch_waves = MAX2(32 * info->max_good_cu_per_sa * info->max_sa_per_se * info->num_se, 32);
+   info->max_gflops = 128 * info->num_cu * info->max_gpu_freq_mhz / 1000;
+   info->pcie_gen = di.pcie_gen;
+   info->pcie_num_lanes = di.pcie_num_lanes;
+   info->se_tile_repeat = 32 * info->max_se;
+   info->max_submitted_ibs[AMD_IP_GFX] = 192;
+
+   /* This winsys, as rdn_init_info_gcn() has it for GFX6-8. */
+   info->gart_size_kb = (uint32_t)(mem.gtt.total_heap_size / 1024);
+   info->vram_size_kb = (uint32_t)(total_vram / 1024);
+   info->vram_vis_size_kb = (uint32_t)(mem.cpu_accessible_vram.total_heap_size / 1024);
+   info->max_heap_size_kb = MAX2(info->vram_size_kb, info->gart_size_kb);
+   info->all_vram_visible = false;
+   info->has_dedicated_vram = true;
+   info->min_alloc_size = 4096;
+   info->max_alignment = 1024 * 1024;
+   info->r600_has_virtual_memory = true;
+   /* Buffers radeonsi addresses with 32 bits stay in the aperture, the first 256 MB of VRAM. */
+   info->address32_hi = (uint32_t)(dev->vram_gpu_base >> 32);
+   info->has_userptr = ws->dev->gart_bind_user != NULL;
+   info->has_syncobj = false;
+   info->has_timeline_syncobj = false;
+   info->has_fence_to_handle = false;
+   info->has_sparse = false;
+   info->has_sparse_image_3d = false;
+   info->has_sparse_image_standard_3d = false;
+   info->has_tmz_support = false;
+   info->has_gpuvm_fault_query = false;
+   info->has_kernelq_reg_shadowing = false;
+   info->kernel_has_modifiers = false;
+   info->cp_dma_gtt_copy_max_bytes = dev->cp_dma_gtt_copy_max_bytes;
+   /*
+    * CLEAR_STATE needs the RLC's clear-state buffer; the kext says whether
+    * it loaded one. Off unless RDN_GFX9_CLEAR_STATE=1 until it has run:
+    * radeonsi then writes every context register's reset value itself.
+    */
+   info->has_clear_state = dev->gfx.clear_state && debug_get_bool_option("RDN_GFX9_CLEAR_STATE", false);
+   return true;
+}
+
+/*
+ * GFX9 surfaces: addrlib (Gfx9Lib) through ac_compute_surface(), as
+ * winsys/amdgpu's amdgpu_surface.c; libdrm's radeon_surface.c knows nothing
+ * past Sea Islands.
+ */
+static int rdn_gfx9_surface_init(struct radeon_winsys *rws, const struct radeon_info *info,
+                                 const struct pipe_resource *tex, uint64_t flags, unsigned bpe,
+                                 enum radeon_surf_mode mode, struct radeon_surf *surf)
+{
+   struct radeon_drm_winsys *ws = rdn_winsys(rws);
+   struct ac_surf_config config;
+
+   switch (tex->target) {
+   case PIPE_TEXTURE_1D:
+      if (tex->height0 > 1)
+         return -EINVAL;
+      FALLTHROUGH;
+   case PIPE_TEXTURE_2D:
+   case PIPE_TEXTURE_RECT:
+      if (tex->depth0 > 1 || tex->array_size > 1)
+         return -EINVAL;
+      break;
+   case PIPE_TEXTURE_3D:
+      if (tex->array_size > 1)
+         return -EINVAL;
+      break;
+   case PIPE_TEXTURE_1D_ARRAY:
+      if (tex->height0 > 1)
+         return -EINVAL;
+      FALLTHROUGH;
+   case PIPE_TEXTURE_CUBE:
+   case PIPE_TEXTURE_2D_ARRAY:
+   case PIPE_TEXTURE_CUBE_ARRAY:
+      if (tex->depth0 > 1)
+         return -EINVAL;
+      break;
+   default:
+      return -EINVAL;
+   }
+
+   memset(&config, 0, sizeof(config));
+   config.info.width = tex->width0;
+   config.info.height = tex->height0;
+   config.info.depth = tex->depth0;
+   config.info.array_size = tex->array_size;
+   config.info.samples = tex->nr_samples;
+   config.info.storage_samples = tex->nr_storage_samples;
+   config.info.levels = tex->last_level + 1;
+   config.info.num_channels = util_format_get_nr_components(tex->format);
+   config.is_1d = tex->target == PIPE_TEXTURE_1D || tex->target == PIPE_TEXTURE_1D_ARRAY;
+   config.is_3d = tex->target == PIPE_TEXTURE_3D;
+   config.is_cube = tex->target == PIPE_TEXTURE_CUBE;
+   config.is_array = tex->target == PIPE_TEXTURE_1D_ARRAY ||
+                     tex->target == PIPE_TEXTURE_2D_ARRAY ||
+                     tex->target == PIPE_TEXTURE_CUBE_ARRAY;
+   config.blk_w = util_format_get_blockwidth(tex->format);
+   config.blk_h = util_format_get_blockheight(tex->format);
+   config.bpe = bpe;
+   config.surf_flags = flags;
+   config.modifier = surf->modifier;
+   config.gfx9.swizzle_mode = surf->u.gfx9.swizzle_mode;
+   config.gfx9.dcc_number_type = surf->u.gfx9.dcc_number_type;
+   config.gfx9.dcc_data_format = surf->u.gfx9.dcc_data_format;
+   config.gfx9.dcc_max_compressed_block_size = surf->u.gfx9.color.dcc.max_compressed_block_size;
+   config.gfx9.dcc_independent_64B_blocks = surf->u.gfx9.color.dcc.independent_64B_blocks;
+   config.gfx9.dcc_independent_128B_blocks = surf->u.gfx9.color.dcc.independent_128B_blocks;
+   config.gfx9.dcc_write_compress_disable = surf->u.gfx9.dcc_write_compress_disable;
+   config.gfx9.display_dcc_pitch_max = surf->u.gfx9.color.display_dcc_pitch_max;
+
+   /* radeon_info from the driver, not the winsys: the driver may change it. */
+   {
+      int r = ac_compute_surface(ws->addrlib, info, &config, mode, surf);
+
+      if (r)
+         fprintf(stderr, "rdn: no GFX9 layout (%d) for a %ux%ux%u %s, %u levels, %u samples, %u bytes a block, "
+                 "flags 0x%llx, mode %u\n", r, tex->width0, tex->height0,
+                 MAX2(tex->depth0, tex->array_size), util_format_short_name(tex->format),
+                 tex->last_level + 1, tex->nr_samples, bpe, (unsigned long long)flags, (unsigned)mode);
+      return r;
+   }
+}
+
+static uint64_t rdn_gfx9_surface_offset_from_coord(struct radeon_winsys *rws, const struct radeon_info *info,
+                                                   const struct radeon_surf *surf,
+                                                   const struct pipe_resource *tex, unsigned level,
+                                                   unsigned x, unsigned y, unsigned layer)
+{
+   struct radeon_drm_winsys *ws = rdn_winsys(rws);
+   unsigned samples = MAX2(1, tex->nr_samples);
+   const struct ac_surf_info surf_info = {
+      .width = tex->width0,
+      .height = tex->height0,
+      .depth = tex->depth0,
+      .samples = samples,
+      .storage_samples = samples,
+      .levels = tex->last_level + 1,
+      .num_channels = util_format_get_last_component(tex->format) + 1,
+      .array_size = tex->array_size,
+   };
+
+   return ac_surface_addr_from_coord(ws->addrlib, info, surf, &surf_info, level, x, y, layer,
+                                     tex->target == PIPE_TEXTURE_3D);
+}
+
 struct radeon_winsys *rdn_winsys_create(struct rdn_device *dev,
                                         const struct pipe_screen_config *config,
                                         rdn_screen_create_t screen_create)
@@ -2574,7 +2840,12 @@ struct radeon_winsys *rdn_winsys_create(struct rdn_device *dev,
       list_inithead(&ws->cache_buckets[b]);
    rdn_vram_gpu_base = dev->info.vram_gpu_base;
    rdn_gart_gpu_base = dev->info.gart_gpu_base;
-   if (rdn_device_is_gcn(dev)) {
+   if (rdn_gfx9_family(&dev->info) != CHIP_UNKNOWN) {
+      if (!rdn_init_info_gfx9(ws)) {
+         fprintf(stderr, "rdn: no GFX9 description for device %04x\n", (unsigned)dev->info.pci_device_id);
+         goto fail;
+      }
+   } else if (rdn_device_is_gcn(dev)) {
       if (!rdn_init_info_gcn(ws)) {
          fprintf(stderr, "rdn: no GCN description for device %04x\n", (unsigned)dev->info.pci_device_id);
          goto fail;
@@ -2583,13 +2854,25 @@ struct radeon_winsys *rdn_winsys_create(struct rdn_device *dev,
       rdn_init_info(ws);
    }
 
-   rdn_shim_device_id = ws->info.gfx_level == GFX8 ? RDN_GFX8_SURFACE_DEVICE_ID : dev->info.pci_device_id;
-   rdn_shim_tiling_config = dev->info.tile_config;
-   ws->surf_man = radeon_surface_manager_new(-1);
-   if (!ws->surf_man) {
-      fprintf(stderr, "rdn: no surface layout for device %04x\n",
-              (unsigned)dev->info.pci_device_id);
-      goto fail;
+   if (ws->info.gfx_level >= GFX9) {
+      uint64_t max_alignment = 0;
+
+      ws->addrlib = ac_addrlib_create(&ws->info, &max_alignment);
+      if (!ws->addrlib) {
+         fprintf(stderr, "rdn: no surface library for device %04x\n",
+                 (unsigned)dev->info.pci_device_id);
+         goto fail;
+      }
+      ws->info.max_alignment = MAX2(ws->info.max_alignment, max_alignment);
+   } else {
+      rdn_shim_device_id = ws->info.gfx_level == GFX8 ? RDN_GFX8_SURFACE_DEVICE_ID : dev->info.pci_device_id;
+      rdn_shim_tiling_config = dev->info.tile_config;
+      ws->surf_man = radeon_surface_manager_new(-1);
+      if (!ws->surf_man) {
+         fprintf(stderr, "rdn: no surface layout for device %04x\n",
+                 (unsigned)dev->info.pci_device_id);
+         goto fail;
+      }
    }
 
    ws->base.unref = rdn_winsys_unref;
@@ -2645,6 +2928,10 @@ struct radeon_winsys *rdn_winsys_create(struct rdn_device *dev,
 
    /* surface_init, from Mesa's radeon_drm_surface.c. */
    radeon_surface_init_functions(ws);
+   if (ws->addrlib) {
+      ws->base.surface_init = rdn_gfx9_surface_init;
+      ws->base.surface_offset_from_coord = rdn_gfx9_surface_offset_from_coord;
+   }
 
    ws->base.screen = screen_create(&ws->base, config);
    if (!ws->base.screen)
@@ -2654,6 +2941,8 @@ struct radeon_winsys *rdn_winsys_create(struct rdn_device *dev,
 fail:
    if (ws->surf_man)
       radeon_surface_manager_free(ws->surf_man);
+   if (ws->addrlib)
+      ac_addrlib_destroy(ws->addrlib);
    dev->destroy(dev);
    simple_mtx_destroy(&ws->lock);
    FREE(ws);

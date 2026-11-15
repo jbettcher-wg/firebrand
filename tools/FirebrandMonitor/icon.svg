@@ -1,0 +1,45 @@
+<!-- Firebrand Monitor's icon: the Firebrand chip and a readings badge. mk-icon.py renders it. -->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="512" height="512" viewBox="0 0 512 512">
+<svg x="16" y="10" width="480" height="480" viewBox="0 0 460 460">
+  <defs>
+    <path id="fl" d="M200,360 C138,360 100,318 104,262 C107,222 128,196 142,168 C150,190 152,208 148,226 C168,198 186,160 184,112 C182,84 172,62 160,40 C214,62 252,108 262,160 C266,182 264,200 258,216 C272,204 282,188 286,168 C312,204 322,248 310,292 C298,334 256,360 200,360 Z"/>
+    <linearGradient id="pin" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#c9ccd1"/><stop offset="1" stop-color="#868a91"/></linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3d3839"/><stop offset="1" stop-color="#211d1e"/></linearGradient>
+    <linearGradient id="bodyEdge" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff" stop-opacity="0.30"/><stop offset="1" stop-color="#ffffff" stop-opacity="0.05"/></linearGradient>
+    <radialGradient id="die" cx="0.5" cy="0.7" r="0.8"><stop offset="0" stop-color="#4a2a22"/><stop offset="0.55" stop-color="#2c2425"/><stop offset="1" stop-color="#1c1819"/></radialGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></linearGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="14"/></filter>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="10"/><feOffset dy="10"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.5"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <g filter="url(#shadow)">
+    <g fill="url(#pin)">
+      <rect x='78' y='22' width='16' height='26' rx='3'/><rect x='118' y='22' width='16' height='26' rx='3'/><rect x='158' y='22' width='16' height='26' rx='3'/><rect x='198' y='22' width='16' height='26' rx='3'/><rect x='238' y='22' width='16' height='26' rx='3'/><rect x='278' y='22' width='16' height='26' rx='3'/><rect x='318' y='22' width='16' height='26' rx='3'/><rect x='358' y='22' width='16' height='26' rx='3'/>
+      <rect x='78' y='412' width='16' height='26' rx='3'/><rect x='118' y='412' width='16' height='26' rx='3'/><rect x='158' y='412' width='16' height='26' rx='3'/><rect x='198' y='412' width='16' height='26' rx='3'/><rect x='238' y='412' width='16' height='26' rx='3'/><rect x='278' y='412' width='16' height='26' rx='3'/><rect x='318' y='412' width='16' height='26' rx='3'/><rect x='358' y='412' width='16' height='26' rx='3'/>
+      <rect x='22' y='78' width='26' height='16' rx='3'/><rect x='22' y='118' width='26' height='16' rx='3'/><rect x='22' y='158' width='26' height='16' rx='3'/><rect x='22' y='198' width='26' height='16' rx='3'/><rect x='22' y='238' width='26' height='16' rx='3'/><rect x='22' y='278' width='26' height='16' rx='3'/><rect x='22' y='318' width='26' height='16' rx='3'/><rect x='22' y='358' width='26' height='16' rx='3'/>
+      <rect x='412' y='78' width='26' height='16' rx='3'/><rect x='412' y='118' width='26' height='16' rx='3'/><rect x='412' y='158' width='26' height='16' rx='3'/><rect x='412' y='198' width='26' height='16' rx='3'/><rect x='412' y='238' width='26' height='16' rx='3'/><rect x='412' y='278' width='26' height='16' rx='3'/><rect x='412' y='318' width='26' height='16' rx='3'/><rect x='412' y='358' width='26' height='16' rx='3'/>
+    </g>
+    <rect x="44" y="44" width="372" height="372" rx="34" fill="url(#body)"/>
+    <rect x="45.5" y="45.5" width="369" height="369" rx="33" fill="none" stroke="url(#bodyEdge)" stroke-width="3"/>
+    <rect x="66" y="66" width="328" height="328" rx="22" fill="url(#die)" stroke="#000000" stroke-opacity="0.45" stroke-width="3"/>
+  </g>
+  <g transform="translate(230,378) scale(0.86) translate(-205,-360)">
+    <use xlink:href="#fl" fill="#ff5a1f" opacity="0.55" filter="url(#soft)"/>
+    <use xlink:href="#fl" fill="#cf2a1e"/>
+    <use xlink:href="#fl" fill="#f0612a" transform="translate(200,360) scale(0.72) translate(-200,-360)"/>
+    <use xlink:href="#fl" fill="#f9a72b" transform="translate(203,360) scale(0.46) translate(-200,-360)"/>
+    <use xlink:href="#fl" fill="#ffe08a" transform="translate(205,360) scale(0.22) translate(-200,-360)"/>
+  </g>
+  <path d="M66 88 Q66 66 88 66 L372 66 Q394 66 394 88 L394 170 Q230 205 66 186 Z" fill="url(#gloss)"/>
+</svg>
+  <!-- the monitor's badge: a minute of readings -->
+  <g transform="translate(318,318)">
+    <rect x="0" y="0" width="176" height="150" rx="26" fill="#f4f6f9" stroke="#1d1a1b" stroke-opacity="0.55" stroke-width="5"/>
+    <rect x="14" y="16" width="148" height="118" rx="12" fill="#ffffff"/>
+    <path d="M22 108 L46 98 L64 104 L84 66 L102 82 L120 46 L140 60 L154 40" fill="none" stroke="#e2551f" stroke-width="11" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="M22 108 L46 98 L64 104 L84 66 L102 82 L120 46 L140 60 L154 40 L154 126 L22 126 Z" fill="#e2551f" fill-opacity="0.18"/>
+  </g>
+</svg>

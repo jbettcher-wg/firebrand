@@ -53,7 +53,11 @@ bool FirebrandProbeDevice(IOService *provider);
 bool FirebrandFramebufferWanted(IOService *personality);
 /* the registry view of a personality without its microcode; false: not handled */
 bool FirebrandSerializeWithoutFirmware(const IOService *service, OSSerialize *s, bool *ok);
-/* a control client on `owner` (Firebrand or FirebrandFramebuffer) */
+/*
+ * a control client on `owner` (Firebrand or FirebrandFramebuffer): type
+ * FRB_UC_TYPE ('frb1', administrators only, every method) or
+ * FRB_UC_TYPE_STATUS ('frbs', any user, FRB_UC_STATUS alone)
+ */
 IOReturn FirebrandNewControlClient(IOService *owner, task_t task, void *security, UInt32 type,
 				   IOUserClient **handler);
 
@@ -93,9 +97,15 @@ public:
 	IOReturn methodDpm(UInt32 op, void *out, IOByteCount *outSize);
 	IOReturn methodLut(void *out, IOByteCount *outSize);
 	IOReturn methodAudio(UInt32 op, UInt32 arg, SInt32 *result, SInt32 *dig, SInt32 *pin, UInt32 *flags);
+	IOReturn methodConfig(UInt32 fn, UInt32 offset, UInt32 write, UInt32 value, UInt32 *out);
+	IOReturn methodSmn(UInt32 addr, UInt32 write, UInt32 value, UInt32 *out);
+	IOReturn methodFunctions(UInt32 op, UInt32 arg, SInt32 *result, UInt32 *hdr, UInt32 *id1, UInt32 *nubs);
+	IOReturn methodLutSet(UInt32 op, SInt32 *result);
+	IOReturn methodStatus(void *out, IOByteCount *outSize);
 
 private:
 	FirebrandCore *fCore;
+	bool fStatusOnly;		/* an 'frbs' client: FRB_US_STATUS (the status) and nothing else */
 };
 
 #endif

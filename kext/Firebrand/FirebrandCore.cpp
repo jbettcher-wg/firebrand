@@ -18,13 +18,27 @@
 #include <libkern/libkern.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
+#include <IOKit/pci/IOPCIBridge.h>
 
 #include "FirebrandCore.h"
 extern "C" {
 #include "frb_ring.h"
 #include "frb_pm.h"
 #include "frb_splash.h"
+#include "frb_bo.h"
+#include "frb_uvd.h"
+#include "frb_mode.h"
 }
+#include <mach/kmod.h>
+#ifdef FRB_HAVE_BUILD_H
+#include "frb_build.h"	/* FRB_BUILD_ID: the source the build came from, when the build writes it */
+#endif
+#ifndef FRB_BUILD_ID
+#define FRB_BUILD_ID	""
+#endif
+
+/* kmod_info.c: the kext's version ("0.1.0") */
+extern "C" kmod_info_t kmod_info;
 
 extern "C" {
 /* osfmk/ppc/machine_routines.h; exported, but not in Kernel.framework. */
@@ -107,6 +121,11 @@ static uint32_t os_mmio_read32(void *cookie, uint32_t offset)
 static void os_mmio_write32(void *cookie, uint32_t offset, uint32_t value)
 {
 	((FirebrandCore *)cookie)->writeReg(offset, value);
+}
+
+static void os_doorbell_write64(void *cookie, uint32_t index, uint64_t value)
+{
+	((FirebrandCore *)cookie)->writeDoorbell64(index, value);
 }
 
 static uint32_t os_cfg_read32(void *cookie, uint32_t offset)
@@ -222,6 +241,56 @@ void FirebrandCore::writeReg(UInt32 offset, UInt32 value)
 	__asm__ __volatile__("sync" : : : "memory");
 	OSWriteLittleInt32(fRegs, offset, value);
 	OSSynchronizeIO();
+}
+
+/*
+ * A SOC15 doorbell (amdgpu's WDOORBELL64): the ring's packets and its WPTR
+ * writeback went out through BAR0 and the HDP was flushed before this
+ * (frb_ring.c), so a sync first orders them ahead of the doorbell. The
+ * 32-bit kernel has no 64-bit store to a device, so the value goes out as
+ * two little-endian dwords, the low one first (the lo-hi order of Linux's
+ * io-64-nonatomic-lo-hi): the engines' write pointers stay far below 4 GB,
+ * so the high dword is 0 either way. eieio keeps a later register read from
+ * passing them.
+ */
+void FirebrandCore::writeDoorbell64(UInt32 index, UInt64 value)
+{
+	if (!fDoorbells || (index + 2) * 4 > fDoorbellSize)
+		return;
+	__asm__ __volatile__("sync" : : : "memory");
+	OSWriteLittleInt32(fDoorbells, index * 4, (UInt32)value);
+	OSWriteLittleInt32(fDoorbells, index * 4 + 4, (UInt32)(value >> 32));
+	OSSynchronizeIO();
+}
+
+/*
+ * SOC15: BAR2 is the doorbell aperture (2 MB on the MI50; amdgpu_doorbell_init
+ * maps it from pci_resource_start(pdev, 2)). soc15_common_hw_init enabled it
+ * (BIF_DOORBELL_APER_EN) in stage gmc. Without it, or with FirebrandMMIOWptr,
+ * the gfx and SDMA rings take amdgpu's use_doorbell = false arm.
+ */
+bool FirebrandCore::mapDoorbells(void)
+{
+	if (fDoorbellMap)
+		return true;
+	if (fMMIOWptr) {
+		IOLog("Firebrand: doorbells off (FirebrandMMIOWptr): the rings write their WPTR registers\n");
+		return false;
+	}
+	fDoorbellMap = fDevice->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
+	if (!fDoorbellMap || fDoorbellMap->getLength() < 4096) {
+		IOLog("Firebrand: cannot map the doorbell BAR (BAR2); the rings write their WPTR registers\n");
+		if (fDoorbellMap) {
+			fDoorbellMap->release();
+			fDoorbellMap = 0;
+		}
+		return false;
+	}
+	fDoorbells = (volatile UInt8 *)fDoorbellMap->getVirtualAddress();
+	fDoorbellSize = (UInt32)fDoorbellMap->getLength();
+	fOS.doorbell_write64 = os_doorbell_write64;
+	IOLog("Firebrand: doorbells: BAR2, %lu KB\n", (unsigned long)(fDoorbellSize >> 10));
+	return true;
 }
 
 /* --- firmware from the personality ---------------------------------------- */
@@ -364,18 +433,43 @@ bool FirebrandCore::loadBios(void)
 
 /* --- BAR0 and the dummy page (needed from stage GMC on) -------------------- */
 
+#define FRB_APER_MAX	(256u << 20)	/* the CPU window into VRAM: frb_gmc_v9_0_layout's and the replays' */
+
 bool FirebrandCore::mapAperture(void)
 {
+	IODeviceMemory *bar, *window;
+	IOByteCount length;
+
 	if (fFbMap)
 		return true;
-	fFbMap = fDevice->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+	/*
+	 * The CPU window into VRAM is at most FRB_APER_MAX from BAR0's start,
+	 * whatever size the BAR has (a resizable BAR may be 16 GB on Vega 20;
+	 * the bridge publishes at most 256 MB of it today, but a 32-bit kernel
+	 * map could not take the whole of a large one anyway). Nothing the GPU
+	 * is programmed with depends on the BAR's size: offset 0 of BAR0 is
+	 * VRAM offset 0, and gmc's layout sits at the top of this window.
+	 */
+	bar = fDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+	if (!bar || !(length = bar->getLength())) {
+		IOLog("Firebrand: BAR0 has no device memory\n");
+		return false;
+	}
+	if (length > FRB_APER_MAX) {
+		window = IODeviceMemory::withSubRange(bar, 0, FRB_APER_MAX);
+		fFbMap = window ? window->map() : 0;
+		if (window)
+			window->release();
+	} else
+		fFbMap = bar->map();
 	if (!fFbMap) {
 		IOLog("Firebrand: cannot map BAR0\n");
 		return false;
 	}
 	fAdev.aper = (volatile uint8_t *)fFbMap->getVirtualAddress();
 	fAdev.aper_size = (uint32_t)fFbMap->getLength();
-	IOLog("Firebrand: BAR0 mapped, %lu MB\n", (unsigned long)(fAdev.aper_size >> 20));
+	IOLog("Firebrand: BAR0 mapped, %lu MB%s\n", (unsigned long)(fAdev.aper_size >> 20),
+	      length > FRB_APER_MAX ? " of a larger BAR (the CPU window's cap)" : "");
 	return true;
 }
 
@@ -540,7 +634,7 @@ int FirebrandCore::gttAlloc(uint32_t size, struct frb_gtt *gtt)
 	}
 	busMaster();
 	bzero(mem->getBytesNoCopy(), npages * 4096);
-	frb_gart_bind(&fAdev, first, npages, bus, FRB_PTE_GTT);
+	frb_gart_bind(&fAdev, first, npages, bus, frb_gart_gtt_flags(&fAdev));
 	IOFree(bus, npages * sizeof(uint64_t));
 	gtt->cpu = mem->getBytesNoCopy();
 	gtt->gpu_addr = frb_gart_gpu_addr(&fAdev, first);
@@ -620,7 +714,7 @@ int FirebrandCore::runStages(UInt32 stage)
  */
 void FirebrandCore::publishMemory(void)
 {
-	UInt32 memoryMB = frb_vi_get_config_memsize(&fAdev), memoryBytes, visibleMB;
+	UInt32 memoryMB = frb_funcs(&fAdev)->get_config_memsize(&fAdev), memoryBytes, visibleMB;
 	IODeviceMemory *bar = aperture();
 	UInt64 totalBytes64, barMB;
 	char model[64];
@@ -677,6 +771,7 @@ void FirebrandCore::readPcieCaps(void)
 	while (ptr && guard-- > 0) {
 		if (fDevice->configRead8(ptr) == 0x10) {	/* PCI Express */
 			lnkcap = fDevice->configRead32(ptr + 0x0c);
+			fPcieCap = ptr;
 			break;
 		}
 		ptr = fDevice->configRead8(ptr + 1) & 0xfc;
@@ -743,6 +838,26 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 	fAccelWanted = flag("FirebrandAccel", "frb_accel");
 	fDpmWanted = flag("FirebrandDPM", "frb_dpm");
 	fAudioWanted = flag("FirebrandAudio", "frb_audio");
+	fPspOnly = flag("FirebrandPSPOnly", "frb_psp_only");
+	fMMIOWptr = flag("FirebrandMMIOWptr", "frb_mmio_wptr");
+	fUVDOneInstance = flag("FirebrandUVDOneInstance", "frb_uvd_one");
+	{
+		/* FirebrandGating (default on in the personality); boot-arg frb_cg=0 turns it off, frb_cg=1 on */
+		int arg;
+
+		fGating = fOwner && fOwner->getProperty("FirebrandGating") == kOSBooleanTrue;
+		if (PE_parse_boot_arg("frb_cg", &arg))
+			fGating = arg != 0;
+	}
+	{
+		/* FirebrandGatingExclude: AMD_CG_SUPPORT_* bits to leave ungated; boot-arg frb_cg_exclude */
+		OSNumber *n = fOwner ? OSDynamicCast(OSNumber, fOwner->getProperty("FirebrandGatingExclude")) : 0;
+		int arg;
+
+		fGatingExclude = n ? n->unsigned32BitValue() : 0;
+		if (PE_parse_boot_arg("frb_cg_exclude", &arg))
+			fGatingExclude = (UInt32)arg;
+	}
 	fScanoutLimit = 0;
 
 	bzero(&fOS, sizeof(fOS));
@@ -769,7 +884,13 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 	fAdev.subsys_device = fDevice->configRead16(kIOPCIConfigSubSystemID);
 	fAdev.asic_type = frb_asic_type_of(fAdev.device);
 	fAdev.row = frb_asic_lookup(fAdev.device, fAdev.revision, fAdev.subsys_vendor, fAdev.subsys_device);
-	fAdev.num_crtc = 6;	/* DCE 11.2 (dce_v11_0 mode_info.num_crtc for Polaris) */
+	/* the family's IP blocks (si_set_ip_blocks / vi_set_ip_blocks) */
+	fAdev.funcs = frb_asic_funcs_of(fAdev.asic_type);
+	if (!fAdev.funcs) {
+		IOLog("Firebrand: %04x:%04x is no family this driver has\n", fAdev.vendor, fAdev.device);
+		goto fail;
+	}
+	fAdev.num_crtc = fAdev.funcs->num_crtc;	/* the DCE's mode_info.num_crtc */
 	fAdev.allow_unverified = fBringUp;
 	fAdev.adopt = fAdopt;
 	/* the accelerator's legacy clients take the GART start as 32 bits */
@@ -778,33 +899,69 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 	fAdev.trace_cap = FRB_TRACE_ENTRIES;
 	fAdev.want_dpm = fDpmWanted;
 	fAdev.want_audio = fAudioWanted;
+	fAdev.force_tmds = flag("FirebrandForceTMDS", "frb_force_tmds");
+	{
+		int cg = 1;
+
+		/* frb_cg=0: SI's blocks keep the gating hw_init leaves (si_sdma_stage) */
+		fAdev.no_cg = PE_parse_boot_arg("frb_cg", &cg) && !cg;
+	}
+	{
+		OSNumber *q = fOwner ? OSDynamicCast(OSNumber, fOwner->getProperty("FirebrandSIDPMQuirks")) : 0;
+		int arg;
+
+		/* SI DPM features to leave off (RadeonNI's SIDPMQuirks / rdn_sidpm_quirks) */
+		fAdev.si_dpm_quirks = q ? q->unsigned32BitValue() : 0;
+		if (PE_parse_boot_arg("frb_sidpm_quirks", &arg))
+			fAdev.si_dpm_quirks = (uint32_t)arg;
+		/* SI DPM only on request until its state switch works (docs/si-bring-up.md) */
+		fAdev.si_dpm_wanted = (fOwner && fOwner->getProperty("FirebrandSIDPM") == kOSBooleanTrue) ||
+				      (PE_parse_boot_arg("frb_sidpm", &arg) && arg);
+	}
 	fAdev.audio_pin = -1;		/* RadeonNI's pin choice until frbctl audio pin N */
+	fAdev.psp_only = fPspOnly;	/* SOC15: stage smu stops after the PSP's firmware loads */
+	fAdev.mmio_wptr = fMMIOWptr;	/* SOC15: no doorbells, the rings write their WPTR registers */
+	fAdev.uvd_one_inst = fUVDOneInstance;	/* Vega 20: stage uvd starts only the first UVD instance */
+	fAdev.want_gating = fGating;	/* SOC15: clock gating after stage sdma (amdgpu's late_init) */
+	fAdev.cg_exclude = fGatingExclude;
 	readPcieCaps();
+	findSlotPort();
+	{
+		/* the driver's version and source, for frbctl report and Firebrand Monitor (any user reads the registry) */
+		char v[96];
+
+		snprintf(v, sizeof(v), "%s%s%s", kmod_info.version, FRB_BUILD_ID[0] ? " " : "", FRB_BUILD_ID);
+		fOwner->setProperty("FirebrandVersion", v);
+	}
 
 	IOLog("Firebrand: %04x:%04x rev %02x subsystem %04x:%04x, %s, command %04x; %s\n",
 	      fAdev.vendor, fAdev.device, fAdev.revision, fAdev.subsys_vendor, fAdev.subsys_device,
 	      frb_asic_name(fAdev.asic_type), fDevice->configRead16(kIOPCIConfigCommand),
 	      fAdev.row ? fAdev.row->board : "no row in the family table: survey only");
 
-	/* amdgpu_device_init: the register BAR is 5 on VI (256 KB) */
+	/* amdgpu_device_init: the register BAR is 5 from Bonaire on (CIK, VI: 256 KB; Vega 20: 512 KB), 2 on SI */
 	fDevice->setMemoryEnable(true);
-	fRegMap = fDevice->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5);
+	fRegMap = fDevice->mapDeviceMemoryWithRegister((UInt8)fAdev.funcs->rmmio_bar);
 	if (!fRegMap) {
-		IOLog("Firebrand: cannot map the register BAR (BAR5)\n");
+		IOLog("Firebrand: cannot map the register BAR (BAR%lu)\n",
+		      (unsigned long)((fAdev.funcs->rmmio_bar - 0x10) / 4));
 		goto fail;
 	}
 	fRegs = (volatile UInt8 *)fRegMap->getVirtualAddress();
 	fAdev.rmmio_size = (uint32_t)fRegMap->getLength();
-	IOLog("Firebrand: registers: BAR5, %lu KB\n", (unsigned long)(fAdev.rmmio_size >> 10));
+	IOLog("Firebrand: registers: BAR%lu, %lu KB (%s)\n", (unsigned long)((fAdev.funcs->rmmio_bar - 0x10) / 4),
+	      (unsigned long)(fAdev.rmmio_size >> 10), fAdev.funcs->name);
 
 	if (!loadBios()) {
 		IOLog("Firebrand: no usable VBIOS; nothing done\n");
 		goto fail;
 	}
+	if (frb_is_soc15(&fAdev))
+		mapDoorbells();		/* the gfx and SDMA rings' WPTRs (stages gfx, sdma) */
 
 	/* the survey: reads only */
-	frb_vi_common_early_init(&fAdev);
-	frb_atombios_survey(&fAdev);
+	fAdev.funcs->early_init(&fAdev);
+	frb_device_survey(&fAdev);	/* atomfirmware (SOC15) or atombios tables */
 	fAdev.stage_done = FRB_STAGE_SURVEY;
 	fOwner->setProperty("FirebrandASIC", frb_asic_name(fAdev.asic_type));
 	if (fAdev.row)
@@ -836,6 +993,9 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 				IOLog("Firebrand: FirebrandDisplay: no monitor found\n");
 		}
 		IOLockUnlock(fLock);
+		/* outside the lock: the bridge publishes a nub and its driver starts */
+		if (fAdev.stage_done >= FRB_STAGE_DCE)
+			audioFunction();
 	}
 	IOLog("Firebrand: ready (stage %s); frbctl talks to it\n", frb_stage_name(fAdev.stage_done));
 	return true;
@@ -847,6 +1007,12 @@ fail:
 
 void FirebrandCore::stop(void)
 {
+	if (fLock) {
+		/* the status call answers with the identity only from here on */
+		IOLockLock(fLock);
+		fStopped = true;
+		IOLockUnlock(fLock);
+	}
 	if (fRegs) {
 		/* the engines first: nothing may fetch from the driver's memory after this */
 		IOLockLock(fLock);
@@ -864,6 +1030,12 @@ void FirebrandCore::stop(void)
 		fFbMap->release();
 		fFbMap = 0;
 		fAdev.aper = 0;
+	}
+	if (fDoorbellMap) {
+		fOS.doorbell_write64 = 0;
+		fDoorbellMap->release();
+		fDoorbellMap = 0;
+		fDoorbells = 0;
 	}
 	if (fRegMap) {
 		fRegMap->release();
@@ -891,8 +1063,14 @@ void FirebrandCore::free(void)
 		fLogMem->release();
 	if (fFirmware)
 		fFirmware->release();
+	if (fLutSaved)
+		IOFree(fLutSaved, 3 * 256 * sizeof(uint16_t));
+	fLutSaved = 0;
 	if (fLock)
 		IOLockFree(fLock);
+	if (fSlotPort)
+		fSlotPort->release();
+	fSlotPort = 0;
 	fTraceMem = 0;
 	fLogMem = 0;
 	fFirmware = 0;
@@ -952,6 +1130,174 @@ IOReturn FirebrandCore::ucRegRead(UInt32 reg, UInt32 *value)
 		return kIOReturnBadArgument;
 	IOLockLock(fLock);
 	*value = frb_rreg(&fAdev, reg);
+	IOLockUnlock(fLock);
+	return kIOReturnSuccess;
+}
+
+/*
+ * FRB_QUIRK_AUDIO_FN_STRAP (frb_device.h): a card whose HD Audio function is
+ * strapped on but hidden by the BIF's audio pin strap. The strap is card
+ * knowledge, so it is set here; finding the new function and giving it a
+ * nub is the PCI bridge's job, asked for by name through
+ * callPlatformFunction("PCIScanFunctions", device, flags 0: no reset) so the
+ * call is harmless on a bridge that does not know it (kIOReturnUnsupported).
+ * Off with FirebrandAudioFunction false or boot-arg frb_audiofn=0. Called
+ * once the stages have run: the audio driver that attaches to the new
+ * function finds a posted card with its display engine up.
+ */
+#define FRB_PCI_SCAN_FUNCTIONS	"PCIScanFunctions"
+#define FRB_PCI_SCAN_RESET_LINK	1u	/* a link reset first; the quirk does not use it (frbctl fn scan 1 can) */
+
+void FirebrandCore::audioFunction(void)
+{
+	IOPCIAddressSpace sp;
+	UInt32 hdr_before, hdr_after, id1, newNubs = 0;
+	IOReturn ret;
+	bool on;
+	int arg, r;
+
+	if (!fAdev.row || !(fAdev.row->quirks & FRB_QUIRK_AUDIO_FN_STRAP) || !frb_is_soc15(&fAdev))
+		return;
+	on = fOwner->getProperty("FirebrandAudioFunction") != kOSBooleanFalse;
+	if (PE_parse_boot_arg("frb_audiofn", &arg))
+		on = arg != 0;
+	sp = fDevice->space;
+	sp.s.functionNum = 1;
+	hdr_before = fDevice->configRead32(kIOPCIConfigCacheLineSize);
+	IOLockLock(fLock);
+	r = frb_soc15_audio_function_strap(&fAdev, on);
+	IOLockUnlock(fLock);
+	hdr_after = fDevice->configRead32(kIOPCIConfigCacheLineSize);
+	id1 = fDevice->configRead32(sp, kIOPCIConfigVendorID);
+	IOLog("Firebrand: audio function (quirk %s): strap %s; header type %02x -> %02x; function 1 reads %08x\n",
+	      on ? "on" : "off (FirebrandAudioFunction / frb_audiofn)",
+	      r == FRB_AUDIOFN_NONE ? "not an HD Audio function, left alone" :
+	      r == FRB_AUDIOFN_ALREADY ? "STRAP_AUD_PIN already on" :
+	      r == FRB_AUDIOFN_LEFT ? "STRAP_AUD_PIN 0 (no audio function), left so" :
+	      r == FRB_AUDIOFN_WRITTEN ? "STRAP_AUD_PIN set" : "STRAP_AUD_PIN did NOT read back",
+	      (unsigned)((hdr_before >> 16) & 0xff), (unsigned)((hdr_after >> 16) & 0xff), (unsigned)id1);
+	if (!on || (r != FRB_AUDIOFN_WRITTEN && r != FRB_AUDIOFN_ALREADY))
+		return;
+	if (!(hdr_after & 0x00800000) || id1 == 0xffffffff) {
+		IOLog("Firebrand: audio function: the strap is on but function 1 did not appear; nothing asked of "
+		      "the bridge\n");
+		return;
+	}
+	/* a function the bridge already published (a second start) gets no second nub */
+	ret = scanFunctions(0, &newNubs);
+	IOLog("Firebrand: audio function: the bridge asked to scan %02x:%02x's functions: 0x%x%s; %u new nub(s)\n",
+	      (unsigned)sp.s.busNum, (unsigned)sp.s.deviceNum, ret,
+	      ret == kIOReturnUnsupported ? " (the bridge does not offer " FRB_PCI_SCAN_FUNCTIONS ")" : "",
+	      (unsigned)newNubs);
+}
+
+extern "C" {
+/* frb_soc15.h (its register headers are C only) */
+uint32_t frb_soc15_smn_rreg(struct frb_device *adev, uint32_t reg);
+void frb_soc15_smn_wreg(struct frb_device *adev, uint32_t reg, uint32_t v);
+void frb_soc15_survey_registers(struct frb_device *adev);
+}
+
+/* the bridge's PCIScanFunctions for this device (kIOReturnUnsupported from a bridge without it) */
+IOReturn FirebrandCore::scanFunctions(UInt32 flags, UInt32 *newNubs)
+{
+	IOService *bridge = OSDynamicCast(IOService, fDevice->getParentEntry(gIOServicePlane));
+	const OSSymbol *name;
+	IOReturn ret;
+
+	*newNubs = 0;
+	if (!bridge)
+		return kIOReturnNoDevice;
+	name = OSSymbol::withCString(FRB_PCI_SCAN_FUNCTIONS);
+	ret = bridge->callPlatformFunction(name, false, fDevice, (void *)(unsigned long)flags, newNubs, 0);
+	name->release();
+	return ret;
+}
+
+IOReturn FirebrandCore::ucSmn(UInt32 addr, UInt32 write, UInt32 value, UInt32 *out)
+{
+	if (!frb_is_soc15(&fAdev))
+		return kIOReturnUnsupported;
+	if (write && !fAllowRegWrite)
+		return kIOReturnNotPermitted;
+	IOLockLock(fLock);
+	if (write) {
+		IOLog("Firebrand: frbctl smn %08lx = %08lx\n", (unsigned long)addr, (unsigned long)value);
+		frb_soc15_smn_wreg(&fAdev, addr, value);
+	}
+	*out = frb_soc15_smn_rreg(&fAdev, addr);
+	IOLockUnlock(fLock);
+	return kIOReturnSuccess;
+}
+
+IOReturn FirebrandCore::ucFunctions(UInt32 op, UInt32 arg, SInt32 *result, UInt32 *hdr, UInt32 *id1, UInt32 *nubs)
+{
+	IOPCIAddressSpace sp = fDevice->space;
+
+	sp.s.functionNum = 1;
+	*result = 0;
+	*nubs = 0;
+	if (!frb_is_soc15(&fAdev))
+		return kIOReturnUnsupported;
+	if (op != FRB_FN_OP_STATUS && !(op == FRB_FN_OP_SCAN && !(arg & FRB_PCI_SCAN_RESET_LINK)) && !fAllowRegWrite)
+		return kIOReturnNotPermitted;
+	IOLockLock(fLock);
+	switch (op) {
+	case FRB_FN_OP_STATUS:
+		frb_soc15_survey_registers(&fAdev);
+		frb_soc15_audio_function_strap(&fAdev, 0);
+		break;
+	case FRB_FN_OP_SCAN:
+		*result = (SInt32)scanFunctions(arg, nubs);
+		break;
+	default:
+		IOLockUnlock(fLock);
+		return kIOReturnBadArgument;
+	}
+	*hdr = (fDevice->configRead32(kIOPCIConfigCacheLineSize) >> 16) & 0xff;
+	*id1 = fDevice->configRead32(sp, kIOPCIConfigVendorID);
+	IOLockUnlock(fLock);
+	return kIOReturnSuccess;
+}
+
+IOReturn FirebrandCore::ucConfig(UInt32 fn, UInt32 offset, UInt32 write, UInt32 value, UInt32 *out)
+{
+	IOPCIAddressSpace sp;
+
+	if (offset > 0xffc || (offset & 3))
+		return kIOReturnBadArgument;
+	if (offset > 0xfc)
+		return kIOReturnUnsupported;	/* IOPCIDevice's space calls take a UInt8 offset */
+	if (fn & 0x01000000) {
+		/*
+		 * 0x01BBDDFF: another device of this host bridge (the card's
+		 * switch ports, the root port), read only: the status registers
+		 * of the path to the card
+		 */
+		IOPCIBridge *bridge = OSDynamicCast(IOPCIBridge, fDevice->getProvider());
+
+		if (write || !bridge || ((fn >> 8) & 0xff) > 31 || (fn & 0xff) > 7)
+			return kIOReturnBadArgument;
+		sp = fDevice->space;
+		sp.s.busNum = (fn >> 16) & 0xff;
+		sp.s.deviceNum = (fn >> 8) & 0x1f;
+		sp.s.functionNum = fn & 7;
+		*out = bridge->configRead32(sp, (UInt8)offset);
+		return kIOReturnSuccess;
+	}
+	if (fn > 7)
+		return kIOReturnBadArgument;
+	if (write && !fAllowRegWrite)
+		return kIOReturnNotPermitted;
+	sp = fDevice->space;
+	sp.s.functionNum = fn;
+	IOLockLock(fLock);
+	if (write) {
+		IOLog("Firebrand: frbctl cfg %u %02lx = %08lx\n", (unsigned)fn, (unsigned long)offset,
+		      (unsigned long)value);
+		fDevice->configWrite32(sp, (UInt8)offset, value);
+	}
+	*out = fDevice->configRead32(sp, (UInt8)offset);
 	IOLockUnlock(fLock);
 	return kIOReturnSuccess;
 }
@@ -1094,6 +1440,29 @@ static UInt32 patternPixel(UInt32 pattern, UInt32 x, UInt32 y, UInt32 w, UInt32 
 		return y < a0 ? 0xffffff : 0;
 	case FRB_PATTERN_LEFT:
 		return x < a0 ? 0xffffff : 0;
+	case FRB_PATTERN_SMPTE: {
+		/* libdrm tests/util/pattern.c fill_smpte_rgb32, XR24 (no alpha bits) */
+		static const UInt32 top[7] = { 0xc0c0c0, 0xc0c000, 0x00c0c0, 0x00c000, 0xc000c0, 0xc00000, 0x0000c0 };
+		static const UInt32 middle[7] = { 0x0000c0, 0x131313, 0xc000c0, 0x131313, 0x00c0c0, 0x131313, 0xc0c0c0 };
+		static const UInt32 bottom[8] = { 0x00214c, 0xffffff, 0x32006a, 0x131313, 0x090909, 0x131313, 0x1d1d1d,
+						  0x131313 };
+
+		if (y < h * 6 / 9)
+			return top[x * 7 / w];
+		if (y < h * 7 / 9)
+			return middle[x * 7 / w];
+		if (x < w * 5 / 7)
+			return bottom[x * 4 / (w * 5 / 7)];
+		if (x < w * 6 / 7)
+			return bottom[(x - w * 5 / 7) * 3 / (w / 7) + 4];
+		return bottom[7];
+	}
+	case FRB_PATTERN_SMPTE_CURSOR:
+		/* ucCursor's FRB_CURSOR_OP_TEST image (left half opaque, its alpha 0xff) over the bars */
+		if (x >= a0 && x < a0 + FRB_CURSOR_MAX / 2 && y >= a1 && y < a1 + FRB_CURSOR_MAX)
+			return ((((x - a0) * 4) & 0xff) << 16) | ((((y - a1) * 2) & 0xff) << 8) |
+			       ((((x - a0) + (y - a1)) * 3) & 0xff);
+		return patternPixel(FRB_PATTERN_SMPTE, x, y, w, h, 0, 0);
 	default:
 		return 0;
 	}
@@ -1230,6 +1599,8 @@ IOReturn FirebrandCore::ucDisplayInfo(struct frb_user_display *out)
 		out->num_crtc = d->num_crtc;
 		out->default_dispclk = d->default_dispclk;
 		out->dp_extclk = d->dp_extclk;
+		if (frb_is_soc15(&fAdev))	/* DCE 12: DISPCLK as the VBIOS last set it */
+			out->default_dispclk = d->dce12.dispclk_khz / 10;
 		for (i = 0; i < d->num_connectors && i < 6; i++) {
 			struct frb_connector *s = &d->conn[i];
 			struct frb_user_connector *u = &out->conn[i];
@@ -1243,8 +1614,9 @@ IOReturn FirebrandCore::ucDisplayInfo(struct frb_user_display *out)
 			u->linkb = s->linkb;
 			u->i2c_id = s->i2c_id;
 			u->hpd = s->hpd;
-			u->dig_encoder = (int8_t)s->dig_encoder;
-			u->sense = frb_dce_v11_0_hpd_sense(&fAdev, s->hpd);
+			/* DCE 12: the link's DIG is its transmitter's (DC's link_enc_hw_inst = stream encoder) */
+			u->dig_encoder = (int8_t)(frb_is_soc15(&fAdev) && c->conn == s ? s->transmitter : s->dig_encoder);
+			u->sense = frb_display_hpd_sense(&fAdev, s);
 			u->dp_sink_type = s->dp_sink_type;
 			bcopy(s->dpcd, u->dpcd, sizeof(u->dpcd));
 			u->dp_clock = s->dp_clock;
@@ -1272,14 +1644,27 @@ IOReturn FirebrandCore::ucDisplayInfo(struct frb_user_display *out)
 		}
 		out->audio_dig = d->afmt.enabled ? d->afmt.active_dig : -1;
 		out->audio_ep = d->afmt.active_pin >= 0 ? d->afmt.active_pin : 0;
-		/* that codec pin's HOT_PLUG_CONTROL, CHANNEL_SPEAKER (AZF0ENDPOINTn index/data, 4 apart) */
-		frb_wreg(&fAdev, 0x17a8 + 4 * out->audio_ep, 0x54);
-		out->audio_hot_plug = frb_rreg(&fAdev, 0x17a9 + 4 * out->audio_ep);
-		frb_wreg(&fAdev, 0x17a8 + 4 * out->audio_ep, 0x25);
-		out->audio_speakers = frb_rreg(&fAdev, 0x17a9 + 4 * out->audio_ep);
+		if (frb_is_soc15(&fAdev)) {
+			frb_dce_v12_0_readout(&fAdev, out->audio_ep, &out->crtc_control,
+					      &out->crtc_status_frame_count, &out->audio_hot_plug,
+					      &out->audio_speakers);
+			goto done;
+		}
+		/*
+		 * that codec pin's HOT_PLUG_CONTROL, CHANNEL_SPEAKER (AZF0ENDPOINTn
+		 * index/data, 4 apart): DCE 11.2's pair, so only where its audio
+		 * block is the one ported (DCE 6 has the pair at 0x1780)
+		 */
+		if (frb_funcs(&fAdev)->display && frb_funcs(&fAdev)->display->audio_regs == &frb_audio_regs_dce11) {
+			frb_wreg(&fAdev, 0x17a8 + 4 * out->audio_ep, 0x54);
+			out->audio_hot_plug = frb_rreg(&fAdev, 0x17a9 + 4 * out->audio_ep);
+			frb_wreg(&fAdev, 0x17a8 + 4 * out->audio_ep, 0x25);
+			out->audio_speakers = frb_rreg(&fAdev, 0x17a9 + 4 * out->audio_ep);
+		}
 		out->crtc_control = frb_rreg(&fAdev, 0x1b9c + c->crtc_offset);	/* mmCRTC_CONTROL */
 		out->crtc_status_frame_count = frb_rreg(&fAdev, 0x1ba6 + c->crtc_offset);	/* mmCRTC_STATUS_FRAME_COUNT */
 	}
+done:
 	IOLockUnlock(fLock);
 	return kIOReturnSuccess;
 }
@@ -1296,7 +1681,7 @@ IOReturn FirebrandCore::ucAudio(UInt32 op, SInt32 arg, SInt32 *result, SInt32 *d
 
 	IOLockLock(fLock);
 	d = display();
-	if (!d || !fAdev.want_audio) {
+	if (!d || !fAdev.want_audio || frb_is_soc15(&fAdev)) {	/* DCE 12: DP audio not ported (frb_dce_audio.c is DCE 11's) */
 		r = -ENODEV;
 	} else {
 		switch (op) {
@@ -1397,26 +1782,26 @@ IOReturn FirebrandCore::ucDisplayFill(UInt32 pattern, UInt32 arg0, UInt32 arg1, 
 }
 
 /*
- * The cursor surface: FRB_CURSOR_MAX pixels a row (the plane's pitch on DCE
- * 10/11, whatever CUR_SIZE says: RadeonNI rdn_cursor.c, DCE8 on), the
- * image top left, the rest transparent; little-endian words, as the
- * display reads them. Then HDP flushed and the plane pointed at it, the
- * whole FRB_CURSOR_MAX square shown (amdgpu's 128x128 cursor bo).
+ * The cursor surface: the DCE's cursor_max pixels a row (the plane's pitch,
+ * whatever CUR_SIZE says: 128 on DCE 8-11, RadeonNI rdn_cursor.c; 64 on
+ * DCE 6), the image top left, the rest transparent; little-endian words, as
+ * the display reads them. Then HDP flushed and the plane pointed at it, the
+ * whole square shown (amdgpu's 128x128 cursor bo; 64x64 on DCE 6).
  */
 int FirebrandCore::loadCursorLocked(UInt32 offset, const UInt32 *argb, UInt32 w, UInt32 h)
 {
 	struct frb_display *d = display();
-	UInt32 x, y;
+	UInt32 x, y, m = frb_display_cursor_max(&fAdev);
 
-	if (!d || !fAdev.aper || w > FRB_CURSOR_MAX || h > FRB_CURSOR_MAX ||
+	if (!d || !fAdev.aper || w > m || h > m ||
 	    !frb_vram_ok(&fAdev, offset, kCursorBytes) || offset + kCursorBytes > fAdev.layout.reserved_start)
 		return -EINVAL;
-	for (y = 0; y < FRB_CURSOR_MAX; y++)
-		for (x = 0; x < FRB_CURSOR_MAX; x++)
-			frb_vram_write32(&fAdev, offset + 4 * (y * FRB_CURSOR_MAX + x),
+	for (y = 0; y < m; y++)
+		for (x = 0; x < m; x++)
+			frb_vram_write32(&fAdev, offset + 4 * (y * m + x),
 					 x < w && y < h ? argb[y * w + x] : 0);
 	frb_flush_hdp(&fAdev);
-	return frb_display_cursor_set(&fAdev, d, offset, FRB_CURSOR_MAX, FRB_CURSOR_MAX);
+	return frb_display_cursor_set(&fAdev, d, offset, m, m);
 }
 
 /*
@@ -1427,7 +1812,7 @@ int FirebrandCore::loadCursorLocked(UInt32 offset, const UInt32 *argb, UInt32 w,
 IOReturn FirebrandCore::ucCursor(UInt32 op, SInt32 x, SInt32 y, SInt32 *result)
 {
 	struct frb_display *d;
-	UInt32 *img, i, j;
+	UInt32 *img, i, j, m = frb_display_cursor_max(&fAdev);
 
 	IOLockLock(fLock);
 	d = display();
@@ -1438,13 +1823,13 @@ IOReturn FirebrandCore::ucCursor(UInt32 op, SInt32 x, SInt32 y, SInt32 *result)
 		if (!img) {
 			*result = -ENOMEM;
 		} else {
-			for (j = 0; j < FRB_CURSOR_MAX; j++)
-				for (i = 0; i < FRB_CURSOR_MAX; i++)
-					img[j * FRB_CURSOR_MAX + i] = i < FRB_CURSOR_MAX / 2 ?
+			for (j = 0; j < m; j++)
+				for (i = 0; i < m; i++)
+					img[j * m + i] = i < m / 2 ?
 						0xff000000u | ((i * 4) & 0xff) << 16 | ((j * 2) & 0xff) << 8 |
 						(((i + j) * 3) & 0xff) : 0;
 			*result = loadCursorLocked(cursorOffset(d->crtc.fb_pitch * 4 * d->crtc.fb_height), img,
-						   FRB_CURSOR_MAX, FRB_CURSOR_MAX);
+						   m, m);
 			if (!*result)
 				*result = frb_display_cursor_move(&fAdev, d, x, y, 1);
 			IOFree(img, kCursorBytes);
@@ -1454,11 +1839,11 @@ IOReturn FirebrandCore::ucCursor(UInt32 op, SInt32 x, SInt32 y, SInt32 *result)
 		if (!img) {
 			*result = -ENOMEM;
 		} else {
-			for (j = 0; j < FRB_CURSOR_MAX; j++)
-				for (i = 0; i < FRB_CURSOR_MAX; i++)
-					img[j * FRB_CURSOR_MAX + i] = j < (UInt32)y ? (UInt32)x : 0;
+			for (j = 0; j < m; j++)
+				for (i = 0; i < m; i++)
+					img[j * m + i] = j < (UInt32)y ? (UInt32)x : 0;
 			*result = loadCursorLocked(cursorOffset(d->crtc.fb_pitch * 4 * d->crtc.fb_height), img,
-						   FRB_CURSOR_MAX, FRB_CURSOR_MAX);
+						   m, m);
 			if (!*result)
 				*result = frb_display_cursor_move(&fAdev, d, d->crtc.cursor_x, d->crtc.cursor_y, 1);
 			IOFree(img, kCursorBytes);
@@ -1533,7 +1918,9 @@ IOReturn FirebrandCore::ucSinkCrc(UInt32 idx, SInt32 *result, UInt32 *r, UInt32 
 
 	IOLockLock(fLock);
 	d = display();
-	if (!d || idx >= (UInt32)d->num_connectors)
+	if (d && idx == FRB_PIPE_CRC)
+		*result = frb_display_pipe_crc(&fAdev, d, crc);
+	else if (!d || idx >= (UInt32)d->num_connectors)
 		*result = -ENODEV;
 	else
 		*result = frb_dp_sink_crc(&fAdev, &d->conn[idx], crc);
@@ -1572,6 +1959,50 @@ IOReturn FirebrandCore::ucLut(struct frb_user_lut *out)
 	return kIOReturnSuccess;
 }
 
+/*
+ * frbctl lut linear|restore: the sink CRC of a known frame (frbctl fill)
+ * needs the pipe's identity, which the window server's ColorSync ramp is not.
+ * linear keeps the ramp it replaces; restore puts it back. Administrator only
+ * (the control client is).
+ */
+IOReturn FirebrandCore::ucLutSet(UInt32 op, SInt32 *result)
+{
+	struct frb_display *d;
+	uint16_t ramp[256];
+	UInt32 i;
+
+	IOLockLock(fLock);
+	d = display();
+	if (!d) {
+		*result = -ENODEV;
+	} else if (op == FRB_LUT_OP_LINEAR) {
+		if (!fLutSaved)
+			fLutSaved = (uint16_t *)IOMalloc(sizeof(d->crtc.gamma));
+		if (!fLutSaved) {
+			*result = -ENOMEM;
+		} else {
+			memcpy(fLutSaved, d->crtc.gamma, sizeof(d->crtc.gamma));
+			for (i = 0; i < 256; i++)
+				ramp[i] = (uint16_t)(i << 8);
+			frb_display_set_gamma(&fAdev, d, ramp, ramp, ramp);
+			*result = 0;
+		}
+	} else if (op == FRB_LUT_OP_RESTORE) {
+		if (!fLutSaved) {
+			*result = -ENOENT;
+		} else {
+			frb_display_set_gamma(&fAdev, d, fLutSaved, fLutSaved + 256, fLutSaved + 512);
+			IOFree(fLutSaved, sizeof(d->crtc.gamma));
+			fLutSaved = 0;
+			*result = 0;
+		}
+	} else {
+		*result = -EINVAL;
+	}
+	IOLockUnlock(fLock);
+	return kIOReturnSuccess;
+}
+
 IOReturn FirebrandCore::ucDpm(UInt32 op, struct frb_user_dpm *out)
 {
 	struct frb_pm_status st;
@@ -1579,10 +2010,49 @@ IOReturn FirebrandCore::ucDpm(UInt32 op, struct frb_user_dpm *out)
 	uint32_t i;
 
 	bzero(out, sizeof(*out));
+	bzero(&st, sizeof(st));
 	IOLockLock(fLock);
 	/* a change is traced (frbctl trace dump); a status read keeps the last trace */
+	/* frbctl dpm on N: SI's DPM switches (RDN_SI_DPM_*, FRB_SI_DPM_*) for this try, above the op */
+	if ((op & 0xff) == FRB_DPM_OP_ENABLE && (op >> 8)) {
+		fAdev.si_dpm_quirks = op >> 8;
+		op &= 0xff;
+	}
 	if (op != FRB_DPM_OP_STATUS)
 		frb_trace_start(&fAdev);
+	if (frb_is_soc15(&fAdev)) {
+		/*
+		 * Vega 20: the SMU11 readout; clock gating on and off live
+		 * (amdgpu's set_clockgating_state gate/ungate); forcing levels
+		 * and the DPM init by hand are not ported (DPM runs in stage smu)
+		 */
+		switch (op) {
+		case FRB_DPM_OP_STATUS:
+			break;
+		case FRB_DPM_OP_GATE_ON:
+			r = frb_soc15_set_cg_state(&fAdev, 1);
+			if (!r)
+				IOLog("Firebrand: clock gating on (frbctl dpm gating on)\n");
+			break;
+		case FRB_DPM_OP_GATE_OFF:
+			r = frb_soc15_set_cg_state(&fAdev, 0);
+			if (!r)
+				IOLog("Firebrand: clock gating off (frbctl dpm gating off)\n");
+			break;
+		case FRB_DPM_OP_FCLK_LOW:
+		case FRB_DPM_OP_FCLK_TOP:
+			r = frb_vega20_set_fclk_soft_min(&fAdev, op == FRB_DPM_OP_FCLK_TOP);
+			break;
+		default:
+			r = -ENOSYS;
+			break;
+		}
+		if (op != FRB_DPM_OP_STATUS)
+			frb_trace_stop(&fAdev);
+		frb_vega20_get_status(&fAdev, &st);
+		IOLockUnlock(fLock);
+		goto fill;
+	}
 	switch (op) {
 	case FRB_DPM_OP_STATUS:
 		break;
@@ -1602,6 +2072,7 @@ IOReturn FirebrandCore::ucDpm(UInt32 op, struct frb_user_dpm *out)
 			r = -EPERM;
 		else {
 			fAdev.dpm_failed = 0;
+			fAdev.si_dpm_wanted = 1;	/* frbctl dpm on is the request SI's opt-in waits for */
 			r = frb_pm_hw_init(&fAdev);
 			fAdev.dpm_failed = r;
 			/* as at load: the watermarks and powerplay's display configuration */
@@ -1614,6 +2085,10 @@ IOReturn FirebrandCore::ucDpm(UInt32 op, struct frb_user_dpm *out)
 		/* the watermarks back to the boot clocks */
 		frb_display_dpm_changed(&fAdev);
 		break;
+	case FRB_DPM_OP_GATE_ON:
+	case FRB_DPM_OP_GATE_OFF:
+		r = -ENOSYS;	/* VI's clock gating is not ported */
+		break;
 	default:
 		r = -EINVAL;
 		break;
@@ -1623,7 +2098,8 @@ IOReturn FirebrandCore::ucDpm(UInt32 op, struct frb_user_dpm *out)
 	frb_pm_get_status(&fAdev, &st);
 	IOLockUnlock(fLock);
 
-	out->version = 1;
+fill:
+	out->version = 2;
 	out->result = r;
 	out->enabled = st.enabled;
 	out->failed = fAdev.dpm_failed;
@@ -1655,6 +2131,24 @@ IOReturn FirebrandCore::ucDpm(UInt32 op, struct frb_user_dpm *out)
 	out->num_display = st.num_display;
 	out->vrefresh = st.vrefresh;
 	out->min_vblank_time = st.min_vblank_time;
+	out->soc15 = frb_is_soc15(&fAdev) ? 1 : 0;
+	out->cur_socclk = st.cur_socclk;
+	out->cur_fclk = st.cur_fclk;
+	out->temp_edge = st.temp_edge;
+	out->temp_hotspot = st.temp_hotspot;
+	out->temp_hbm = st.temp_hbm;
+	out->gfx_count = st.gfx_count;
+	out->uclk_count = st.uclk_count;
+	out->soc_count = st.soc_count;
+	for (i = 0; i < 16; i++) {
+		out->gfx_levels[i] = st.gfx_levels[i];
+		out->uclk_levels[i] = st.uclk_levels[i];
+		out->soc_levels[i] = st.soc_levels[i];
+	}
+	out->smu_version = st.smu_version;
+	out->gating = st.gating;
+	out->cg_flags_lo = (uint32_t)st.cg_flags;
+	out->cg_flags_hi = (uint32_t)(st.cg_flags >> 32);
 	return kIOReturnSuccess;
 }
 
@@ -1723,3 +2217,356 @@ IOMemoryDescriptor *FirebrandCore::ucMemory(UInt32 type)
 	}
 }
 
+
+/* --- the status call (FRB_UC_STATUS): what a monitor shows ------------------ */
+
+/* the PCI Express capability of d, 0 none */
+static UInt8 pcieCapOf(IOPCIDevice *d)
+{
+	UInt8 ptr;
+	int guard = 48;
+
+	if (!(d->configRead16(kIOPCIConfigStatus) & 0x0010))
+		return 0;
+	ptr = d->configRead8(0x34) & 0xfc;
+	while (ptr && guard-- > 0) {
+		if (d->configRead8(ptr) == 0x10)
+			return ptr;
+		ptr = d->configRead8(ptr + 1) & 0xfc;
+	}
+	return 0;
+}
+
+/* an AMD PCI-to-PCI bridge whose PCIe capability says Upstream Port (PCI_EXP_TYPE_UPSTREAM, 5) */
+static bool amdUpstreamPort(IOPCIDevice *d, UInt8 *cap)
+{
+	UInt8 c;
+
+	if (d->configRead16(kIOPCIConfigVendorID) != 0x1002 ||
+	    (d->configRead32(kIOPCIConfigRevisionID) >> 8) != 0x060400)
+		return false;
+	c = pcieCapOf(d);
+	if (!c || ((d->configRead16(c + 2) >> 4) & 0xf) != 5)
+		return false;
+	*cap = c;
+	return true;
+}
+
+/*
+ * The PCIe link the card reaches the host through. Vega 10 and 20 carry a
+ * switch in the package (upstream port 1002:14a0, downstream 14a1): the GPU
+ * function's own Link Status is the switch's internal link (16 GT/s x16 on
+ * the MI50 whatever the slot), and the slot's is the upstream port's, where
+ * lspci reads it. QorIQPCIBridge publishes the switch's ports as IOPCIDevice
+ * siblings of the GPU; a stock IOPCIFamily has them as its ancestors, behind
+ * IOPCI2PCIBridge. Either way: an AMD upstream port on a lower bus than the
+ * GPU's, the nearest one. None (Polaris, SI): the GPU's own link is the slot's.
+ */
+void FirebrandCore::findSlotPort(void)
+{
+	IORegistryEntry *e, *parent = fDevice->getParentEntry(gIOServicePlane);
+	IOPCIDevice *d, *best = 0;
+	OSIterator *it;
+	UInt8 bus = fDevice->getBusNumber(), cap, bestCap = 0;
+
+	for (e = parent; e; e = e->getParentEntry(gIOServicePlane)) {
+		d = OSDynamicCast(IOPCIDevice, e);
+		if (d && d->getBusNumber() < bus && amdUpstreamPort(d, &cap) &&
+		    (!best || d->getBusNumber() > best->getBusNumber())) {
+			best = d;
+			bestCap = cap;
+		}
+	}
+	it = parent ? parent->getChildIterator(gIOServicePlane) : 0;
+	while (it && (e = (IORegistryEntry *)it->getNextObject())) {
+		d = OSDynamicCast(IOPCIDevice, e);
+		if (d && d != fDevice && d->getBusNumber() < bus && amdUpstreamPort(d, &cap) &&
+		    (!best || d->getBusNumber() > best->getBusNumber())) {
+			best = d;
+			bestCap = cap;
+		}
+	}
+	if (it)
+		it->release();
+	if (best) {
+		best->retain();
+		fSlotPort = best;
+		fSlotCap = bestCap;
+		IOLog("Firebrand: the card's link to the host is %04x:%04x's (bus %u), an upstream port in the package\n",
+		      best->configRead16(kIOPCIConfigVendorID), best->configRead16(kIOPCIConfigDeviceID),
+		      (unsigned)best->getBusNumber());
+	}
+}
+
+/*
+ * The sensors (frb_pm_read_sensors): at most one sample every kSensorsMinMs
+ * whoever asks, so any number of monitors costs the SMU one sample per
+ * period; after a read the SMU did not acknowledge, none for kSensorsHoldMs
+ * (each unanswered message waits out the SMU's timeout with the lock held).
+ */
+void FirebrandCore::sampleSensorsLocked(void)
+{
+	UInt64 now = os_time_ms(this);
+
+	if (fSensorsAt && now - fSensorsAt < kSensorsMinMs)
+		return;
+	if (fSensorsHoldUntil && now < fSensorsHoldUntil)
+		return;
+	fSensorsResult = frb_pm_read_sensors(&fAdev, &fSensors);
+	fSensorsAt = now;
+	if (fSensorsResult && fSensorsResult != -ENODEV) {
+		fSensorsHoldUntil = now + kSensorsHoldMs;
+		IOLog("Firebrand: status: the sensor read failed (%d); the next in %u s\n", fSensorsResult,
+		      (unsigned)(kSensorsHoldMs / 1000));
+	}
+}
+
+static void statusCopy(char *dst, size_t cap, const char *src)
+{
+	strncpy(dst, src ? src : "", cap - 1);
+	dst[cap - 1] = 0;
+}
+
+/* the connectors, CRTC0's mode, DP audio: the display's own state, the hot-plug sense read now */
+void FirebrandCore::statusDisplayLocked(struct frb_user_status *out)
+{
+	struct frb_display *d = display();
+	struct frb_crtc *c;
+	int i;
+
+	if (!d)
+		return;
+	c = &d->crtc;
+	out->valid |= FRB_ST_DISPLAY;
+	out->num_connectors = d->num_connectors < 6 ? d->num_connectors : 6;
+	for (i = 0; i < (int)out->num_connectors; i++) {
+		struct frb_connector *s = &d->conn[i];
+		struct frb_user_status_conn *u = &out->conn[i];
+		struct frb_edid_audio aud;
+
+		u->type = s->connector_type;
+		u->connected = frb_display_hpd_sense(&fAdev, s) ? 1 : 0;
+		if (s->dpcd[0]) {
+			u->dp_max_rate_khz = s->dpcd[1] * 27000u;
+			u->dp_max_lanes = s->dpcd[2] & 0x1f;
+		}
+		if (s->edid_len && frb_edid_extract_audio(s->edid, s->edid_len, &aud))
+			statusCopy(u->sink, sizeof(u->sink), aud.sink_name);
+		if (c->conn != s)
+			continue;
+		u->active = 1;
+		u->width = c->mode.hdisplay;
+		u->height = c->mode.vdisplay;
+		u->pixel_khz = c->mode.clock;
+		if (c->mode.htotal && c->mode.vtotal)
+			u->refresh_chz = (UInt16)(((c->mode.clock * 1000u) / c->mode.htotal * 100u) / c->mode.vtotal);
+		u->bpc = (UInt8)(frb_is_soc15(&fAdev) ? d->dce12.bpc : c->bpc);
+		if (s->dpcd[0]) {
+			u->dp_rate_khz = s->dp_clock;
+			u->dp_lanes = (UInt8)s->dp_lane_count;
+		}
+		if (s->edid_len && frb_edid_extract_audio(s->edid, s->edid_len, &aud))
+			out->audio_sink = aud.has_audio ? 1 : 0;
+	}
+	out->valid |= FRB_ST_AUDIO;
+	if (frb_is_soc15(&fAdev)) {
+		/* DCE 12: the stream's Azalia endpoint and its DIG (the link's transmitter) */
+		out->audio_endpoint = d->dce12.audio_ep;
+		out->audio_on = d->dce12.audio_on ? 1 : 0;
+		out->audio_dig = d->dce12.audio_ep >= 0 && c->conn ? c->conn->transmitter : -1;
+	} else {
+		out->audio_endpoint = d->afmt.enabled ? d->afmt.active_pin : -1;
+		out->audio_on = d->afmt.enabled ? 1 : 0;
+		out->audio_dig = d->afmt.enabled ? d->afmt.active_dig : -1;
+	}
+}
+
+IOReturn FirebrandCore::ucStatus(struct frb_user_status *out)
+{
+	struct frb_device *adev = &fAdev;
+	const struct frb_pm_sensors *s = &fSensors;
+	UInt64 vram;
+	UInt32 i, n;
+	UInt16 v;
+
+	bzero(out, sizeof(*out));
+	out->version = FRB_STATUS_VERSION;
+	out->size = sizeof(*out);
+	IOLockLock(fLock);
+	out->vendor = adev->vendor;
+	out->device = adev->device;
+	out->subsys_vendor = adev->subsys_vendor;
+	out->subsys_device = adev->subsys_device;
+	out->revision = adev->revision;
+	out->asic_type = adev->asic_type;
+	out->family = adev->family;
+	out->stage_done = adev->stage_done;
+	out->row_max_stage = adev->row ? adev->row->max_stage : 0xff;
+	out->stage_failed = adev->stage_failed;
+	out->flags = (fBringUp ? FRB_SF_BRINGUP : 0) | (fOwner && fOwner->metaCast("FirebrandFramebuffer") ? FRB_SF_FRAMEBUFFER : 0) |
+		     (fAccelWanted ? FRB_SF_ACCEL : 0) | (fDpmWanted ? FRB_SF_DPM : 0) | (fAudioWanted ? FRB_SF_AUDIO : 0) |
+		     (fGating ? FRB_SF_GATING : 0);
+	statusCopy(out->asic, sizeof(out->asic), frb_asic_name(adev->asic_type));
+	statusCopy(out->board, sizeof(out->board), adev->row ? adev->row->board : "");
+	statusCopy(out->driver_version, sizeof(out->driver_version), kmod_info.version);
+	snprintf(out->build, sizeof(out->build), "%s%s%s", FRB_BUILD_ID, FRB_BUILD_ID[0] ? ", " : "", __DATE__);
+	vram = adev->gmc.real_vram_size ? adev->gmc.real_vram_size : adev->gmc.mc_vram_size;
+	out->vram_mb = (UInt32)(vram >> 20);
+	out->vram_visible_mb = (UInt32)((adev->aper_size && adev->aper_size < vram ? adev->aper_size : vram) >> 20);
+	out->vram_width = adev->gmc.vram_width;
+	if (fStopped || !fRegs) {
+		out->flags |= FRB_SF_STOPPED;
+		IOLockUnlock(fLock);
+		return kIOReturnSuccess;
+	}
+
+	/* power management: the switch, the init's outcome, then the sample */
+	if (!fDpmWanted)
+		out->dpm_state = FRB_DPM_STATE_OFF;
+	else if (adev->dpm_failed)
+		out->dpm_state = FRB_DPM_STATE_FAILED;
+	else if (frb_pm_dpm_running(adev))
+		out->dpm_state = FRB_DPM_STATE_ON;
+	else
+		out->dpm_state = FRB_DPM_STATE_PENDING;
+	out->dpm_failed = adev->dpm_failed;
+	sampleSensorsLocked();
+	out->sensor_age_ms = fSensorsAt ? (UInt32)(os_time_ms(this) - fSensorsAt) : 0;
+	if (s->valid & FRB_PMS_CLOCKS) {
+		out->gfx_mhz = s->gfx_mhz;
+		out->mem_mhz = s->mem_mhz;
+		out->valid |= FRB_ST_CLOCKS;
+	}
+	if (s->valid & FRB_PMS_SOC_CLOCKS) {
+		out->soc_mhz = s->soc_mhz;
+		out->fclk_mhz = s->fclk_mhz;
+		out->valid |= FRB_ST_SOC_CLOCKS;
+	}
+	if (s->valid & FRB_PMS_LEVELS) {
+		out->gfx_level_count = s->gfx_count;
+		out->mem_level_count = s->mem_count;
+		for (i = 0; i < 16; i++) {
+			out->gfx_levels[i] = (UInt16)s->gfx_levels[i];
+			out->mem_levels[i] = (UInt16)s->mem_levels[i];
+		}
+		out->valid |= FRB_ST_LEVELS;
+	}
+	if (s->valid & FRB_PMS_TEMP) {
+		out->temp_mc = s->temp_mc;
+		out->valid |= FRB_ST_TEMP;
+	}
+	if (s->valid & FRB_PMS_TEMP_HOTSPOT) {
+		out->temp_hotspot_mc = s->temp_hotspot_mc;
+		out->valid |= FRB_ST_TEMP_HOTSPOT;
+	}
+	if (s->valid & FRB_PMS_TEMP_MEM) {
+		out->temp_mem_mc = s->temp_mem_mc;
+		out->valid |= FRB_ST_TEMP_MEM;
+	}
+	if (s->valid & FRB_PMS_POWER) {
+		out->power_mw = s->power_mw;
+		out->valid |= FRB_ST_POWER;
+	}
+	if (s->valid & FRB_PMS_POWER_LIMIT) {
+		out->power_limit_w = s->power_limit_w;
+		out->valid |= FRB_ST_POWER_LIMIT;
+	}
+	if (s->valid & FRB_PMS_LOAD) {
+		out->gpu_load = s->gpu_load;
+		out->mem_load = s->mem_load;
+		out->valid |= FRB_ST_LOAD;
+	}
+	if (s->valid & FRB_PMS_VDDGFX) {
+		out->vddgfx_mv = s->vddgfx_mv;
+		out->valid |= FRB_ST_VDDGFX;
+	}
+	if (s->valid & FRB_PMS_FAN) {
+		out->fan_rpm = s->fan_rpm;
+		out->fan_pwm = s->fan_pwm;
+		out->valid |= FRB_ST_FAN;
+	}
+	if (s->valid & FRB_PMS_THROTTLE) {
+		out->throttler = s->throttler;
+		out->valid |= FRB_ST_THROTTLE;
+	}
+	if (s->valid & FRB_PMS_SMU) {
+		out->smu_version = s->smu_version;
+		out->features_kind = s->features_kind;
+		out->features_lo = (UInt32)s->features;
+		out->features_hi = (UInt32)(s->features >> 32);
+		out->valid |= FRB_ST_SMU;
+	}
+	if (frb_is_soc15(adev)) {
+		/* SOC15 clock gating (VI's is not ported: no bit, "not available") */
+		out->gating = (adev->want_gating ? 1u : 0u) | (adev->cg_gated ? 2u : 0u);
+		out->cg_flags_lo = (UInt32)adev->cg_flags;
+		out->cg_flags_hi = (UInt32)(adev->cg_flags >> 32);
+		out->valid |= FRB_ST_GATING;
+	}
+
+	/* the video decoder: the driver's bookkeeping, never UVD's registers (a gated block) */
+	out->valid |= FRB_ST_UVD;
+	if (adev->uvd && adev->stage_done >= FRB_STAGE_UVD) {
+		for (i = 0, n = 0; i < adev->uvd->num_uvd_inst && i < AMDGPU_MAX_UVD_INSTANCES; i++)
+			if (!(adev->uvd->harvest_config & (1u << i)))
+				n++;
+		out->uvd_instances = n;
+		out->uvd_state = adev->uvd->powered ? FRB_UVD_STATE_RUNNING : FRB_UVD_STATE_IDLE;
+		out->uvd_fw_version = adev->uvd->fw_version;
+		out->uvd_sessions = fVideoSessions;
+		out->uvd_flags = fVideoPoisoned ? FRB_UVD_FLAG_POISONED : 0;
+	}
+
+	/* PCIe: Link Status / Link Capabilities from configuration space, read now */
+	if (fPcieCap) {
+		UInt32 cap = fDevice->configRead32(fPcieCap + 0x0c);
+
+		v = fDevice->configRead16(fPcieCap + 0x12);
+		if (v != 0xffff) {
+			out->link_speed = v & 0xf;
+			out->link_width = (v >> 4) & 0x3f;
+			out->link_max_speed = cap & 0xf;
+			out->link_max_width = (cap >> 4) & 0x3f;
+			out->valid |= FRB_ST_LINK;
+		}
+	}
+	if (fSlotPort && fSlotCap) {
+		UInt32 cap = fSlotPort->configRead32(fSlotCap + 0x0c);
+
+		v = fSlotPort->configRead16(fSlotCap + 0x12);
+		if (v != 0xffff) {
+			out->slot_speed = v & 0xf;
+			out->slot_width = (v >> 4) & 0x3f;
+			out->slot_max_speed = cap & 0xf;
+			out->slot_max_width = (cap >> 4) & 0x3f;
+			out->slot_vendor = fSlotPort->configRead16(kIOPCIConfigVendorID);
+			out->slot_device = fSlotPort->configRead16(kIOPCIConfigDeviceID);
+			out->valid |= FRB_ST_SLOT_LINK;
+		}
+	} else if (out->valid & FRB_ST_LINK) {
+		out->slot_speed = out->link_speed;
+		out->slot_width = out->link_width;
+		out->slot_max_speed = out->link_max_speed;
+		out->slot_max_width = out->link_max_width;
+		out->slot_vendor = adev->vendor;
+		out->slot_device = adev->device;
+		out->valid |= FRB_ST_SLOT_LINK;
+	}
+
+	/* memory: the accelerator's heaps, the GART's pages */
+	if (fVramMgr && fVramMgr->ready) {
+		out->vram_heap_kb = (UInt32)(((fVramMgr->vis_end - fVramMgr->vis_start) +
+					      (fVramMgr->invis_end - fVramMgr->invis_start)) >> 10);
+		out->vram_heap_used_kb = (UInt32)((fVramMgr->vis_used + fVramMgr->invis_used) >> 10);
+		out->valid |= FRB_ST_VRAM_HEAP;
+	}
+	if (adev->gart.ready) {
+		out->gart_kb = adev->gart.num_gpu_pages * (AMDGPU_GPU_PAGE_SIZE >> 10);
+		out->gart_used_kb = adev->gart.used_pages * (AMDGPU_GPU_PAGE_SIZE >> 10);
+		out->valid |= FRB_ST_GART;
+	}
+
+	statusDisplayLocked(out);
+	IOLockUnlock(fLock);
+	return kIOReturnSuccess;
+}

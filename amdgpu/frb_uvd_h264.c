@@ -2,7 +2,7 @@
  * See frb_uvd_h264.h. The checks are RadeonNI's hw/rdn_uvd_h264.c
  * (valid_config, valid_picture, bitstream_size) unchanged, so a stream the
  * client library accepts is one this accepts; the message and IB are Mesa
- * 26.2.4's ac_uvd_dec.c for Polaris (uvd_build_create_cmd,
+ * 26.2.4's ac_uvd_dec.c for Polaris and Vega (uvd_build_create_cmd,
  * uvd_build_decode_cmd, build_avc_msg, ac_uvd_dec_dpb_size,
  * calc_ctx_size_avc) at struct ruvd_msg's byte offsets.
  *
@@ -42,13 +42,13 @@ enum {
 	H_FRAME_NUM_LIST = 264, H_CURR_POC = 328, H_REF_POC = 336, H_DECODED_PIC = 464
 };
 
-/* the GPCOM registers as Mesa's RUVD_* byte offsets, PACKET0 takes them as dwords */
-#define RUVD_GPCOM_VCPU_CMD	0xEF0C
-#define RUVD_GPCOM_VCPU_DATA0	0xEF10
-#define RUVD_GPCOM_VCPU_DATA1	0xEF14
-#define RUVD_ENGINE_CNTL	0xEF18
-#define RUVD_NO_OP		0xEFFC
-#define RUVD_PKT0(reg)		((uint32_t)((reg) >> 2) & 0xffff)
+/*
+ * The GPCOM registers, PACKET0 by dword: Mesa's RUVD_GPCOM_VCPU_CMD 0xEF0C,
+ * DATA0 0xEF10, DATA1 0xEF14, RUVD_ENGINE_CNTL 0xEF18, RUVD_NO_OP 0xEFFC
+ * (bytes) are reg_base 0x3800 + these; its RUVD_*_SOC15 0x2070c, 0x20710,
+ * 0x20714, 0x20718 are 0x7e00 + these.
+ */
+#define RUVD_PKT0(hw, reg)	((uint32_t)((hw)->reg_base + (reg)) & 0xffff)
 
 static void put_le32(uint8_t *out, uint32_t value)
 {
@@ -165,17 +165,21 @@ int frb_uvd_h264_valid_picture(const struct rdn_uvd_h264_config *c, const struct
  * The sizes: ac_uvd_dec_dpb_size (Polaris: 17 pictures, the macroblock
  * context and IT surface not in it), calc_ctx_size_avc (with 17
  * references, the most the session can hold), the session context, and
- * a linear target. Mesa's DPB alignment is 16 before Vega.
+ * a linear target. Mesa's DPB alignment is 16 before Vega and 32 from
+ * Vega 10 on (ac_uvd_dec_dpb_alignment), applied to the 16-aligned size.
  */
-int frb_uvd_h264_layout_init(const struct rdn_uvd_h264_config *c, struct frb_uvd_h264_layout *out)
+int frb_uvd_h264_layout_init(const struct frb_uvd_h264_hw *hw, const struct rdn_uvd_h264_config *c,
+			     struct frb_uvd_h264_layout *out)
 {
 	struct frb_uvd_h264_layout l;
 	uint64_t image, width_in_mb, height_in_mb, dpb, ctx, pitch, target, packed;
 
-	if (!out || !valid_config(c))
+	if (!out || !hw || (hw->dpb_alignment != 16 && hw->dpb_alignment != 32) || !valid_config(c))
 		return -1;
 	memset(&l, 0, sizeof(l));
-	image = align_up(c->coded_width, 16) * align_up(c->coded_height, 16);
+	l.hw = *hw;
+	image = align_up(align_up(c->coded_width, 16), hw->dpb_alignment) *
+		align_up(align_up(c->coded_height, 16), hw->dpb_alignment);
 	image += image / 2;
 	image = align_up(image, 1024);
 	width_in_mb = align_up(c->coded_width, 16) / 16;
@@ -190,7 +194,7 @@ int frb_uvd_h264_layout_init(const struct rdn_uvd_h264_config *c, struct frb_uvd
 		return -1;
 	l.width = c->coded_width;
 	l.height = c->coded_height;
-	l.db_pitch = (uint32_t)align_up(c->coded_width, 16);
+	l.db_pitch = (uint32_t)align_up(c->coded_width, hw->dpb_alignment);
 	l.image_bytes = (uint32_t)image;
 	l.dpb_bytes = (uint32_t)dpb;
 	l.ctx_bytes = (uint32_t)ctx;
@@ -277,6 +281,7 @@ int frb_uvd_h264_pack_decode(const struct rdn_uvd_h264_config *c, const struct r
 	put_le32(out + D_DT_CHROMA_TOP, l->chroma_offset);
 	/* family >= CHIP_STONEY */
 	put_le32(out + D_DT_WA_CHROMA_TOP, l->target_pitch / 2);
+	/* GFX9: dt_wa_chroma_bottom_offset is the target's swizzle mode; linear (ADDR_SW_LINEAR) is 0, as stored */
 
 	h = out + D_CODEC;
 	put_le32(h + H_PROFILE, c->profile_idc == 66 ? 0 : c->profile_idc == 77 ? 1 : 2);
@@ -322,22 +327,23 @@ void frb_uvd_h264_pack_its(const struct rdn_uvd_h264_picture *p, uint8_t *out)
 }
 
 /* send_cmd: DATA0 = low address, DATA1 = high, CMD = cmd << 1 */
-static void send_cmd(uint32_t *w, uint32_t *n, uint32_t cmd, uint64_t va)
+static void send_cmd_hw(const struct frb_uvd_h264_hw *hw, uint32_t *w, uint32_t *n, uint32_t cmd, uint64_t va)
 {
-	w[(*n)++] = RUVD_PKT0(RUVD_GPCOM_VCPU_DATA0);
+	w[(*n)++] = RUVD_PKT0(hw, FRB_UVD_H264_GPCOM_VCPU_DATA0);
 	w[(*n)++] = (uint32_t)va;
-	w[(*n)++] = RUVD_PKT0(RUVD_GPCOM_VCPU_DATA1);
+	w[(*n)++] = RUVD_PKT0(hw, FRB_UVD_H264_GPCOM_VCPU_DATA1);
 	w[(*n)++] = (uint32_t)(va >> 32);
-	w[(*n)++] = RUVD_PKT0(RUVD_GPCOM_VCPU_CMD);
+	w[(*n)++] = RUVD_PKT0(hw, FRB_UVD_H264_GPCOM_VCPU_CMD);
 	w[(*n)++] = cmd << 1;
 }
+#define send_cmd(w, n, cmd, va)	send_cmd_hw(hw, (w), (n), (cmd), (va))
 
-uint32_t frb_uvd_h264_build_ib(uint32_t type, const struct frb_uvd_h264_buffers *b,
-			       uint32_t out[FRB_UVD_H264_IB_MAX_DW])
+uint32_t frb_uvd_h264_build_ib(uint32_t type, const struct frb_uvd_h264_hw *hw,
+			       const struct frb_uvd_h264_buffers *b, uint32_t out[FRB_UVD_H264_IB_MAX_DW])
 {
 	uint32_t n = 0;
 
-	if (!b || !b->msg || (b->msg & 63) || type > RDN_UVD_H264_MSG_DESTROY)
+	if (!hw || !b || !b->msg || (b->msg & 63) || type > RDN_UVD_H264_MSG_DESTROY)
 		return 0;
 	if (type == RDN_UVD_H264_MSG_DESTROY) {
 		send_cmd(out, &n, FRB_UVD_CMD_MSG_BUFFER, b->msg);
@@ -358,11 +364,11 @@ uint32_t frb_uvd_h264_build_ib(uint32_t type, const struct frb_uvd_h264_buffers 
 		send_cmd(out, &n, FRB_UVD_CMD_FEEDBACK_BUFFER, b->feedback);
 		send_cmd(out, &n, FRB_UVD_CMD_BITSTREAM_BUFFER, b->bitstream);
 		send_cmd(out, &n, FRB_UVD_CMD_DECODING_TARGET, b->target);
-		out[n++] = RUVD_PKT0(RUVD_ENGINE_CNTL);
+		out[n++] = RUVD_PKT0(hw, FRB_UVD_H264_ENGINE_CNTL);
 		out[n++] = 1;
 	}
 	while (n & 15) {
-		out[n++] = RUVD_PKT0(RUVD_NO_OP);
+		out[n++] = RUVD_PKT0(hw, FRB_UVD_H264_NO_OP);
 		out[n++] = 0;
 	}
 	return n;

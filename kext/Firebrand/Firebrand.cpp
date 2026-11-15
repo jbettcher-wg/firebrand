@@ -77,9 +77,11 @@ IOReturn FirebrandNewControlClient(IOService *owner, task_t task, void *security
 {
 	FirebrandUserClient *client;
 
-	if (type != FRB_UC_TYPE)
+	if (type != FRB_UC_TYPE && type != FRB_UC_TYPE_STATUS)
 		return kIOReturnUnsupported;
-	if (IOUserClient::clientHasPrivilege(security, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+	/* the status client reads only; everything else is the administrator's */
+	if (type == FRB_UC_TYPE &&
+	    IOUserClient::clientHasPrivilege(security, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
 		return kIOReturnNotPrivileged;
 	client = new FirebrandUserClient;
 	if (!client)
@@ -177,6 +179,7 @@ OSDefineMetaClassAndStructors(FirebrandUserClient, IOUserClient)
 
 bool FirebrandUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
 {
+	fStatusOnly = type != FRB_UC_TYPE;
 	return super::initWithTask(owningTask, securityID, type);
 }
 
@@ -227,8 +230,20 @@ IOExternalMethod *FirebrandUserClient::getTargetAndMethodForIndex(IOService **ta
 		{ 0, (IOMethod)&FirebrandUserClient::methodDpm, kIOUCScalarIStructO, 1, sizeof(struct frb_user_dpm) },
 		{ 0, (IOMethod)&FirebrandUserClient::methodLut, kIOUCScalarIStructO, 0, sizeof(struct frb_user_lut) },
 		{ 0, (IOMethod)&FirebrandUserClient::methodAudio, kIOUCScalarIScalarO, 2, 4 },
+		{ 0, (IOMethod)&FirebrandUserClient::methodConfig, kIOUCScalarIScalarO, 4, 1 },
+		{ 0, (IOMethod)&FirebrandUserClient::methodSmn, kIOUCScalarIScalarO, 3, 1 },
+		{ 0, (IOMethod)&FirebrandUserClient::methodFunctions, kIOUCScalarIScalarO, 2, 4 },
+		{ 0, (IOMethod)&FirebrandUserClient::methodLutSet, kIOUCScalarIScalarO, 1, 1 },
+		/* variable: a client built against an older (shorter) frb_user_status gets its prefix */
+		{ 0, (IOMethod)&FirebrandUserClient::methodStatus, kIOUCScalarIStructO, 0, kIOUCVariableStructureSize },
 	};
 
+	/* an 'frbs' client: its own numbers (FRB_US_*), only the status */
+	if (fStatusOnly) {
+		if (index != FRB_US_STATUS)
+			return 0;
+		index = FRB_UC_STATUS;
+	}
 	if (index >= FRB_UC_METHOD_COUNT)
 		return 0;
 	*target = this;
@@ -238,8 +253,10 @@ IOExternalMethod *FirebrandUserClient::getTargetAndMethodForIndex(IOService **ta
 IOReturn FirebrandUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
 						  IOMemoryDescriptor **memory)
 {
-	IOMemoryDescriptor *desc = fCore ? fCore->ucMemory(type) : 0;
+	IOMemoryDescriptor *desc = fCore && !fStatusOnly ? fCore->ucMemory(type) : 0;
 
+	if (fStatusOnly)
+		return kIOReturnNotPrivileged;
 	if (!desc)
 		return kIOReturnBadArgument;
 	desc->retain();
@@ -352,12 +369,58 @@ IOReturn FirebrandUserClient::methodAudio(UInt32 op, UInt32 arg, SInt32 *result,
 	return fCore->ucAudio(op, (SInt32)arg, result, dig, pin, flags);
 }
 
+IOReturn FirebrandUserClient::methodConfig(UInt32 fn, UInt32 offset, UInt32 write, UInt32 value, UInt32 *out)
+{
+	return fCore->ucConfig(fn, offset, write, value, out);
+}
+
+IOReturn FirebrandUserClient::methodSmn(UInt32 addr, UInt32 write, UInt32 value, UInt32 *out)
+{
+	return fCore->ucSmn(addr, write, value, out);
+}
+
+IOReturn FirebrandUserClient::methodFunctions(UInt32 op, UInt32 arg, SInt32 *result, UInt32 *hdr, UInt32 *id1,
+					       UInt32 *nubs)
+{
+	return fCore->ucFunctions(op, arg, result, hdr, id1, nubs);
+}
+
+IOReturn FirebrandUserClient::methodLutSet(UInt32 op, SInt32 *result)
+{
+	return fCore->ucLutSet(op, result);
+}
+
 IOReturn FirebrandUserClient::methodLut(void *out, IOByteCount *outSize)
 {
 	if (*outSize < sizeof(struct frb_user_lut))
 		return kIOReturnBadArgument;
 	*outSize = sizeof(struct frb_user_lut);
 	return fCore->ucLut((struct frb_user_lut *)out);
+}
+
+/*
+ * FRB_UC_STATUS: the structure, or as much of it as the client asked for
+ * (one built against an older frb_user_status); its size field says how
+ * much this driver has. At least the version, size and valid words.
+ */
+IOReturn FirebrandUserClient::methodStatus(void *out, IOByteCount *outSize)
+{
+	struct frb_user_status *st;
+	IOReturn r;
+
+	if (*outSize < 3 * sizeof(uint32_t))
+		return kIOReturnBadArgument;
+	if (*outSize >= sizeof(struct frb_user_status)) {
+		*outSize = sizeof(struct frb_user_status);
+		return fCore->ucStatus((struct frb_user_status *)out);
+	}
+	st = (struct frb_user_status *)IOMalloc(sizeof(*st));
+	if (!st)
+		return kIOReturnNoMemory;
+	r = fCore->ucStatus(st);
+	bcopy(st, out, *outSize);
+	IOFree(st, sizeof(*st));
+	return r;
 }
 
 IOReturn FirebrandUserClient::methodDpm(UInt32 op, void *out, IOByteCount *outSize)

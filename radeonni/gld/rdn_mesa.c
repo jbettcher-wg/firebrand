@@ -2630,6 +2630,35 @@ void rdn_mesa_cgls_context_created(void *cgls_ctx)
 	}
 }
 
+/*
+ * CGLCreateContext has returned: the context's table is the engine's
+ * finished one, and nothing has been called through it yet. A program that
+ * never makes the context current (it calls through the table, as Core
+ * Image does) is Mesa's from its first call this way, not from its first
+ * drawable. RDN_NO_CREATE_EARLY=1 in a program's environment: as before,
+ * at the first CGLSetCurrentContext.
+ */
+void rdn_mesa_cgl_context_created(void *cgl_ctx)
+{
+	static int off = -1;
+	void *rend = cgl_ctx ? *(void **)cgl_ctx : NULL;
+	int i;
+
+	if (off < 0)
+		off = getenv("RDN_NO_CREATE_EARLY") != NULL;
+	if (off || !rend || !rdn_engine_layout())
+		return;
+	for (i = 0; i < MAX_CONTEXTS; ++i) {
+		struct context *c = &contexts[i];
+		if (c->gld_ctx && !c->type && !c->dispatched && c->early_rend == rend) {
+			c->early_ready = 1;
+			install(c, (char *)c->early_rend + rdn_engine_layout()->table_off,
+				"at creation");
+			return;
+		}
+	}
+}
+
 void rdn_mesa_early_all(void *cgl_ctx)
 {
 	int i;

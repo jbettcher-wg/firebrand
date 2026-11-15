@@ -221,13 +221,42 @@ static int dpcd_access(struct frb_device *adev, struct frb_connector *conn, int 
 	return done;
 }
 
+/*
+ * DCE 12 (SOC15) has no AUX command table: its DPCD goes through DC's dce_aux
+ * engine (frb_dce12_aux.c), 16 bytes a message. The DCE 11 callers (frbctl
+ * dpcd, the sink CRC) keep this entry point on both.
+ */
+int frb_dce12_dpcd_read(struct frb_device *adev, const struct frb_connector *c, uint32_t addr, uint8_t *buf, uint32_t size);
+int frb_dce12_dpcd_write(struct frb_device *adev, const struct frb_connector *c, uint32_t addr, const uint8_t *buf,
+			 uint32_t size);
+
+static int dce12_dpcd(struct frb_device *adev, struct frb_connector *conn, int write, uint32_t addr, uint8_t *buf, int n)
+{
+	int done = 0;
+
+	while (done < n) {
+		int chunk = n - done > 16 ? 16 : n - done, r;
+
+		r = write ? frb_dce12_dpcd_write(adev, conn, addr + done, buf + done, chunk) :
+			    frb_dce12_dpcd_read(adev, conn, addr + done, buf + done, chunk);
+		if (r != chunk)
+			return r < 0 ? r : -EIO;
+		done += chunk;
+	}
+	return done;
+}
+
 int frb_dp_dpcd_read(struct frb_device *adev, struct frb_connector *conn, uint32_t addr, uint8_t *buf, int n)
 {
+	if (frb_is_soc15(adev))
+		return dce12_dpcd(adev, conn, 0, addr, buf, n);
 	return dpcd_access(adev, conn, DP_AUX_NATIVE_READ, addr, buf, n);
 }
 
 int frb_dp_dpcd_write(struct frb_device *adev, struct frb_connector *conn, uint32_t addr, const uint8_t *buf, int n)
 {
+	if (frb_is_soc15(adev))
+		return dce12_dpcd(adev, conn, 1, addr, (uint8_t *)buf, n);
 	return dpcd_access(adev, conn, DP_AUX_NATIVE_WRITE, addr, (uint8_t *)buf, n);
 }
 

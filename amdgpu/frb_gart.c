@@ -39,6 +39,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 #include "frb_device.h"
+#include "frb_soc15.h"
 #include "include/asic_reg/gmc/gmc_8_1_d.h"
 #include "include/asic_reg/bif/bif_5_0_d.h"
 
@@ -63,7 +64,7 @@ int frb_gart_init(struct frb_device *adev)
 	frb_info(adev, "[drm] GART: num gpu pages %u, table %u KB at 0x%016llX (BAR0 offset 0x%08x)",
 		 adev->gart.num_gpu_pages, adev->gart.table_size >> 10,
 		 (unsigned long long)adev->gart.table_addr, adev->gart.table_offset);
-	adev->gart.ready = adev->gart.table_size <= (512u << 10);
+	adev->gart.ready = adev->gart.table_size <= adev->layout.gart_table_size;
 	return adev->gart.ready ? 0 : -ERANGE;
 }
 
@@ -109,6 +110,7 @@ int frb_gart_alloc(struct frb_device *adev, uint32_t npages, uint32_t *first)
 		if (!adev->gart.used)
 			return -ENOMEM;
 		adev->gart.used[0] |= 1;
+		adev->gart.used_pages = 1;
 	}
 	for (i = 1; i < n; i++) {
 		if (adev->gart.used[i / 32] & (1u << (i % 32))) {
@@ -120,6 +122,7 @@ int frb_gart_alloc(struct frb_device *adev, uint32_t npages, uint32_t *first)
 
 			for (p = start; p <= i; p++)
 				adev->gart.used[p / 32] |= 1u << (p % 32);
+			adev->gart.used_pages += npages;
 			*first = start;
 			return 0;
 		}
@@ -133,13 +136,23 @@ void frb_gart_free(struct frb_device *adev, uint32_t first, uint32_t npages)
 
 	if (!adev->gart.used)
 		return;
-	for (p = first; p < first + npages && p < adev->gart.num_gpu_pages; p++)
+	for (p = first; p < first + npages && p < adev->gart.num_gpu_pages; p++) {
+		if (adev->gart.used[p / 32] & (1u << (p % 32)))
+			adev->gart.used_pages--;
 		adev->gart.used[p / 32] &= ~(1u << (p % 32));
+	}
 }
 
 /* amdgpu_gart_invalidate_tlb: the HDP flush (the table is in VRAM), then VMID 0's TLB */
 void frb_gart_invalidate_tlb(struct frb_device *adev)
 {
+	if (frb_is_soc15(adev)) {
+		/* amdgpu_gart_invalidate_tlb on GMC 9: the HDP flush, then VMID 0 on both hubs */
+		frb_soc15_flush_hdp(adev);
+		frb_gmc_v9_0_flush_gpu_tlb(adev, 0, AMDGPU_GFXHUB(0), 0);
+		frb_gmc_v9_0_flush_gpu_tlb(adev, 0, AMDGPU_MMHUB0(0), 0);
+		return;
+	}
 	WREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
 	RREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL);
 	/* gmc_v8_0_flush_gpu_tlb(adev, 0, 0, 0): bits 0-15 are the VM contexts */

@@ -55,11 +55,19 @@ fi
 [ "$audio" = 0 ] || [ -d "$here/HDAudio.kext" ] || fail "HDAudio.kext is not next to this script (or use --no-audio)"
 
 # Is a supported card in the Mac now? Fine if not: install with the old card in, then swap.
-if ioreg -r -c IOPCIDevice -l -w0 2>/dev/null | grep -q '"device-id" = <9f690000>'; then
-	echo "Found an AMD Polaris 12 card (1002:699f)."
+card=
+for c in "9f690000:an AMD Polaris 12 card (1002:699f)" "2b680000:an AMD Cape Verde card (1002:682b)" \
+	 "a1660000:an AMD Vega 20 card (1002:66a1)"; do
+	if ioreg -r -c IOPCIDevice -l -w0 2>/dev/null | grep -q "\"device-id\" = <${c%%:*}>"; then
+		card="${c#*:}"
+		break
+	fi
+done
+if [ -n "$card" ]; then
+	echo "Found $card."
 else
-	echo "No Polaris 12 card (1002:699f) in the Mac right now: the driver is installed and will"
-	echo "start when the card is in."
+	echo "No supported card (1002:699f, 682b or 66a1) in the Mac right now: the driver is installed"
+	echo "and will start when the card is in."
 fi
 
 set -e

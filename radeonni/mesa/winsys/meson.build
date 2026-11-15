@@ -22,7 +22,7 @@ librdnwinsys = static_library(
     include_directories('shim'), inc_rdn_winsys,
     include_directories('../radeon/drm'),
     inc_src, inc_include, inc_gallium, inc_gallium_aux, inc_amd_common,
-  ],
+  ] + (with_gallium_radeonsi ? [inc_amd] : []),   # GFX9: addrlib's chip revision ranges (amdgpu_asic_addr.h)
   c_args : [no_override_init_args],
   gnu_symbol_visibility : 'hidden',
   # GCN: ac_fill_compiler_info() and sid.h's generated register macros.

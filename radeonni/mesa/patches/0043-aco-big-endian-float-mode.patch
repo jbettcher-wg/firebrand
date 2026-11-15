@@ -1,0 +1,93 @@
+osx-gpu: ACO on a big-endian host: FLOAT_MODE's fields where the hardware has them
+
+aco::float_mode is a union of two-bit fields (round32, round16_64, denorm32,
+denorm16_64) and `val`, "matching the encoding of the MODE register": val is
+what the shader's FLOAT_MODE is programmed with (config->float_mode ->
+SPI_SHADER_PGM_RSRC1 / COMPUTE_PGM_RSRC1). A big-endian ABI allocates
+bit-fields from the top bit down, so on PowerPC val came out mirrored:
+0xc0 (round to nearest, keep 16- and 64-bit denormals), the mode of nearly
+every shader, was programmed as 0x03: 32-bit floats rounded toward zero and
+all denormals flushed, on every card since radeonsi first ran here (GFX6-8
+showed nothing a test caught). On GFX9 it broke outright: ACO copies a pair
+of 16-bit values with v_pack_b32_f16 when the mode keeps 16-bit denormals,
+the hardware flushed them, and a small integer is a denormal half float, so
+radeonsi's compute blit with 16-bit coordinates (GFX9 and later) lost the
+first pixel of every lane: every other row of a texture read back or copied
+to a linear surface stayed unwritten (Vega 20 on Firebrand, 2026-11-15,
+rdn_gltest).
+
+The fields are declared in the opposite order on a big-endian host.
+
+aco_lower_to_hw_instr.cpp compared copy_operation's use counts (a union of
+eight bytes and a 64-bit word) with 0x0101, bytes 0 and 1 used once each as
+a little-endian host reads the word; on a big-endian host the test never
+held and the pair was packed the long way. It is now done by byte, so both
+hosts choose the same instructions.
+
+diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
+--- a/src/amd/compiler/aco_ir.h
++++ b/src/amd/compiler/aco_ir.h
+@@ -146,6 +146,24 @@
+ struct float_mode {
+    /* matches encoding of the MODE register */
+    union {
++      /* osx-gpu: `val` is the hardware's FLOAT_MODE (config->float_mode, s_setreg): round32 must
++       * be its low bits. A big-endian ABI allocates bit-fields from the top down, so the fields
++       * are declared in the opposite order there; otherwise every shader ran with the fields
++       * mirrored (0xc0, "keep 16/64-bit denormals", became round-toward-zero for 32-bit floats
++       * with denormals flushed, and v_pack_b32_f16 zeroed small integers on GFX9).
++       */
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++      struct {
++         unsigned denorm16_64 : 2;
++         unsigned denorm32 : 2;
++         fp_round round16_64 : 2;
++         fp_round round32 : 2;
++      };
++      struct {
++         uint8_t denorm : 4;
++         uint8_t round : 4;
++      };
++#else
+       struct {
+          fp_round round32 : 2;
+          fp_round round16_64 : 2;
+@@ -156,6 +174,7 @@
+          uint8_t round : 4;
+          uint8_t denorm : 4;
+       };
++#endif
+       uint8_t val = 0;
+    };
+    /* if false, optimizations which may remove denormal flushing can be done */
+diff --git a/src/amd/compiler/aco_lower_to_hw_instr.cpp b/src/amd/compiler/aco_lower_to_hw_instr.cpp
+--- a/src/amd/compiler/aco_lower_to_hw_instr.cpp
++++ b/src/amd/compiler/aco_lower_to_hw_instr.cpp
+@@ -1203,6 +1203,14 @@
+       uint8_t uses[8];
+       uint64_t is_used = 0;
+    };
++
++   /* osx-gpu: bytes 0 and 1 used once each and nothing else, i.e. is_used == 0x0101 as a
++    * little-endian host reads it; by byte, so a big-endian host makes the same choice. */
++   bool low_word_used_once() const
++   {
++      return uses[0] == 1 && uses[1] == 1 &&
++             !(uses[2] | uses[3] | uses[4] | uses[5] | uses[6] | uses[7]);
++   }
+ };
+ 
+ void
+@@ -1879,10 +1887,10 @@
+          std::map<PhysReg, copy_operation>::iterator other = copy_map.find(reg_hi);
+          if (other != copy_map.end() && other->second.bytes == 2) {
+             /* check if the target register is otherwise unused */
+-            bool unused_lo = !it->second.is_used || (it->second.is_used == 0x0101 &&
++            bool unused_lo = !it->second.is_used || (it->second.low_word_used_once() &&
+                                                      other->second.op.physReg() == it->first);
+             bool unused_hi = !other->second.is_used ||
+-                             (other->second.is_used == 0x0101 && it->second.op.physReg() == reg_hi);
++                             (other->second.low_word_used_once() && it->second.op.physReg() == reg_hi);
+             if (unused_lo && unused_hi) {
+                Operand lo = it->second.op;
+                Operand hi = other->second.op;

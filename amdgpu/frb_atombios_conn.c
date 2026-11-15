@@ -33,7 +33,6 @@
 #include <stddef.h>
 #include "frb_display.h"
 #include "../shared/atom/atombios.h"
-#include "include/asic_reg/dce/dce_11_2_d.h"
 
 int frb_cmd_rev(struct frb_device *adev, int index, uint8_t *frev, uint8_t *crev)
 {
@@ -70,7 +69,7 @@ static int hpd_from_gpio(struct frb_device *adev, uint8_t id)
 			continue;
 		reg = U16(pin + offsetof(ATOM_GPIO_PIN_ASSIGNMENT, usGpioPin_AIndex));
 		mask = 1u << U8(pin + offsetof(ATOM_GPIO_PIN_ASSIGNMENT, ucGpioPinBitShift));
-		if (reg != mmDC_GPIO_HPD_A)	/* dce_v11_0_hpd_get_gpio_reg */
+		if (!frb_funcs(adev)->display || reg != frb_funcs(adev)->display->hpd_gpio_reg)	/* dce_vX_0_hpd_get_gpio_reg */
 			return -1;
 		switch (mask) {
 		case (1 << 0):	return 0;

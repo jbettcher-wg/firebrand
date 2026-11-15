@@ -88,44 +88,7 @@ static void uvd_v6_0_stop(struct frb_device *adev);
 static void uvd_v6_0_set_sw_clock_gating(struct frb_device *adev);
 static void uvd_v6_0_enable_mgcg(struct frb_device *adev, int enable);
 
-static inline struct frb_uvd *to_uvd(struct frb_ring *ring)
-{
-	return ring->adev->uvd;
-}
-
-/* --- the ring's byte order ------------------------------------------------ */
-
-static inline uint32_t swab32(uint32_t v)
-{
-	return (v << 24) | ((v & 0xff00) << 8) | ((v >> 8) & 0xff00) | (v >> 24);
-}
-
-/*
- * amdgpu_ring_write for this ring. Default: little-endian dwords, LMI swap
- * 0. Swapped (amdgpu's __BIG_ENDIAN arm): the CPU's order on a big-endian
- * host, which LMI swap 0xa turns round on the fetch; the dword is stored
- * byte-swapped relative to little-endian so the result is the same on any
- * host the library is built for.
- */
-void frb_uvd_ring_write(struct frb_ring *ring, uint32_t v)
-{
-	frb_ring_write(ring, to_uvd(ring)->swapped ? swab32(v) : v);
-}
-
-void frb_uvd_ib_write(struct frb_device *adev, struct frb_ib *ib, uint32_t v)
-{
-	frb_ib_write(adev, ib, adev->uvd->swapped ? swab32(v) : v);
-}
-
-void frb_uvd_ib_pad(struct frb_device *adev, struct frb_ib *ib)
-{
-	if (ib->length_dw & 1)
-		frb_uvd_ib_write(adev, ib, 0);
-	while (ib->length_dw & 0xf) {
-		frb_uvd_ib_write(adev, ib, PACKET0(mmUVD_NO_OP, 0));
-		frb_uvd_ib_write(adev, ib, 0);
-	}
-}
+/* --- the ring's byte order: frb_uvd.c (frb_uvd_ring_write, frb_uvd_ib_write, frb_uvd_ib_pad) --- */
 
 #define amdgpu_ring_write(ring, v)	frb_uvd_ring_write((ring), (v))
 
@@ -353,7 +316,8 @@ static const struct frb_ring_funcs uvd_v6_0_ring_vm_funcs = {
 
 static int uvd_v6_0_early_init(struct frb_device *adev)
 {
-	/* adev->uvd.num_uvd_inst = 1; not an APU */
+	adev->uvd->num_uvd_inst = 1;
+	adev->uvd->harvest_config = 0;
 	if (RREG32_SMC(ixCC_HARVEST_FUSES) & CC_HARVEST_FUSES__UVD_DISABLE_MASK)
 		return -ENOENT;
 
@@ -376,7 +340,7 @@ static int uvd_v6_0_sw_init(struct frb_device *adev)
 	/* !uvd_v6_0_enc_support's arm, whatever the firmware: the encode rings are not ported */
 	frb_info(adev, "UVD ENC is disabled (not ported)");
 
-	ring = &uvd->ring;
+	ring = &uvd->inst[0].ring;
 	if (!ring->funcs) {
 		r = frb_ring_init(adev, ring, "uvd", &uvd_v6_0_ring_vm_funcs, 512);
 		if (r)
@@ -394,7 +358,7 @@ static int uvd_v6_0_sw_init(struct frb_device *adev)
 static int uvd_v6_0_hw_init(struct frb_device *adev)
 {
 	struct frb_uvd *uvd = adev->uvd;
-	struct frb_ring *ring = &uvd->ring;
+	struct frb_ring *ring = &uvd->inst[0].ring;
 	uint32_t tmp;
 	int r;
 
@@ -475,9 +439,9 @@ static void uvd_v6_0_mc_resume(struct frb_device *adev)
 
 	/* program memory controller bits 0-27 */
 	WREG32(mmUVD_LMI_VCPU_CACHE_64BIT_BAR_LOW,
-			lower_32_bits(uvd->gpu_addr));
+			lower_32_bits(uvd->inst[0].gpu_addr));
 	WREG32(mmUVD_LMI_VCPU_CACHE_64BIT_BAR_HIGH,
-			upper_32_bits(uvd->gpu_addr));
+			upper_32_bits(uvd->inst[0].gpu_addr));
 
 	offset = AMDGPU_UVD_FIRMWARE_OFFSET;
 	size = AMDGPU_UVD_FIRMWARE_SIZE(uvd);
@@ -510,7 +474,7 @@ static void uvd_v6_0_mc_resume(struct frb_device *adev)
 static int uvd_v6_0_start(struct frb_device *adev)
 {
 	struct frb_uvd *uvd = adev->uvd;
-	struct frb_ring *ring = &uvd->ring;
+	struct frb_ring *ring = &uvd->inst[0].ring;
 	uint32_t rb_bufsz, tmp;
 	uint32_t lmi_swap_cntl;
 	uint32_t mp_swap_cntl;
@@ -652,8 +616,8 @@ static int uvd_v6_0_start(struct frb_device *adev)
 
 	/* uvd_v6_0_enc_support(): the encode rings are not ported (see the header) */
 
-	uvd->starts++;
-	frb_info(adev, "uvd: VCPU up (start %u): ring %llx, %u bytes, LMI swap %u", uvd->starts,
+	uvd->inst[0].starts++;
+	frb_info(adev, "uvd: VCPU up (start %u): ring %llx, %u bytes, LMI swap %u", uvd->inst[0].starts,
 		 (unsigned long long)ring->gpu_addr, ring->ring_size, lmi_swap_cntl);
 	return 0;
 }
@@ -883,11 +847,6 @@ out:
 
 /* --- the stage, the tests by hand, the teardown ----------------------------- */
 
-struct frb_ring *frb_uvd_ring(struct frb_device *adev)
-{
-	return adev->uvd && adev->uvd->ring.funcs && adev->uvd->ring.ready ? &adev->uvd->ring : NULL;
-}
-
 int frb_uvd_v6_0_init(struct frb_device *adev)
 {
 	struct frb_uvd *uvd = adev->uvd;
@@ -916,10 +875,10 @@ int frb_uvd_v6_0_init(struct frb_device *adev)
 		return r;
 
 	/* amdgpu_device_ip_late_init's amdgpu_ib_ring_tests, for this ring */
-	r = frb_uvd_ring_test_ib(&uvd->ring, FRB_FENCE_TIMEOUT_US);
+	r = frb_uvd_ring_test_ib(&uvd->inst[0].ring, FRB_FENCE_TIMEOUT_US);
 	if (r) {
-		frb_err(adev, "IB test failed on %s (%d).", uvd->ring.name, r);
-		uvd->ring.ready = 0;
+		frb_err(adev, "IB test failed on %s (%d).", uvd->inst[0].ring.name, r);
+		uvd->inst[0].ring.ready = 0;
 		return r;
 	}
 
@@ -938,7 +897,7 @@ int frb_uvd_v6_0_init(struct frb_device *adev)
 static int uvd_swap_probe(struct frb_device *adev)
 {
 	struct frb_uvd *uvd = adev->uvd;
-	struct frb_ring *ring = &uvd->ring;
+	struct frb_ring *ring = &uvd->inst[0].ring;
 	int mode, r, rr[2], ri[2];
 
 	for (mode = 0; mode < 2; mode++) {
@@ -979,9 +938,9 @@ int frb_uvd_v6_0_test(struct frb_device *adev, int test)
 	struct frb_ring *ring;
 	int r;
 
-	if (!uvd || !uvd->ring.funcs)
+	if (!uvd || !uvd->inst[0].ring.funcs)
 		return -ENODEV;
-	ring = &uvd->ring;
+	ring = &uvd->inst[0].ring;
 	switch (test) {
 	case FRB_TEST_RING:
 		r = uvd_v6_0_ring_test_ring(ring);
