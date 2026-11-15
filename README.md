@@ -161,9 +161,10 @@ under System Preferences > Accounts > Login Items: started that way it shows no 
 its menu-bar item and Dock icon; click the Dock icon, or choose "Open Firebrand Monitor…" from
 its menu, for the window.
 
-The readings depend on the card: all of them on Vega 20 and Polaris. On the R7 450, with power
-management off, there are no clock, load or power readings, only the temperature and the
-driver's state; that card has not been run with the monitor yet.
+The readings depend on the card. On Vega 20 (Instinct MI50) all of them are live. On the R7 450,
+with power management off, it shows the temperature and the driver's state; clock, load and
+power readings come with power management. Polaris support is written but has not been run on
+a Polaris card yet.
 
 ## Uninstalling
 
