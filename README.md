@@ -11,6 +11,10 @@ hardware H.264 decoding, DisplayPort audio and power management. Every other car
 families loads too, display-only until you unlock it
 ([Your card isn't listed as verified?](#your-card-isnt-listed-as-verified)).
 
+[![Mac OS X 10.5.8 on a 24-thread NXP T4240 with an AMD Instinct MI50 under Firebrand, with Firebrand Monitor on the right](art/desktop-mi50.jpg)](art/desktop-mi50.jpg)
+
+<sub>Leopard 10.5.8 on a 12-core, 24-thread NXP T4240 with an AMD Instinct MI50 (Vega 20) under Firebrand at 2560x1440. Firebrand Monitor is on the right.</sub>
+
 The kernel driver is written after Linux's **amdgpu**: one file per hardware block
 (`gmc_v8_0`, `gfx_v8_0`, `sdma_v3_0`, `uvd_v6_0`, `dce_v11_0`, the SMU7 powerplay code), with
 amdgpu's function names, so code ports from Linux file for file. Every structure the GPU reads
@@ -97,7 +101,7 @@ an unlocked card misbehaves at startup, start once with the boot argument `frb_u
 G5, set it beforehand with `sudo nvram boot-args="frb_unlock=0"`, or in Open Firmware) or in
 single-user mode (hold Command-S; Firebrand does not load there), then run `sudo frbctl lock`.
 
-Please report with Copy Report: [Firebrand Monitor](#firebrand-monitor)'s **Copy Report** (or
+Please report with Copy Report ([how, step by step](#reporting-a-card)): [Firebrand Monitor](#firebrand-monitor)'s **Copy Report** (or
 `frbctl report --md` in Terminal) puts on the clipboard what an issue needs: the card's IDs and
 subsystem, its VBIOS version, the stage it reached and the text of any stage that failed, its
 clocks and temperature. Paste it into an [issue](https://github.com/jbettcher-wg/firebrand/issues),
@@ -196,6 +200,8 @@ Graphics/Displays ("Quartz Extreme: Supported", "Core Image: Hardware Accelerate
 
 ## Firebrand Monitor
 
+<p align="center"><img src="art/firebrand-monitor-w8100.png" alt="Firebrand Monitor's window on a FirePro W8100: GPU and memory clocks, temperature, and the driver's status, with Copy Report at the bottom right"></p>
+
 `Firebrand Monitor.app`, in the same `build/dist/Firebrand` folder (copy it to Applications),
 shows what the card is doing:
 
@@ -207,10 +213,25 @@ shows what the card is doing:
   stage and any stage that failed, power management and the VBIOS's boot clocks, the
   displays and their DisplayPort links, the video decoder, the PCIe link and video memory in
   use. An untested card is marked as one on its page and in the window's footer.
-- **Copy Report** puts all of it on the clipboard, ready to paste into a GitHub issue. Please
-  add it to any problem you report. `frbctl report --md` prints the same in Terminal, and
-  both describe a card even when the driver did not stay on it (a card that stopped before
-  the display, or a Vega 10/12 card Firebrand only identifies).
+- **Copy Report** puts all of it on the clipboard, ready to paste into a GitHub issue.
+  `frbctl report --md` prints the same in Terminal, and both describe a card even when the
+  driver did not stay on it (a card that stopped before the display, or a Vega 10/12 card
+  Firebrand only identifies).
+
+### Reporting a card
+
+Whether your card works, half works or doesn't come up at all, a report helps. It is how a
+card gets its own verified row.
+
+1. Open Firebrand Monitor and go to your card's page. The **Support** row says whether the
+   card is verified or untested, and **Stage** shows how far it got.
+2. Click **Copy Report** at the bottom right.
+3. [Open an issue](https://github.com/jbettcher-wg/firebrand/issues/new), paste the report,
+   and add what you tried and what worked or broke. If you unlocked the card, say how it did
+   display-only and unlocked.
+
+If the desktop doesn't come up, run `frbctl report --md` from another machine over ssh
+(Remote Login) and paste that instead.
 
 It needs no administrator password: it only reads, through a read-only connection to the
 driver that any user may open. Every control stays in `frbctl`. To start it at login, add it
