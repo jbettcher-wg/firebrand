@@ -19,6 +19,7 @@
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <IOKit/pci/IOPCIBridge.h>
+#include <IOKit/IOCatalogue.h>
 
 #include "FirebrandCore.h"
 extern "C" {
@@ -306,17 +307,117 @@ bool FirebrandCore::mapDoorbells(void)
 
 /* --- firmware from the personality ---------------------------------------- */
 
-int FirebrandCore::firmware(const char *name, const uint8_t **data, uint32_t *size)
+/* a file of the store, through FirmwareAliases when its bytes are under another name */
+OSData *FirebrandCore::firmwareData(const char *name)
 {
 	OSData *d = fFirmware ? OSDynamicCast(OSData, fFirmware->getObject(name)) : 0;
+	OSString *canon;
 
-	if (!d || !d->getLength()) {
+	if (!d && fFirmware && fFirmwareAliases &&
+	    (canon = OSDynamicCast(OSString, fFirmwareAliases->getObject(name))))
+		d = OSDynamicCast(OSData, fFirmware->getObject(canon));
+	return d && d->getLength() ? d : 0;
+}
+
+int FirebrandCore::firmware(const char *name, const uint8_t **data, uint32_t *size)
+{
+	OSData *d = firmwareData(name);
+
+	if (!d) {
 		IOLog("Firebrand: firmware %s is not in the kext (scripts/fetch-firmware.sh, rebuild)\n", name);
 		return -ENOENT;
 	}
 	*data = (const uint8_t *)d->getBytesNoCopy();
 	*size = d->getLength();
 	return 0;
+}
+
+/*
+ * The FirebrandFirmware personality: IOProviderClass FirebrandFirmwareStore
+ * (no such class, so it never matches) and FirebrandFirmwareStore = this
+ * kext's bundle identifier, holding the microcode once for both driver
+ * personalities. kextd hands it to the IOCatalogue with the others; the
+ * catalogue's findDrivers finds it by that key (IOCatalogue.h, in the 10.5
+ * KPI). The dictionaries are retained, so they outlive the personality.
+ */
+bool FirebrandCore::findFirmwareStore(void)
+{
+	OSString *id = OSDynamicCast(OSString, fOwner ? fOwner->getProperty("CFBundleIdentifier") : 0);
+	OSDictionary *match = OSDictionary::withCapacity(1);
+	OSOrderedSet *found = 0;
+	OSDictionary *store = 0;
+	SInt32 generation = 0;
+
+	if (match && id && match->setObject("FirebrandFirmwareStore", id))
+		found = gIOCatalogue->findDrivers(match, &generation);
+	if (match)
+		match->release();
+	if (found && found->getCount())
+		store = OSDynamicCast(OSDictionary, found->getFirstObject());
+	if (store && OSDynamicCast(OSDictionary, store->getObject("Firmware"))) {
+		fFirmware = (OSDictionary *)store->getObject("Firmware");
+		fFirmware->retain();
+		fFirmwareAliases = OSDynamicCast(OSDictionary, store->getObject("FirmwareAliases"));
+		if (fFirmwareAliases)
+			fFirmwareAliases->retain();
+		fFirmwareFrom = "the FirebrandFirmware personality";
+	}
+	if (found)
+		found->release();
+	return fFirmware != 0;
+}
+
+/*
+ * frbctl firmware: for every device id the driver matches and every
+ * revision amdgpu's kicker rules name, every file that card may ask for
+ * (frb_fw_names_for: all register outcomes), looked up in the store as the
+ * stages would. Reads the kext's own memory only; the card is not touched.
+ */
+IOReturn FirebrandCore::ucFirmwareCheck(struct frb_user_fwcheck *out)
+{
+	char names[40][32];
+	int i, r, k, n, j;
+
+	bzero(out, sizeof(*out));
+	out->version = 1;
+	out->store_files = fFirmware ? fFirmware->getCount() : 0;
+	out->store_aliases = fFirmwareAliases ? fFirmwareAliases->getCount() : 0;
+	strncpy(out->source, fFirmwareFrom ? fFirmwareFrom : "none", sizeof(out->source) - 1);
+	for (i = 0; i < frb_pciid_count(); i++) {
+		uint16_t device = frb_pciid_device(i);
+
+		out->devices++;
+		for (r = 0; r < frb_fw_revision_count; r++) {
+			enum amd_asic_type t = frb_asic_type_of_rev(device, frb_fw_revisions[r]);
+
+			if (!frb_asic_ported(t))
+				continue;
+			n = frb_fw_names_for(t, device, frb_fw_revisions[r], names, 40);
+			out->lookups += n;
+			for (k = 0; k < n; k++) {
+				if (firmwareData(names[k]))
+					continue;
+				out->missing++;
+				for (j = 0; j < (int)out->missing_listed; j++)
+					if (!strncmp(out->missing_names[j], names[k], sizeof(out->missing_names[j])))
+						break;
+				if (j == (int)out->missing_listed && out->missing_listed < 8)
+					strncpy(out->missing_names[out->missing_listed++], names[k],
+						sizeof(out->missing_names[0]) - 1);
+			}
+		}
+	}
+	/* the verified cards' own files, by the choices their stages make */
+	for (i = 0; i < frb_verified_row_count(); i++) {
+		const struct frb_asic_row *row = frb_verified_row(i);
+
+		n = frb_fw_names_for(row->asic_type, row->device, row->revision, names, 40);
+		for (k = 0; k < n; k++)
+			if (!firmwareData(names[k]))
+				out->verified_missing++;
+		out->verified_rows++;
+	}
+	return kIOReturnSuccess;
 }
 
 /* --- the VBIOS (RadeonNI's three sources) ---------------------------------- */
@@ -881,13 +982,31 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 		goto fail;
 	bzero(fLogMem->getBytesNoCopy(), FRB_LOG_BYTES);
 
-	/* the microcode leaves the property table (serializeProperties) */
+	/*
+	 * The microcode: the FirebrandFirmware personality's, once for both
+	 * driver personalities (embed-firmware.pl); a build that still embeds it
+	 * in this personality is taken as it is, and leaves the property table
+	 * (serializeProperties).
+	 */
 	fw = OSDynamicCast(OSDictionary, fOwner->getProperty("Firmware"));
 	if (fw) {
+		OSDictionary *aliases = OSDynamicCast(OSDictionary, fOwner->getProperty("FirmwareAliases"));
+
 		fFirmware = fw;
 		fFirmware->retain();
+		if (aliases) {
+			fFirmwareAliases = aliases;
+			fFirmwareAliases->retain();
+		}
 		fOwner->removeProperty("Firmware");
+		fOwner->removeProperty("FirmwareAliases");
+		fFirmwareFrom = "this personality";
+	} else if (!findFirmwareStore()) {
+		IOLog("Firebrand: no FirebrandFirmware personality in the IOCatalogue: no microcode (stage post at most)\n");
 	}
+	if (fFirmware)
+		IOLog("Firebrand: microcode from %s: %u files, %u aliases\n", fFirmwareFrom,
+		      (unsigned)fFirmware->getCount(), fFirmwareAliases ? (unsigned)fFirmwareAliases->getCount() : 0);
 	fAllowRegWrite = flag("FirebrandAllowRegWrite", "frb_regwrite");
 	fBringUp = flag("FirebrandBringUp", "frb_bringup");
 	{
@@ -1180,6 +1299,9 @@ void FirebrandCore::free(void)
 		fLogMem->release();
 	if (fFirmware)
 		fFirmware->release();
+	if (fFirmwareAliases)
+		fFirmwareAliases->release();
+	fFirmwareAliases = 0;
 	if (fLutSaved)
 		IOFree(fLutSaved, 3 * 256 * sizeof(uint16_t));
 	fLutSaved = 0;

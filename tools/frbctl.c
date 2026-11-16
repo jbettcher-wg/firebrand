@@ -47,6 +47,9 @@
  *                                and at once on a loaded driver, so `frbctl stage 7` can try the
  *                                rest without a restart. A verified card is not affected. Root.
  *   frbctl unlock status         the installed setting and each loaded card's
+ *   frbctl firmware              the kext's microcode against what every matched device id may ask
+ *                                for (each kicker revision, each register outcome), looked up in
+ *                                the kernel as the stages would; the card is not touched
  *
  * Builds on Mac OS X 10.5 (IOKit only; scripts/build-mac.sh does this):
  *   gcc -std=gnu99 -I../kext/Firebrand -I../shared -o frbctl frbctl.c frb_status.c ../shared/frb_edid.c \
@@ -493,6 +496,23 @@ int main(int argc, char **argv)
 			printf("%-4s %-40s 0x%08lx 0x%08x%s\n", kind, name, off, (unsigned)v, r ? " ERR" : "");
 		}
 		fclose(f);
+	} else if (!strcmp(argv[1], "firmware")) {
+		struct frb_user_fwcheck fc;
+		IOByteCount sz = sizeof(fc);
+		uint32_t k;
+
+		memset(&fc, 0, sizeof(fc));
+		r = IOConnectMethodScalarIStructureO(conn, FRB_UC_FW_CHECK, 0, &sz, &fc);
+		if (r) {
+			fprintf(stderr, "firmware: 0x%x (a driver older than frbctl firmware?)\n", r);
+			return 1;
+		}
+		printf("store        %u images, %u aliases, from %s\n", fc.store_files, fc.store_aliases, fc.source);
+		printf("walked       %u device ids, %u file lookups: %u missing\n", fc.devices, fc.lookups, fc.missing);
+		printf("verified     %u rows: %u files missing\n", fc.verified_rows, fc.verified_missing);
+		for (k = 0; k < fc.missing_listed; k++)
+			printf("missing      %s\n", fc.missing_names[k]);
+		return fc.missing || fc.verified_missing ? 1 : 0;
 	} else if (!strcmp(argv[1], "stage") && argc == 3) {
 		r = scalar(FRB_UC_RUN_STAGE, 1, atoi(argv[2]), 0, &v);
 		printf("stage %s: %s, result %d (frbctl log has the details)\n", argv[2], r ? "ERR" : "ran", v);

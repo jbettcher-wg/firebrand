@@ -344,7 +344,7 @@ int frb_smu7_write_smc_sram_dword(struct frb_device *adev, uint32_t smc_addr, ui
 /* --- firmware ------------------------------------------------------------ */
 
 struct frb_smu_fw {
-	const char *name;		/* the file amdgpu loads on Polaris 12 */
+	const char *name;		/* the file amdgpu loads (frb_fw_select.c) */
 	struct frb_fw fw;
 	struct frb_ucode u;
 	uint32_t offset;		/* in the firmware buffer (VRAM, BAR0 offset) */
@@ -722,6 +722,8 @@ static int smu7_request_smu_load_fw(struct frb_device *adev, struct smu7_state *
 int frb_smu7_start(struct frb_device *adev)
 {
 	static struct frb_smu_fw fw[FW_COUNT];
+	static char names[FRB_FW_TOC_COUNT][32];
+	char smc_name[32];
 	struct frb_smu_fw smc;
 	struct smu7_state s;
 	uint32_t efuse;
@@ -733,27 +735,22 @@ int frb_smu7_start(struct frb_device *adev)
 	if (adev->stage_done < FRB_STAGE_GMC || !adev->aper)
 		return -EPERM;
 
-	/* the files gfx_v8_0/sdma_v3_0/amdgpu_cgs ask for on a non-kicker Polaris 12 */
-	fw[FW_SDMA0].name = "polaris12_sdma.bin";
-	fw[FW_SDMA1].name = "polaris12_sdma1.bin";
-	fw[FW_CE].name = "polaris12_ce_2.bin";
-	fw[FW_PFP].name = "polaris12_pfp_2.bin";
-	fw[FW_ME].name = "polaris12_me_2.bin";
-	fw[FW_MEC].name = "polaris12_mec_2.bin";
-	fw[FW_RLC].name = "polaris12_rlc.bin";
-	smc.name = "polaris12_smc.bin";
-	if (adev->asic_type != CHIP_POLARIS12 || ASICID_IS_P23(adev->device, adev->revision)) {
-		frb_err(adev, "smu: only the non-kicker Polaris 12 set is wired up");
+	/*
+	 * The files gfx_v8_0, sdma_v3_0 and amdgpu_cgs ask for (frb_fw_select.c):
+	 * Polaris 10, 11 and 12 (the _2 CP images) and Vega M; the SMC image
+	 * once SMU_FIRMWARE says which key the SMU takes (below).
+	 */
+	if (frb_fw_vi_toc_names(adev->asic_type, names)) {
+		frb_err(adev, "smu: no SMU7 firmware set for %s", frb_asic_name(adev->asic_type));
 		return -ENODEV;
 	}
+	for (i = 0; i < FW_COUNT; i++)
+		fw[i].name = names[i];
 	for (i = 0; i < FW_COUNT; i++) {
 		r = load_file(adev, &fw[i]);
 		if (r)
 			return r;
 	}
-	r = load_file(adev, &smc);
-	if (r)
-		return r;
 
 	/* smu7_init: amdgpu's two VRAM objects, here at the top of the CPU window */
 	s.header_mc = adev->gmc.vram_start + adev->layout.toc;
@@ -773,16 +770,22 @@ int frb_smu7_start(struct frb_device *adev)
 
 		s.protected_mode = REG_GET_FIELD(smu_fw, SMU_FIRMWARE, SMU_MODE);
 		s.security_hard_key = REG_GET_FIELD(RREG32_SMC(ixSMU_FIRMWARE), SMU_FIRMWARE, SMU_SEL);
+		/*
+		 * smu7_upload_smu_firmware_image: the image for the key the SMU
+		 * takes (Polaris 10/11's _sk image for the soft key) and the
+		 * kicker parts' own (amdgpu_cgs_get_firmware_info)
+		 */
+		frb_fw_smc_name(smc_name, sizeof(smc_name), adev->asic_type, adev->device, adev->revision,
+				!s.security_hard_key);
+		smc.name = smc_name;
+		r = load_file(adev, &smc);
+		if (r)
+			return r;
 		frb_info(adev, "smu: SMU_FIRMWARE %08x: %s mode, %s key; AVFS fuse %08x (%s); "
 			 "uploading %s (version 0x%08x, %u bytes)",
 			 smu_fw, s.protected_mode ? "protected" : "non-protected",
 			 s.security_hard_key ? "hard" : "soft", efuse, s.avfs_supported ? "AVFS" : "no AVFS",
 			 smc.name, smc.u.ucode_version, smc.u.ucode_size_bytes);
-		if (!s.security_hard_key) {
-			/* amdgpu would take the _sk image; the captures never needed it */
-			frb_err(adev, "smu: soft-key SMU (polaris12_smc_sk.bin) not wired up");
-			return -ENODEV;
-		}
 		if (s.protected_mode == 0)
 			r = polaris10_start_smu_in_non_protection_mode(adev, &smc.u);
 		else
@@ -791,7 +794,9 @@ int frb_smu7_start(struct frb_device *adev)
 			frb_err(adev, "Failed to load SMU ucode.");
 			return r;
 		}
-		polaris10_avfs_event_mgr(adev, &s);
+		/* vegam_start_smu is polaris10_start_smu without the AVFS event step */
+		if (adev->asic_type != CHIP_VEGAM)
+			polaris10_avfs_event_mgr(adev, &s);
 	} else {
 		frb_info(adev, "smu: the SMC is already running");
 	}

@@ -206,6 +206,26 @@ static const struct frb_asic_row rows[] = {
 	  FRB_QUIRK_AUDIO_FN_STRAP },
 };
 
+int frb_verified_row_count(void)
+{
+	return (int)ARRAY_SIZE(rows);
+}
+
+const struct frb_asic_row *frb_verified_row(int i)
+{
+	return i >= 0 && i < (int)ARRAY_SIZE(rows) ? &rows[i] : 0;
+}
+
+int frb_pciid_count(void)
+{
+	return (int)ARRAY_SIZE(pciidlist);
+}
+
+uint16_t frb_pciid_device(int i)
+{
+	return i >= 0 && i < (int)ARRAY_SIZE(pciidlist) ? pciidlist[i].device : 0;
+}
+
 enum amd_asic_type frb_asic_type_of(uint16_t device)
 {
 	unsigned int i;

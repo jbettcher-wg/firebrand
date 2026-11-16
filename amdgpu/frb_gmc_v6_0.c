@@ -94,24 +94,16 @@ static int gmc_v6_0_wait_for_idle(struct frb_device *adev)
 /* gmc_v6_0_init_microcode: "this memory configuration requires special firmware" */
 static int gmc_v6_0_init_microcode(struct frb_device *adev)
 {
-	const char *chip_name;
 	uint32_t misc0;
 	int err;
 
-	switch (adev->asic_type) {
-	case CHIP_TAHITI:	chip_name = "tahiti"; break;
-	case CHIP_PITCAIRN:	chip_name = "pitcairn"; break;
-	case CHIP_VERDE:	chip_name = "verde"; break;
-	case CHIP_OLAND:	chip_name = "oland"; break;
-	case CHIP_HAINAN:	chip_name = "hainan"; break;
-	default:		return -EINVAL;
-	}
-
+	if (!frb_fw_mc_needs_misc0(adev->asic_type))
+		return -EINVAL;
+	/* the chip's image, or si58_mc.bin for this memory configuration (frb_fw_select.c) */
 	misc0 = RREG32(mmMC_SEQ_MISC0);
-	if (((misc0 & 0xff000000) >> 24) == 0x58)
-		chip_name = "si58";
-
-	frb_fw_name(adev->gmc.fw_name, sizeof(adev->gmc.fw_name), chip_name, "_mc.bin");
+	if (frb_fw_mc_name(adev->gmc.fw_name, sizeof(adev->gmc.fw_name), adev->asic_type, adev->device,
+			   adev->revision, misc0, 0))
+		return -EINVAL;
 	frb_info(adev, "gmc: MC_SEQ_MISC0 %08x -> %s", misc0, adev->gmc.fw_name);
 	err = adev->os->firmware(adev->os->cookie, adev->gmc.fw_name,
 				 &adev->gmc.fw.data, &adev->gmc.fw.size);

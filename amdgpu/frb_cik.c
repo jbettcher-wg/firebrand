@@ -616,31 +616,17 @@ int frb_cik_gfx_addr_config(struct frb_device *adev)
  */
 int frb_cik_smc_stage(struct frb_device *adev)
 {
-	const char *chip_name;
 	struct frb_fw fw = { 0, 0 };
 	struct frb_ucode u;
 	char name[32];
 	uint32_t start;
 	int r;
 
-	switch (adev->asic_type) {
-	case CHIP_BONAIRE:
-		if ((adev->revision == 0x80) || (adev->revision == 0x81) || (adev->device == 0x665f))
-			chip_name = "bonaire_k";
-		else
-			chip_name = "bonaire";
-		break;
-	case CHIP_HAWAII:
-		if (adev->revision == 0x80)
-			chip_name = "hawaii_k";
-		else
-			chip_name = "hawaii";
-		break;
-	default:
-		frb_err(adev, "cik: no SMC image choice for this chip here");
+	/* amdgpu_cgs_get_firmware_info's CIK arms (frb_fw_select.c) */
+	if (frb_fw_smc_name(name, sizeof(name), adev->asic_type, adev->device, adev->revision, 0)) {
+		frb_err(adev, "cik: no SMC image choice for this chip");
 		return -ENODEV;
 	}
-	frb_fw_name(name, sizeof(name), chip_name, "_smc.bin");
 	r = adev->os->firmware(adev->os->cookie, name, &fw.data, &fw.size);
 	if (r) {
 		frb_err(adev, "cik_smc: Failed to load firmware. err = %d \"%s\"", r, name);

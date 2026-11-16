@@ -70,6 +70,8 @@ enum {
 	FRB_UC_UNLOCK,		/* in: 1 unlock, 0 lock (an untested card past display-only, for frbctl stage N
 				   now; frbctl unlock also writes FirebrandUnlock for the next start); out: the
 				   stage the card may run to now */
+	FRB_UC_FW_CHECK,	/* struct out: struct frb_user_fwcheck (the kext's microcode against every
+				   matched device id's needs; reads only, the card untouched) */
 	FRB_UC_METHOD_COUNT
 };
 
@@ -250,6 +252,20 @@ struct frb_user_status {
 	char stage_error[200];		/* the failed stage's error lines, "" none */
 	uint32_t boot_gfx_mhz, boot_mem_mhz;	/* the VBIOS's boot clocks (FirmwareInfo), 0 unknown: what the card
 						   runs at without power management */
+};
+
+/* FRB_UC_FW_CHECK */
+struct frb_user_fwcheck {
+	uint32_t version;		/* 1 */
+	uint32_t store_files;		/* distinct images in the store */
+	uint32_t store_aliases;		/* names whose bytes are under another name */
+	uint32_t devices;		/* device ids walked (pciidlist) */
+	uint32_t lookups;		/* file lookups made (device x revision x file) */
+	uint32_t missing;		/* lookups that found nothing */
+	uint32_t missing_listed;
+	uint32_t verified_rows, verified_missing;	/* the family table's verified cards, their misses */
+	char source[40];		/* where the store came from */
+	char missing_names[8][32];	/* the first distinct misses */
 };
 
 /* FRB_UC_FUNCTIONS: the device's PCI functions (the hidden HD Audio function; bring-up) */

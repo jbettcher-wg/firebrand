@@ -75,6 +75,10 @@ public:
 	void writeDoorbell64(UInt32 index, UInt64 value);	/* SOC15: BAR2, os->doorbell_write64 */
 	IOPCIDevice *device(void) { return fDevice; }
 	int firmware(const char *name, const uint8_t **data, uint32_t *size);
+	/* the same without the log line for a missing file (frbctl firmware) */
+	OSData *firmwareData(const char *name);
+	/* frbctl firmware: every file each matched device id may ask for, looked up in the store */
+	IOReturn ucFirmwareCheck(struct frb_user_fwcheck *out);
 	void logLine(const char *line);
 	/* an error line from the library (os_log): kept for the failed stage's text in the report */
 	void errorLine(const char *line);
@@ -251,6 +255,9 @@ private:
 	IOBufferMemoryDescriptor *fLogMem;
 	UInt32 fLogLen;
 	OSDictionary *fFirmware;
+	OSDictionary *fFirmwareAliases;	/* file name -> the name its identical bytes are under */
+	const char *fFirmwareFrom;	/* "the FirebrandFirmware personality", "this personality" */
+	bool findFirmwareStore(void);
 	IOLock *fLock;
 	void *fBios;
 	UInt32 fBiosSize;

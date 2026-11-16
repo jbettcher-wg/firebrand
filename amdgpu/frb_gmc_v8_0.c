@@ -149,37 +149,21 @@ static int gmc_v8_0_wait_for_idle(struct frb_device *adev)
  */
 static int gmc_v8_0_init_microcode(struct frb_device *adev)
 {
-	const char *chip_name;
 	uint32_t up159 = 0;
 	int err;
 
-	switch (adev->asic_type) {
-	case CHIP_POLARIS11:
-		chip_name = "polaris11";	/* _k variants not carried */
-		break;
-	case CHIP_POLARIS10:
-		chip_name = "polaris10";
-		break;
-	case CHIP_POLARIS12:
-		if (ASICID_IS_P23(adev->device, adev->revision)) {
-			chip_name = "polaris12_k";
-		} else {
-			WREG32(mmMC_SEQ_IO_DEBUG_INDEX, ixMC_IO_DEBUG_UP_159);
-			/* Polaris12 32bit ASIC needs a special MC firmware */
-			up159 = RREG32(mmMC_SEQ_IO_DEBUG_DATA);
-			if (up159 == 0x05b4dc40)
-				chip_name = "polaris12_32";
-			else
-				chip_name = "polaris12";
-		}
-		break;
-	case CHIP_VEGAM:
-		return 0;
-	default:
-		return -EINVAL;
+	if (frb_fw_mc_needs_up159(adev->asic_type, adev->device, adev->revision)) {
+		WREG32(mmMC_SEQ_IO_DEBUG_INDEX, ixMC_IO_DEBUG_UP_159);
+		/* Polaris12 32bit ASIC needs a special MC firmware */
+		up159 = RREG32(mmMC_SEQ_IO_DEBUG_DATA);
 	}
-
-	frb_fw_name(adev->gmc.fw_name, sizeof(adev->gmc.fw_name), chip_name, "_mc.bin");
+	/* the Polaris 10/11/12 kickers' _k images, Polaris 12's 32-bit part, none on Vega M (frb_fw_select.c) */
+	err = frb_fw_mc_name(adev->gmc.fw_name, sizeof(adev->gmc.fw_name), adev->asic_type, adev->device,
+			     adev->revision, 0, up159);
+	if (err == 1)
+		return 0;
+	if (err)
+		return -EINVAL;
 	frb_info(adev, "gmc: MC_IO_DEBUG_UP_159 %08x -> %s", up159, adev->gmc.fw_name);
 	err = adev->os->firmware(adev->os->cookie, adev->gmc.fw_name,
 				 &adev->gmc.fw.data, &adev->gmc.fw.size);

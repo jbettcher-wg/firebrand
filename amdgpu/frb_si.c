@@ -701,27 +701,17 @@ int frb_si_gfx_addr_config(struct frb_device *adev)
  */
 int frb_si_smc_stage(struct frb_device *adev)
 {
-	const char *chip_name;
 	struct frb_fw fw = { 0, 0 };
 	struct frb_ucode u;
 	char name[32];
 	uint32_t rst, clk, pc;
 	int r;
 
-	switch (adev->asic_type) {
-	case CHIP_VERDE:
-		if (((adev->device == 0x6820) && ((adev->revision == 0x81) || (adev->revision == 0x83))) ||
-		    ((adev->device == 0x6821) && ((adev->revision == 0x83) || (adev->revision == 0x87))) ||
-		    ((adev->revision == 0x87) && ((adev->device == 0x6823) || (adev->device == 0x682b))))
-			chip_name = "verde_k";
-		else
-			chip_name = "verde";
-		break;
-	default:
-		frb_err(adev, "si: no SMC image choice for this chip here (only Verde has a row)");
+	/* si_dpm_init_microcode's choice, the kickers and banks_k_2 included (frb_fw_select.c) */
+	if (frb_fw_smc_name(name, sizeof(name), adev->asic_type, adev->device, adev->revision, 0)) {
+		frb_err(adev, "si: no SMC image choice for this chip");
 		return -ENODEV;
 	}
-	frb_fw_name(name, sizeof(name), chip_name, "_smc.bin");
 	r = adev->os->firmware(adev->os->cookie, name, &fw.data, &fw.size);
 	if (r) {
 		frb_err(adev, "si_smc: Failed to load firmware. err = %d \"%s\"", r, name);

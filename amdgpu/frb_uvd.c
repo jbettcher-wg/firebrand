@@ -83,8 +83,6 @@
 /* Polaris10/11 firmware version */
 #define FW_1_66_16	((1 << 24) | (66 << 16) | (16 << 8))
 
-#define FIRMWARE_POLARIS12	"polaris12_uvd.bin"
-#define FIRMWARE_VEGA20		"vega20_uvd.bin"
 
 static inline uint32_t swab32(uint32_t v)
 {
@@ -144,11 +142,6 @@ void frb_uvd_ib_pad(struct frb_device *adev, struct frb_ib *ib)
 		frb_uvd_ib_write(adev, ib, 0);
 	}
 }
-#define FIRMWARE_BONAIRE	"bonaire_uvd.bin"	/* amdgpu_uvd.c; radeon loads bonaire_uvd.bin for Hawaii too */
-#define FIRMWARE_HAWAII		"hawaii_uvd.bin"
-#define FIRMWARE_TAHITI		"tahiti_uvd.bin"
-#define FIRMWARE_VERDE		"verde_uvd.bin"
-#define FIRMWARE_PITCAIRN	"pitcairn_uvd.bin"
 
 /*
  * amdgpu_uvd_sw_init: the firmware, its version and handle count, each
@@ -162,30 +155,10 @@ int frb_uvd_sw_init(struct frb_device *adev)
 	const char *fw_name;
 	int r;
 
-	switch (adev->asic_type) {
-	case CHIP_TAHITI:
-		fw_name = FIRMWARE_TAHITI;
-		break;
-	case CHIP_VERDE:
-		fw_name = FIRMWARE_VERDE;
-		break;
-	case CHIP_PITCAIRN:
-		fw_name = FIRMWARE_PITCAIRN;
-		break;
-	case CHIP_BONAIRE:
-		fw_name = FIRMWARE_BONAIRE;
-		break;
-	case CHIP_HAWAII:
-		fw_name = FIRMWARE_HAWAII;
-		break;
-	case CHIP_POLARIS12:
-		fw_name = FIRMWARE_POLARIS12;
-		break;
-	case CHIP_VEGA20:
-		fw_name = FIRMWARE_VEGA20;
-		break;
-	default:
-		frb_err(adev, "amdgpu_uvd: only Polaris 12, Vega 20, SI and CIK are wired up");
+	/* amdgpu_uvd.c's FIRMWARE_* (frb_fw_select.c); Hainan has no UVD */
+	fw_name = frb_fw_uvd_name(adev->asic_type);
+	if (!fw_name) {
+		frb_err(adev, "amdgpu_uvd: this chip has no UVD");
 		return -EINVAL;
 	}
 	if (!uvd->num_uvd_inst)

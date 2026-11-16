@@ -1,8 +1,12 @@
 # The microcode Firebrand.kext carries, by linux-firmware name. The Makefile
 # embeds each file from ../../firmware (scripts/fetch-firmware.sh fills it;
-# never committed) into the personality's "Firmware" dictionary under its own
-# name, and LICENSE.amdgpu into Contents/Resources. The driver asks for files
-# by name (frb_os.firmware), as amdgpu asks request_firmware.
+# never committed) once, into the FirebrandFirmware personality's "Firmware"
+# dictionary under its own name (a file with the same bytes as an earlier one
+# becomes an alias of it, embed-firmware.pl), and LICENSE.amdgpu into
+# Contents/Resources. The driver asks for files by name (frb_os.firmware), as
+# amdgpu asks request_firmware; amdgpu/frb_fw_select.c makes amdgpu's choice
+# of name, and tests/frb_fw_select_test.c checks that every name any matched
+# card may ask for is listed here (make -C tests fwselect).
 #
 # Polaris 12, not a "kicker" part (ASICID_IS_P23 is 6987/6981 only):
 # - MC: both images; gmc_v8_0_init_microcode picks one from MC_IO_DEBUG_UP_159.
@@ -59,3 +63,104 @@ hawaii_sdma1.bin
 # uvd_v4_2: the VCPU image (amdgpu_uvd.c FIRMWARE_HAWAII; radeon and RadeonNI
 # load bonaire_uvd.bin on Hawaii, the same family 1.64)
 hawaii_uvd.bin
+
+# ---- Every other chip of the ported families (2026-11-15) ----------------------
+# For untested cards: the files frb_fw_select.c asks for on these chips (Linux 7.1's
+# MODULE_FIRMWARE names, linux-firmware 20260916). Carried, not run on hardware: no card
+# of these chips has been in a machine here.
+# Southern Islands: Tahiti, Pitcairn, Oland, Hainan. gmc_v6_0's MC images (si58_mc.bin is
+# carried already), si_dpm_init_microcode's SMC images with the kickers (pitcairn_k,
+# oland_k, hainan_k, banks_k_2 for Hainan 6665 rev c3), gfx_v6_0's CP and RLC images,
+# UVD 3.1 (Hainan has none). Several are linux-firmware links to the same bytes; the
+# kext keeps one copy of each (embed-firmware.pl's aliases).
+banks_k_2_smc.bin
+hainan_ce.bin
+hainan_k_smc.bin
+hainan_mc.bin
+hainan_me.bin
+hainan_pfp.bin
+hainan_rlc.bin
+hainan_smc.bin
+oland_ce.bin
+oland_k_smc.bin
+oland_mc.bin
+oland_me.bin
+oland_pfp.bin
+oland_rlc.bin
+oland_smc.bin
+oland_uvd.bin
+pitcairn_ce.bin
+pitcairn_k_smc.bin
+pitcairn_mc.bin
+pitcairn_me.bin
+pitcairn_pfp.bin
+pitcairn_rlc.bin
+pitcairn_smc.bin
+pitcairn_uvd.bin
+tahiti_ce.bin
+tahiti_mc.bin
+tahiti_me.bin
+tahiti_pfp.bin
+tahiti_rlc.bin
+tahiti_smc.bin
+tahiti_uvd.bin
+# Sea Islands: Bonaire's MC, SMC (and its kicker), CP, RLC, SDMA and UVD images, and
+# Hawaii's kicker SMC image (rev 0x80).
+bonaire_ce.bin
+bonaire_k_smc.bin
+bonaire_mc.bin
+bonaire_me.bin
+bonaire_pfp.bin
+bonaire_rlc.bin
+bonaire_sdma1.bin
+bonaire_sdma.bin
+bonaire_smc.bin
+bonaire_uvd.bin
+hawaii_k_smc.bin
+# Polaris 10 and 11: gmc_v8_0's MC images (the _k ones for ASICID_IS_P30 / P21 / P31),
+# amdgpu_cgs's SMC images (_k for P20 / P21, _k2 for P30 / P31, _smc_sk when the SMU
+# takes the soft key), the SMU7 table of contents (the _2 CP images, RLC, SDMA) and UVD.
+polaris10_ce_2.bin
+polaris10_k2_smc.bin
+polaris10_k_mc.bin
+polaris10_k_smc.bin
+polaris10_mc.bin
+polaris10_me_2.bin
+polaris10_mec2_2.bin
+polaris10_mec_2.bin
+polaris10_pfp_2.bin
+polaris10_rlc.bin
+polaris10_sdma1.bin
+polaris10_sdma.bin
+polaris10_smc.bin
+polaris10_smc_sk.bin
+polaris10_uvd.bin
+polaris11_ce_2.bin
+polaris11_k2_smc.bin
+polaris11_k_mc.bin
+polaris11_k_smc.bin
+polaris11_mc.bin
+polaris11_me_2.bin
+polaris11_mec2_2.bin
+polaris11_mec_2.bin
+polaris11_pfp_2.bin
+polaris11_rlc.bin
+polaris11_sdma1.bin
+polaris11_sdma.bin
+polaris11_smc.bin
+polaris11_smc_sk.bin
+polaris11_uvd.bin
+# Polaris 12 kicker parts (ASICID_IS_P23): their MC and SMC images.
+polaris12_k_mc.bin
+polaris12_k_smc.bin
+# Vega M: no MC image; SMC, the table of contents (CP without _2, MEC2, RLC, SDMA), UVD.
+vegam_ce.bin
+vegam_me.bin
+vegam_mec2.bin
+vegam_mec.bin
+vegam_pfp.bin
+vegam_rlc.bin
+vegam_sdma1.bin
+vegam_sdma.bin
+vegam_smc.bin
+vegam_uvd.bin

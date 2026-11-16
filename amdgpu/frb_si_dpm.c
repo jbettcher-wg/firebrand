@@ -309,6 +309,7 @@ static int si_dpm_hw_init(struct frb_device *adev)
 	const uint8_t *fw = 0;
 	uint32_t fw_size = 0;
 	const char *name;
+	char other[32];
 	unsigned level = 99;
 	uint32_t sclk = 0, mclk = 0;
 	uint16_t vddc = 0;
@@ -353,12 +354,13 @@ static int si_dpm_hw_init(struct frb_device *adev)
 	rdn_si_dpm_set_msg_hook(s->dpm, si_dpm_msg_hook, s);
 
 	/* si_dpm_init_microcode's choice; stage smu checked the same image */
-	if (adev->asic_type == CHIP_VERDE)
+	if (adev->asic_type == CHIP_VERDE) {
 		name = rdn_si_dpm_wants_kicker_smc(s->dpm) ? "verde_k_smc.bin" : "verde_smc.bin";
-	else if (adev->asic_type == CHIP_PITCAIRN)
-		name = rdn_si_dpm_wants_kicker_smc(s->dpm) ? "pitcairn_k_smc.bin" : "pitcairn_smc.bin";
-	else
-		name = "tahiti_smc.bin";
+	} else {
+		/* the other SI chips: amdgpu's choice (frb_fw_select.c: Oland, Hainan, banks_k_2 included) */
+		frb_fw_smc_name(other, sizeof(other), adev->asic_type, adev->device, adev->revision, 0);
+		name = other;
+	}
 	r = adev->os->firmware(adev->os->cookie, name, &fw, &fw_size);
 	if (r) {
 		frb_err(adev, "si_dpm: no %s (%d): boot clocks kept", name, r);

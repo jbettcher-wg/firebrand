@@ -22,6 +22,19 @@
 	<string>0.1.0</string>
 	<key>IOKitPersonalities</key>
 	<dict>
+		<key>FirebrandFirmware</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>io.github.jbettcher-wg.Firebrand</string>
+			<key>IOClass</key>
+			<string>Firebrand</string>
+			<key>IOProviderClass</key>
+			<string>FirebrandFirmwareStore</string>
+			<key>IOMatchCategory</key>
+			<string>FirebrandFirmware</string>
+			<key>FirebrandFirmwareStore</key>
+			<string>io.github.jbettcher-wg.Firebrand</string>
+		</dict>
 		<key>Firebrand</key>
 		<dict>
 			<key>CFBundleIdentifier</key>

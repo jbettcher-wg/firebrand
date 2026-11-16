@@ -121,6 +121,29 @@ enum amd_asic_type {
 #define FRB_GART_LEGACY_START		0x40000000ULL	/* RadeonNI hw/rdn_gart.h RDN_GART_GPU_START */
 
 /* amdgpu.h */
+/* amdgpu.h: the Polaris 10 and 11 "kicker" parts (frb_fw_select.c's MC and SMC choices) */
+#define ASICID_IS_P20(did, rid)		(((did == 0x67DF) && \
+					 ((rid == 0xE3) || \
+					  (rid == 0xE4) || \
+					  (rid == 0xE5) || \
+					  (rid == 0xE7) || \
+					  (rid == 0xEF))) || \
+					 ((did == 0x6FDF) && \
+					 ((rid == 0xE7) || \
+					  (rid == 0xEF) || \
+					  (rid == 0xFF))))
+#define ASICID_IS_P30(did, rid)		((did == 0x67DF) && \
+					((rid == 0xE1) || \
+					 (rid == 0xF7)))
+#define ASICID_IS_P21(did, rid)		(((did == 0x67EF) && \
+					 ((rid == 0xE0) || \
+					  (rid == 0xE5))) || \
+					 ((did == 0x67FF) && \
+					 ((rid == 0xCF) || \
+					  (rid == 0xEF) || \
+					  (rid == 0xFF))))
+#define ASICID_IS_P31(did, rid)		((did == 0x67EF) && \
+					((rid == 0xE2)))
 #define ASICID_IS_P23(did, rid)		(((did == 0x6987) && \
 					 ((rid == 0xC0) || \
 					  (rid == 0xC1) || \
@@ -229,6 +252,31 @@ enum amd_asic_type frb_asic_type_of_rev(uint16_t device, uint8_t revision);
  */
 int frb_asic_ported(enum amd_asic_type t);
 struct frb_device;
+/*
+ * frb_fw_select.c: the microcode file names amdgpu asks for, per chip,
+ * revision and kicker part (pure; tests/frb_fw_select_test.c). 0 with the
+ * name in buf; frb_fw_mc_name returns 1 for a chip with no MC image (Vega M);
+ * -EINVAL for a chip without one.
+ */
+#define FRB_FW_TOC_COUNT	7	/* SDMA0, SDMA1, CE, PFP, ME, MEC, RLC */
+const char *frb_fw_chip_prefix(enum amd_asic_type t);
+int frb_fw_mc_name(char *buf, uint32_t n, enum amd_asic_type t, uint16_t device, uint8_t revision,
+		   uint32_t mc_seq_misc0, uint32_t mc_io_debug_up159);
+int frb_fw_mc_needs_misc0(enum amd_asic_type t);			/* SI: MC_SEQ_MISC0 decides si58 */
+int frb_fw_mc_needs_up159(enum amd_asic_type t, uint16_t device, uint8_t revision); /* Polaris 12's 32-bit part */
+int frb_fw_smc_name(char *buf, uint32_t n, enum amd_asic_type t, uint16_t device, uint8_t revision, int soft_key);
+int frb_fw_vi_toc_names(enum amd_asic_type t, char names[FRB_FW_TOC_COUNT][32]);
+const char *frb_fw_uvd_name(enum amd_asic_type t);			/* 0: no UVD (Hainan) */
+/* every file a card of this identity may ask for (all register outcomes); the count put */
+int frb_fw_names_for(enum amd_asic_type t, uint16_t device, uint8_t revision, char out[][32], int max);
+extern const uint8_t frb_fw_revisions[];	/* the revisions the kicker rules name, and 0 */
+extern const int frb_fw_revision_count;
+/* frb_drv.c's pciidlist, for walking every device id the driver matches */
+int frb_pciid_count(void);
+uint16_t frb_pciid_device(int i);
+/* the family table's verified rows */
+int frb_verified_row_count(void);
+const struct frb_asic_row *frb_verified_row(int i);
 /* an untested card's row (adev->untested_row, from the PCI identity and asic_type); adev->row points at it */
 void frb_asic_untested_row(struct frb_device *adev);
 /* the highest stage this card may run to now: its row's, or an untested card's by the unlock */

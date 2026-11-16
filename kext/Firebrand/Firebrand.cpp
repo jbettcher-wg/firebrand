@@ -239,6 +239,8 @@ IOExternalMethod *FirebrandUserClient::getTargetAndMethodForIndex(IOService **ta
 		/* variable: a client built against an older (shorter) frb_user_status gets its prefix */
 		{ 0, (IOMethod)&FirebrandUserClient::methodStatus, kIOUCScalarIStructO, 0, kIOUCVariableStructureSize },
 		{ 0, (IOMethod)&FirebrandUserClient::methodUnlock, kIOUCScalarIScalarO, 1, 1 },
+		{ 0, (IOMethod)&FirebrandUserClient::methodFirmwareCheck, kIOUCScalarIStructO, 0,
+		  sizeof(struct frb_user_fwcheck) },
 	};
 
 	/* an 'frbs' client: its own numbers (FRB_US_*), only the status */
@@ -300,6 +302,14 @@ IOReturn FirebrandUserClient::methodRunStage(UInt32 stage, SInt32 *result)
 IOReturn FirebrandUserClient::methodUnlock(UInt32 on, UInt32 *cap)
 {
 	return fCore->ucUnlock(on, cap);
+}
+
+IOReturn FirebrandUserClient::methodFirmwareCheck(void *out, IOByteCount *outSize)
+{
+	if (*outSize < sizeof(struct frb_user_fwcheck))
+		return kIOReturnBadArgument;
+	*outSize = sizeof(struct frb_user_fwcheck);
+	return fCore->ucFirmwareCheck((struct frb_user_fwcheck *)out);
 }
 
 IOReturn FirebrandUserClient::methodVramRead(UInt32 offset, UInt32 *value)

@@ -47,7 +47,7 @@ CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -fapple-kext -fcheck-new
 LIBCFLAGS = $(CFLAGS) -std=gnu99 -Wno-unused -Wno-sign-compare
 
 LIB_SRCS = shared/atom/atom.c shared/frb_edid.c shared/frb_dmt.c shared/frb_mem.c shared/frb_splash.c \
-	amdgpu/frb_drv.c amdgpu/frb_device.c amdgpu/frb_atombios.c \
+	amdgpu/frb_drv.c amdgpu/frb_fw_select.c amdgpu/frb_device.c amdgpu/frb_atombios.c \
 	amdgpu/frb_soc15.c amdgpu/frb_atomfirmware.c amdgpu/frb_gmc_v9_0.c amdgpu/frb_gfxhub_v1_0.c \
 	amdgpu/frb_mmhub_v1_0.c amdgpu/frb_psp.c amdgpu/frb_psp_v11_0.c amdgpu/frb_vega20_smumgr.c \
 	amdgpu/frb_dce_v12_0.c amdgpu/frb_dce12_aux.c amdgpu/frb_dce12_hwseq.c amdgpu/frb_dp_fallback.c \

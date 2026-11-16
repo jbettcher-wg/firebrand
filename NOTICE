@@ -78,8 +78,8 @@ GCC 15.3 runtime (libgcc, libstdc++, libatomic)
     Linked statically into RadeonNIGLDriver.bundle by the cross compiler.
     Licence: GNU GPL 3 with the GCC Runtime Library Exception, which permits this.
 
-AMD GPU microcode (linux-firmware: the polaris12_*, verde_*, si58_mc, hawaii_* and vega20_*
-images that kext/Firebrand/firmware.list and firmware-vega20.list name)
+AMD GPU microcode (linux-firmware 20260916: the images of every Southern Islands, Sea Islands,
+Polaris and Vega 20 chip that kext/Firebrand/firmware.list and firmware-vega20.list name)
     Downloaded and checksum-verified by scripts/fetch-firmware.sh; embedded in Firebrand.kext,
     with the licence in Firebrand.kext/Contents/Resources/LICENSE.amdgpu. Never committed here.
     Licence: AMD's microcode licence (binary redistribution). Copyright (C) Advanced Micro

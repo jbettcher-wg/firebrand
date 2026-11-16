@@ -182,14 +182,8 @@ int frb_ci_dpm_hw_init(struct frb_device *adev)
 	if (s->dpm.uploaded && (adev->ci_dpm_quirks & FRB_CI_DPM_UPLOAD_ONLY))
 		return 0;	/* uploaded and held: only frbctl dpm on (no switches) starts it */
 	if (!s->dpm.uploaded) {
-		/* the image stage smu checked: hawaii_k_smc.bin for rev 0x80, hawaii_smc.bin otherwise */
-		if (adev->asic_type == CHIP_HAWAII)
-			frb_fw_name(s->fw_name, sizeof(s->fw_name), adev->revision == 0x80 ? "hawaii_k" : "hawaii",
-				    "_smc.bin");
-		else
-			frb_fw_name(s->fw_name, sizeof(s->fw_name),
-				    (adev->revision == 0x80 || adev->revision == 0x81 || adev->device == 0x665f) ?
-				    "bonaire_k" : "bonaire", "_smc.bin");
+		/* the image stage smu checked (frb_fw_select.c: the Bonaire and Hawaii kickers' _k images) */
+		frb_fw_smc_name(s->fw_name, sizeof(s->fw_name), adev->asic_type, adev->device, adev->revision, 0);
 		r = adev->os->firmware(adev->os->cookie, s->fw_name, &fw, &fw_size);
 		if (r) {
 			frb_err(adev, "ci_dpm: no %s (%d): boot clocks kept", s->fw_name, r);

@@ -98,21 +98,12 @@ static int gmc_v7_0_wait_for_idle(struct frb_device *adev)
 /* gmc_v7_0_init_microcode */
 static int gmc_v7_0_init_microcode(struct frb_device *adev)
 {
-	const char *chip_name;
 	int err;
 
-	switch (adev->asic_type) {
-	case CHIP_BONAIRE:
-		chip_name = "bonaire";
-		break;
-	case CHIP_HAWAII:
-		chip_name = "hawaii";
-		break;
-	default:
+	/* bonaire_mc.bin, hawaii_mc.bin (frb_fw_select.c) */
+	if (frb_fw_mc_name(adev->gmc.fw_name, sizeof(adev->gmc.fw_name), adev->asic_type, adev->device,
+			   adev->revision, 0, 0))
 		return -EINVAL;
-	}
-
-	frb_fw_name(adev->gmc.fw_name, sizeof(adev->gmc.fw_name), chip_name, "_mc.bin");
 	err = adev->os->firmware(adev->os->cookie, adev->gmc.fw_name,
 				 &adev->gmc.fw.data, &adev->gmc.fw.size);
 	if (err) {
