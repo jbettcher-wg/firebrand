@@ -9,19 +9,26 @@
  * million times a second.
  *
  * This replaces libgcc's routine with the same interface and a short cut
- * for the first few threads that use it, which in nearly every program are
- * the only ones that draw. A thread is recognised by where its stack is:
- * the stack pointer lies between two addresses noted when the thread first
- * came here. That takes no call at all (pthread_self() is three jumps away
- * through the C library, and asking it cost more than everything else
- * here), and the routine needs no stack frame of its own. A thread whose
- * stack pointer is found nowhere (more threads than slots, or code running
- * on a stack that is not the thread's own: a game that runs its code on
- * stacks it made itself, as fibres) takes the long way and is still right.
- * That is in two steps: a thread that has a slot is found by pthread_self()
- * (emutls_mid, a few dozen instructions), and only a thread that has none
- * goes through pthread_getspecific() (emutls_slow, with a lock on the first
- * use of a variable).
+ * that takes no call at all (pthread_self() is three jumps away through
+ * the C library, and asking it cost more than everything else here) and no
+ * stack frame. A thread is recognised by where its stack is: every thread
+ * that comes here gets a record with its stack's range and its table of
+ * copies, and a small table (two records for each 64 KB step of the address
+ * space, taken modulo 64 MB) says which threads' stacks were last seen at an
+ * address. The routine looks at the two records for its stack pointer and
+ * takes the one whose range the stack pointer is in. Any number of threads
+ * have the short cut that way; until 2026-11-15 only the first four to come
+ * here had it, which in a program with glthread are Mesa's own, and a
+ * program that draws from a thread it made later (Doom 3 with a render
+ * thread) took the long way at every OpenGL call.
+ *
+ * A thread whose stack pointer is found in neither record (first time at
+ * that depth of its stack, pushed out by two other threads at the same
+ * place in the table, or running on a stack that is not its own: fibres)
+ * is found by pthread_getspecific() (emutls_mid), put in the table if it
+ * is on its own stack, and is still right if it is not. Only a thread's
+ * first use of a variable goes through emutls_slow, with a lock on the
+ * first use of a variable by anyone.
  *
  * RDN_EMUTLS_STATS=1 in the environment prints, when the program ends, how
  * many calls took each of the steps after the first (the first is the
@@ -51,48 +58,62 @@ struct emutls_object {
 	void *templ;
 };
 
-/* A thread's copies, indexed by slot - 1. */
-struct emutls_array {
-	uintptr_t count;
+/*
+ * A thread: its stack and its copies, indexed by slot - 1.
+ *
+ * `low` and `len` are written once, before any other thread can see the
+ * record, and never again: records are never freed, and one whose thread
+ * has ended is taken again only by a thread with exactly the same stack
+ * (the C library hands stacks out again). So whatever thread finds its
+ * stack pointer in a record's range is the one thread living on that stack
+ * now, and the rest of the record is that thread's alone to read and
+ * write. A thread that ends leaves `count` at 0, so that nothing is found
+ * through its record until the next owner has filled it.
+ */
+struct emutls_thread {
+	uintptr_t low, len;		/* the stack: [low, low + len); len 0: not known */
+	uintptr_t count;		/* of `slot` */
 	void **slot;
+	int alive;			/* under emutls_lock */
+	struct emutls_thread *next;	/* all of them, under emutls_lock */
 };
 
 static pthread_mutex_t emutls_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t emutls_once = PTHREAD_ONCE_INIT;
-static pthread_key_t emutls_key;
+static pthread_key_t emutls_key;	/* the thread's struct emutls_thread */
+static volatile int emutls_ready;	/* the key exists */
 static uintptr_t emutls_slots;
+static struct emutls_thread *emutls_threads;
 
 /*
- * The short cut: the first few threads to come here, each from its first
- * time here until it ends.
- *
- * `low` and `high` are read by every thread and written by the slot's
- * own: a free slot has them at ~0 and 0, which no stack pointer lies
- * between; taking a slot writes `high` and then `low`, giving it up
- * `low` and then `high`, so that whatever another thread sees in between
- * is a range no stack pointer is in. The rest is the owner's alone: once
- * a thread has found its stack pointer in a slot, the slot is its own.
+ * The short cut's table. A set is read by every thread and written by any
+ * (one pointer at a time, each a whole record's address at all times); see
+ * struct emutls_thread for why a reader needs no more than that.
  */
-#define FAST_THREADS 4
-static struct emutls_fast {
-	uintptr_t low, high;		/* the thread's stack: [low, high) */
-	uintptr_t count;		/* of its array */
-	void **slot;
-	pthread_t thread;
-	struct emutls_array *array;	/* NULL: the slot is free */
-} fast[FAST_THREADS] = {
-	{ ~(uintptr_t)0, 0, 0, NULL, 0, NULL },
-	{ ~(uintptr_t)0, 0, 0, NULL, 0, NULL },
-	{ ~(uintptr_t)0, 0, 0, NULL, 0, NULL },
-	{ ~(uintptr_t)0, 0, 0, NULL, 0, NULL },
+#define CACHE_SHIFT 16
+#define CACHE_SETS 1024
+static struct emutls_thread emutls_nobody;	/* len 0: no stack pointer is in it */
+static struct emutls_thread *emutls_cache[CACHE_SETS][2] = {
+	[0 ... CACHE_SETS - 1] = { &emutls_nobody, &emutls_nobody }
 };
+
+/* `t` is running with its stack pointer at `sp`, on its own stack: found there next time. */
+static void emutls_cache_put(struct emutls_thread *t, uintptr_t sp)
+{
+	struct emutls_thread **set = emutls_cache[(sp >> CACHE_SHIFT) & (CACHE_SETS - 1)];
+
+	if (set[0] == t)
+		return;
+	set[1] = set[0];
+	set[0] = t;
+}
 
 /*
  * The program's GL thread, without a lookup (mesa/patches/0025).
  *
  * Mesa reads its current context and dispatch table on every call (twice
  * with glthread). Here the first thread that makes a context current in
- * Mesa (and has one of the short-cut slots above) keeps copies of both,
+ * Mesa (and whose stack is known) keeps copies of both,
  * with its stack's range. Mesa's reader (glapi.h) takes the copies when
  * the stack pointer is in the range, which only that thread's can be, and
  * the thread-local variable otherwise (the glthread worker, a second
@@ -108,7 +129,7 @@ struct rdn_tls_primary {
 	void *ctx, *disp;
 };
 struct rdn_tls_primary rdn_tls_primary __attribute__((visibility("hidden")));
-static int primary_slot = -1;		/* fast[] index of the owner, under emutls_lock */
+static struct emutls_thread *primary_thread;	/* the owner, under emutls_lock */
 
 static int primary_enabled(void)
 {
@@ -142,7 +163,7 @@ void rdn_tls_set_context(void *ctx)
 			rdn_tls_primary.len = 0;
 			__sync_synchronize();
 			pthread_mutex_lock(&emutls_lock);
-			primary_slot = -1;
+			primary_thread = NULL;
 			pthread_mutex_unlock(&emutls_lock);
 		}
 	}
@@ -162,25 +183,23 @@ void rdn_tls_set_dispatch(void *disp)
  */
 void rdn_tls_claim(void *ctx, void *disp)
 {
-	pthread_t self;
-	uintptr_t i;
+	struct emutls_thread *t;
 
-	if (!ctx || rdn_tls_primary.len || !primary_enabled())
+	if (!ctx || rdn_tls_primary.len || !primary_enabled() || !emutls_ready)
 		return;
-	self = pthread_self();
+	t = pthread_getspecific(emutls_key);
+	if (!t || !t->len)
+		return;
 	pthread_mutex_lock(&emutls_lock);
-	if (!rdn_tls_primary.len)
-		for (i = 0; i < FAST_THREADS; i++)
-			if (fast[i].array && fast[i].thread == self && fast[i].low < fast[i].high) {
-				primary_slot = (int)i;
-				rdn_tls_primary.ctx = ctx;
-				rdn_tls_primary.disp = disp;
-				rdn_tls_primary.low = fast[i].low;
-				__sync_synchronize();
-				/* Last: from here on the thread's lookups use the copies. */
-				rdn_tls_primary.len = fast[i].high - fast[i].low;
-				break;
-			}
+	if (!rdn_tls_primary.len) {
+		primary_thread = t;
+		rdn_tls_primary.ctx = ctx;
+		rdn_tls_primary.disp = disp;
+		rdn_tls_primary.low = t->low;
+		__sync_synchronize();
+		/* Last: from here on the thread's lookups use the copies. */
+		rdn_tls_primary.len = t->len;
+	}
 	pthread_mutex_unlock(&emutls_lock);
 }
 
@@ -216,39 +235,34 @@ static void emutls_stack(uintptr_t *low, uintptr_t *high)
 
 static void emutls_thread_exit(void *arg)
 {
-	struct emutls_array *a = arg;
-	uintptr_t i;
+	struct emutls_thread *t = arg;
+	uintptr_t i, count = t->count;
+	void **slot = t->slot;
 
-	for (i = 0; i < FAST_THREADS; i++)
-		if (fast[i].array == a) {
-			pthread_mutex_lock(&emutls_lock);
-			if (primary_slot == (int)i) {
-				/* The owner ends: its stack may be another thread's next. */
-				rdn_tls_primary.len = 0;
-				__sync_synchronize();
-				primary_slot = -1;
-			}
-			pthread_mutex_unlock(&emutls_lock);
-			fast[i].low = ~(uintptr_t)0;
-			__sync_synchronize();
-			fast[i].high = 0;
-			fast[i].count = 0;
-			fast[i].slot = NULL;
-			/* Last: from here on the slot may be taken again. */
-			__sync_synchronize();
-			fast[i].array = NULL;
-		}
-	for (i = 0; i < a->count; i++)
-		if (a->slot[i])
+	pthread_mutex_lock(&emutls_lock);
+	if (primary_thread == t) {
+		/* The owner ends: its stack may be another thread's next. */
+		rdn_tls_primary.len = 0;
+		__sync_synchronize();
+		primary_thread = NULL;
+	}
+	/* Nothing is found through the record until its next owner fills it. */
+	t->count = 0;
+	t->slot = NULL;
+	t->alive = 0;
+	pthread_mutex_unlock(&emutls_lock);
+	for (i = 0; i < count; i++)
+		if (slot[i])
 			/* The allocation starts one pointer before the copy. */
-			free(((void **)a->slot[i])[-1]);
-	free(a->slot);
-	free(a);
+			free(((void **)slot[i])[-1]);
+	free(slot);
 }
 
 static void emutls_init(void)
 {
 	pthread_key_create(&emutls_key, emutls_thread_exit);
+	__sync_synchronize();
+	emutls_ready = 1;
 }
 
 static void *emutls_new_copy(struct emutls_object *obj)
@@ -268,28 +282,53 @@ static void *emutls_new_copy(struct emutls_object *obj)
 	return copy;
 }
 
+/* The calling thread's record: one left by a thread that had the same stack, or a new one. */
+static struct emutls_thread *emutls_new_thread(void)
+{
+	struct emutls_thread *t;
+	uintptr_t low, high, len;
+
+	emutls_stack(&low, &high);
+	len = high > low ? high - low : 0;
+	if (!len)
+		low = 0;
+	pthread_mutex_lock(&emutls_lock);
+	for (t = emutls_threads; t; t = t->next)
+		if (!t->alive && t->low == low && t->len == len)
+			break;
+	if (t) {
+		t->alive = 1;
+		pthread_mutex_unlock(&emutls_lock);
+		return t;
+	}
+	pthread_mutex_unlock(&emutls_lock);
+	t = calloc(1, sizeof(*t));
+	if (!t)
+		abort();
+	t->low = low;
+	t->len = len;
+	t->alive = 1;
+	pthread_mutex_lock(&emutls_lock);
+	t->next = emutls_threads;
+	/* Whole before any other thread can come by it. */
+	__sync_synchronize();
+	emutls_threads = t;
+	pthread_mutex_unlock(&emutls_lock);
+	return t;
+}
+
 /* Calls that missed the short cut: found by thread identity, and the long way. */
 static unsigned long emutls_mid_calls, emutls_slow_calls;
 
-/* The long way: everything the short cut in __emutls_get_address() is not. */
-static void *emutls_slow(struct emutls_object *obj) __attribute__((noinline));
+/* The long way: a thread's first use of a variable (and the first use of anything by a thread). */
+static void *emutls_slow(struct emutls_object *obj, uintptr_t sp) __attribute__((noinline));
 
-static void *emutls_slow(struct emutls_object *obj)
+static void *emutls_slow(struct emutls_object *obj, uintptr_t sp)
 {
-	struct emutls_fast *mine = NULL;
-	struct emutls_array *a = NULL;
-	pthread_t self = pthread_self();
-	uintptr_t offset, i;
+	struct emutls_thread *t;
+	uintptr_t offset;
 
 	emutls_slow_calls++;
-	/* A thread with a slot that is not on its own stack just now. */
-	for (i = 0; i < FAST_THREADS; i++)
-		if (fast[i].array && fast[i].thread == self) {
-			mine = &fast[i];
-			a = mine->array;
-			break;
-		}
-
 	pthread_once(&emutls_once, emutls_init);
 
 	offset = obj->loc.offset;
@@ -301,82 +340,53 @@ static void *emutls_slow(struct emutls_object *obj)
 		pthread_mutex_unlock(&emutls_lock);
 	}
 
-	if (!a)
-		a = pthread_getspecific(emutls_key);
-	if (!a) {
-		uintptr_t low, high;
-
-		a = calloc(1, sizeof(*a));
-		if (!a)
-			abort();
-		pthread_setspecific(emutls_key, a);
-		/* The first threads to come here get the short cut. */
-		emutls_stack(&low, &high);
-		pthread_mutex_lock(&emutls_lock);
-		for (i = 0; i < FAST_THREADS; i++)
-			if (!fast[i].array) {
-				mine = &fast[i];
-				mine->thread = self;
-				mine->array = a;
-				mine->count = 0;
-				mine->slot = NULL;
-				mine->high = high;
-				__sync_synchronize();
-				mine->low = low;
-				break;
-			}
-		pthread_mutex_unlock(&emutls_lock);
+	t = pthread_getspecific(emutls_key);
+	if (!t) {
+		t = emutls_new_thread();
+		pthread_setspecific(emutls_key, t);
 	}
-	if (offset > a->count) {
-		/*
-		 * Grown in place of the old table only for its own thread; the
-		 * short cut reads `slot` and `count` from that thread alone.
-		 */
+	if (offset > t->count) {
 		uintptr_t count = offset + 32;
-		void **slot = realloc(a->slot, count * sizeof(*slot));
+		void **slot = realloc(t->slot, count * sizeof(*slot));
 
 		if (!slot)
 			abort();
-		memset(slot + a->count, 0, (count - a->count) * sizeof(*slot));
-		a->slot = slot;
-		a->count = count;
-	}
-	if (!a->slot[offset - 1])
-		a->slot[offset - 1] = emutls_new_copy(obj);
-	if (mine) {
+		memset(slot + t->count, 0, (count - t->count) * sizeof(*slot));
 		/* The table first: `count` says how much of it there is. */
-		mine->slot = a->slot;
-		mine->count = a->count;
+		t->slot = slot;
+		t->count = count;
 	}
-	return a->slot[offset - 1];
+	if (!t->slot[offset - 1])
+		t->slot[offset - 1] = emutls_new_copy(obj);
+	if (sp - t->low < t->len)
+		emutls_cache_put(t, sp);
+	return t->slot[offset - 1];
 }
 
 /*
- * The second step: a thread that has a slot, found by who it is, for the
- * times its stack pointer is outside the range noted for it. The slot's
- * `thread` is its owner's alone to match: a slot is given up (array NULL)
- * before its thread is gone, and one taken again has a new owner.
+ * The second step: a thread whose stack pointer the table did not lead to
+ * its record, found by who it is. On its own stack it is put in the table
+ * for the next time; on another (fibres) it comes here every time.
  */
-static void *emutls_mid(struct emutls_object *obj) __attribute__((noinline));
+static void *emutls_mid(struct emutls_object *obj, uintptr_t sp) __attribute__((noinline));
 
-static void *emutls_mid(struct emutls_object *obj)
+static void *emutls_mid(struct emutls_object *obj, uintptr_t sp)
 {
 	uintptr_t index = obj->loc.offset - 1;
-	pthread_t self = pthread_self();
-	const struct emutls_fast *f;
+	struct emutls_thread *t;
 
 	emutls_mid_calls++;
-	for (f = fast; f < fast + FAST_THREADS; f++)
-		if (f->array && f->thread == self) {
-			if (index < f->count) {
-				void *copy = f->slot[index];
+	if (emutls_ready && (t = pthread_getspecific(emutls_key)) != NULL) {
+		if (sp - t->low < t->len)
+			emutls_cache_put(t, sp);
+		if (index < t->count) {
+			void *copy = t->slot[index];
 
-				if (copy)
-					return copy;
-			}
-			break;
+			if (copy)
+				return copy;
 		}
-	return emutls_slow(obj);
+	}
+	return emutls_slow(obj, sp);
 }
 
 static void emutls_report(void) __attribute__((destructor));
@@ -395,29 +405,21 @@ void *__emutls_get_address(void *object)
 	uintptr_t index = obj->loc.offset - 1;
 	/* Read as it is: asking the compiler for it costs a stack frame. */
 	register uintptr_t sp __asm__("r1");
-	const struct emutls_fast *f;
+	struct emutls_thread *const *set = emutls_cache[(sp >> CACHE_SHIFT) & (CACHE_SETS - 1)];
+	const struct emutls_thread *t = set[0];
 
-	/*
-	 * The first two threads to come here are nearly always the ones that
-	 * count (the program's and glthread's), so they are tried without a loop.
-	 */
-	if (sp >= fast[0].low && sp < fast[0].high)
-		f = &fast[0];
-	else if (sp >= fast[1].low && sp < fast[1].high)
-		f = &fast[1];
-	else if (sp >= fast[2].low && sp < fast[2].high)
-		f = &fast[2];
-	else if (sp >= fast[3].low && sp < fast[3].high)
-		f = &fast[3];
-	else
-		return emutls_mid(obj);
-	if (index < f->count) {
-		void *copy = f->slot[index];
+	if (sp - t->low >= t->len) {
+		t = set[1];
+		if (sp - t->low >= t->len)
+			return emutls_mid(obj, sp);
+	}
+	if (index < t->count) {
+		void *copy = t->slot[index];
 
 		if (copy)
 			return copy;
 	}
-	return emutls_slow(obj);
+	return emutls_slow(obj, sp);
 }
 
 /* libgcc's other entry point: a common variable seen in several objects. */

@@ -84,14 +84,19 @@
 #define ENOMEM 12
 #endif
 
-/* include/drm/amd_asic_type.h, the SI and VI parts (values as Linux numbers them) */
+/* include/drm/amd_asic_type.h, the SI, CIK and VI parts (values as Linux numbers them) */
 enum amd_asic_type {
 	CHIP_TAHITI = 0,
 	CHIP_PITCAIRN,
 	CHIP_VERDE,
 	CHIP_OLAND,
 	CHIP_HAINAN,
-	CHIP_TOPAZ = 10,
+	CHIP_BONAIRE,
+	CHIP_KAVERI,
+	CHIP_KABINI,
+	CHIP_HAWAII,
+	CHIP_MULLINS,
+	CHIP_TOPAZ,
 	CHIP_TONGA,
 	CHIP_FIJI,
 	CHIP_CARRIZO,
@@ -107,6 +112,7 @@ enum amd_asic_type {
 };
 
 #define AMDGPU_FAMILY_SI		110	/* include/uapi/drm/amdgpu_drm.h */
+#define AMDGPU_FAMILY_CI		120	/* Bonaire, Hawaii */
 #define AMDGPU_FAMILY_VI		130
 #define AMDGPU_FAMILY_AI		141	/* Vega (SOC15) */
 #define AMDGPU_MAX_USEC_TIMEOUT		100000	/* amdgpu.h: 100 ms */
@@ -160,7 +166,20 @@ struct frb_asic_row {
 	const char *board;		/* what the card is */
 	uint8_t max_stage;		/* highest enum frb_stage verified on this card */
 	uint32_t quirks;		/* FRB_QUIRK_*: what this one card needs beyond its family */
+	uint8_t untested;		/* frb_asic_untested_row's: a card of a supported family with no row */
 };
+
+/*
+ * The untested-card policy. A card whose device id is in a family Firebrand
+ * has ported (frb_asic_ported) but which has no row of its own runs under a
+ * row frb_asic_untested_row makes for it: display-only (FRB_UNTESTED_STAGE,
+ * stage dce) by default, and with the unlock (FirebrandUnlock in the
+ * personality, which `sudo frbctl unlock` sets; boot-arg frb_unlock=1, or
+ * frbctl unlock on a loaded driver) every stage the family has
+ * (FRB_UNLOCKED_STAGE). A verified row keeps its own max_stage either way.
+ */
+#define FRB_UNTESTED_STAGE	FRB_STAGE_DCE
+#define FRB_UNLOCKED_STAGE	FRB_STAGE_UVD
 
 /*
  * FRB_QUIRK_AUDIO_FN_STRAP: the card's HD Audio function (function 1) is
@@ -198,8 +217,22 @@ int frb_soc15_audio_function_strap(struct frb_device *adev, int write);
 
 const struct frb_asic_row *frb_asic_lookup(uint16_t device, uint8_t revision,
 					   uint16_t subsys_vendor, uint16_t subsys_device);
-/* amdgpu_drv.c pciidlist: is the device id a Polaris at all (any revision)? */
+/* amdgpu_drv.c pciidlist: the device id's chip (any revision), CHIP_UNKNOWN_FRB for none */
 enum amd_asic_type frb_asic_type_of(uint16_t device);
+/* the same with amdgpu's asic_type_quirks (67ff: Polaris 10 at some revisions, Polaris 11 at the rest) */
+enum amd_asic_type frb_asic_type_of_rev(uint16_t device, uint8_t revision);
+/*
+ * Whether Firebrand has the chip's code at all: 1 for the families it ports
+ * (SI, CIK, Polaris, Vega 20), 0 for the ids it only recognises (Vega 10 and
+ * 12: their register bases, PSP 3.1 and powerplay are not ported, so the
+ * driver reads their VBIOS for a report and never touches their registers).
+ */
+int frb_asic_ported(enum amd_asic_type t);
+struct frb_device;
+/* an untested card's row (adev->untested_row, from the PCI identity and asic_type); adev->row points at it */
+void frb_asic_untested_row(struct frb_device *adev);
+/* the highest stage this card may run to now: its row's, or an untested card's by the unlock */
+enum frb_stage frb_stage_cap(const struct frb_device *adev);
 const char *frb_asic_name(enum amd_asic_type t);
 
 struct frb_fw {
@@ -308,7 +341,7 @@ struct frb_trace_ent {
 struct frb_device;
 struct frb_display_funcs;
 struct frb_asic_funcs {
-	const char *name;			/* "si", "vi", "soc15": the common block */
+	const char *name;			/* "si", "cik", "vi", "soc15": the common block */
 	uint32_t rmmio_bar;			/* config offset of the register BAR: 0x18 (BAR2) SI, 0x24 (BAR5) CIK and later */
 	uint32_t family;			/* AMDGPU_FAMILY_* */
 	uint32_t pcie_index, pcie_data;		/* the PCIE index/data pair: 0xe/0xf VI, 0xc/0xd SI */
@@ -317,6 +350,13 @@ struct frb_asic_funcs {
 	void (*smc_wreg)(struct frb_device *adev, uint32_t reg, uint32_t v);
 	uint32_t (*get_config_memsize)(struct frb_device *adev);
 	int (*need_reset_on_init)(struct frb_device *adev);
+	/*
+	 * amdgpu_asic_pre_asic_init: what the family needs before ASIC_Init
+	 * (stage post, only when it posts). NULL on SI and VI as in amdgpu;
+	 * CIK's is RadeonNI's measured SMC clock for the W8100's VBIOS
+	 * (frb_cik.c).
+	 */
+	void (*pre_asic_init)(struct frb_device *adev);
 	int (*asic_reset)(struct frb_device *adev);
 	int (*common_hw_init)(struct frb_device *adev);	/* stage gmc, first */
 	void (*gmc_early_init)(struct frb_device *adev);
@@ -333,6 +373,7 @@ struct frb_asic_funcs {
 };
 extern const struct frb_asic_funcs frb_vi_asic_funcs;	/* frb_vi.c */
 extern const struct frb_asic_funcs frb_si_asic_funcs;	/* frb_si.c */
+extern const struct frb_asic_funcs frb_cik_asic_funcs;	/* frb_cik.c */
 extern const struct frb_asic_funcs frb_soc15_asic_funcs;	/* frb_soc15.c */
 /* frb_drv.c: the family's table for an asic_type, NULL for none */
 const struct frb_asic_funcs *frb_asic_funcs_of(enum amd_asic_type t);
@@ -402,6 +443,13 @@ struct frb_device {
 	 * Off unless the personality's FirebrandBringUp / boot-arg frb_bringup=1.
 	 */
 	int allow_unverified;
+	/*
+	 * An untested card (row->untested): the unlock lets it past
+	 * display-only (frb_stage_cap). FirebrandUnlock / boot-arg frb_unlock,
+	 * or frbctl unlock on a loaded driver. Never affects a verified row.
+	 */
+	int unlocked;
+	struct frb_asic_row untested_row;	/* frb_asic_untested_row's, when adev->row is it */
 
 	/* progress */
 	/*
@@ -421,6 +469,9 @@ struct frb_device {
 	struct frb_gfx6 *gfx6;			/* frb_gfx_v6_0.c (SI), from stage gfx */
 	struct frb_si_dma *si_dma;		/* frb_si_dma.c (SI), from stage sdma */
 	struct frb_si_dpm *si_dpm;		/* frb_si_dpm.c (SI), DPM after stage sdma */
+	struct frb_ci_dpm *ci_dpm;		/* frb_ci_dpm.c (CIK), DPM after stage smu */
+	struct frb_gfx7 *gfx7;			/* frb_gfx_v7_0.c (CIK), from stage gfx */
+	struct frb_cik_sdma *cik_sdma;		/* frb_cik_sdma.c (CIK), from stage sdma */
 	struct frb_gtt gtt_test;		/* frb_engines.c's GTT test buffer */
 	uint32_t gtt_test_vram;
 	struct frb_sdma *sdma;			/* frb_sdma_v3_0.c, from stage sdma */
@@ -467,12 +518,23 @@ struct frb_device {
 	 * (0: amdgpu's default). smu_hw_avfs: the AVFS fuse the SMU start read.
 	 */
 	int want_dpm;
-	int no_cg;				/* frb_cg=0: SI leaves its blocks' clock gating as hw_init left it */
+	int no_cg;				/* frb_cg=0: SI and CIK leave their blocks' clock gating as hw_init left it */
 	uint32_t si_dpm_quirks;			/* FirebrandSIDPMQuirks / frb_sidpm_quirks / frbctl dpm on N: RDN_SI_DPM_* (si_dpm/rdn_si_dpm.h) and FRB_SI_DPM_* */
 /* a lone CRTC takes the whole line buffer and two DMIF buffers (RadeonNI's reading of dce6_line_buffer_adjust; amdgpu and radeon always halve it) */
 #define FRB_SI_DPM_LB_WHOLE	(1u << 9)
-	int si_dpm_wanted;			/* frb_sidpm=1: SI DPM (off by default: its first state switch hangs the card, si-bring-up.md) */
-	int cg_on;				/* the SI blocks were gated (frb_si.c), so hw_fini ungates them */
+#define FRB_SI_DPM_CG_KEEP	(1u << 10)	/* the blocks' clock gating stays on through si_dpm's enable and first switch (as before amdgpu's order was taken) */
+#define FRB_SI_DPM_MC_UNGATED	(1u << 11)	/* the MC's MGCG and light sleep stay off once DPM runs */
+	int si_dpm_wanted;			/* SI DPM (on by default; FirebrandSIDPM false / frb_sidpm=0: boot clocks) */
+	int cg_on;				/* the SI / CIK blocks were gated (frb_si.c, frb_cik.c), so hw_fini ungates them */
+	uint32_t cik_gb_addr_config;		/* CIK: gfx_v7_0_gpu_early_init's GB_ADDR_CONFIG (frb_cik_gfx_addr_config) */
+	/*
+	 * CIK DPM (frb_ci_dpm.c): ci_dpm_wanted from FirebrandCIDPM / frb_cidpm
+	 * (DPM right after stage smu); ci_dpm_quirks the bring-up switches
+	 * (frbctl dpm on <bits> on a CIK card).
+	 */
+	int ci_dpm_wanted;
+	uint32_t ci_dpm_quirks;
+#define FRB_CI_DPM_UPLOAD_ONLY	(1u << 0)	/* the image and tables into the SMC's SRAM, the SMC left in reset */
 	int want_audio;				/* FirebrandAudio / frb_audio=1: DP audio (frb_dce_audio.c) */
 	int force_tmds;				/* FirebrandForceTMDS / frb_force_tmds=1: a test aid, a silent DVI/HDMI connector taken as a DVI sink with no EDID (RadeonNI's FakeEDID) */
 	int audio_pin;				/* frbctl audio pin N: the codec pin DP audio takes; -1 RadeonNI's choice */
@@ -486,6 +548,9 @@ struct frb_device {
 
 	enum frb_stage stage_done;		/* highest stage completed */
 	int stage_failed;			/* errno of the stage that failed, or 0 */
+	enum frb_stage stage_failed_at;		/* the stage that failed (with stage_failed) */
+	/* the VBIOS's identity (frb_atombios_survey_strings), for the status call and reports */
+	char vbios_pn[48], vbios_ver[24], vbios_date[20];
 	uint32_t asic_init_ms;
 
 	/* register trace (frbctl trace; tools/trace-compare.py) */
@@ -622,7 +687,7 @@ struct frb_gfx_info {
 	 * AMDGPU_INFO_DEV_INFO hands Mesa from adev->gfx.config and cu_info.
 	 * GFX9 has no tiling tables: addrlib works from gb_addr_config.
 	 */
-	uint32_t gfx_level;		/* 8 or 9 */
+	uint32_t gfx_level;		/* 7 (CIK), 8 or 9; 0 from gfx_v6_0 */
 	uint32_t cu_bitmap[4][4];	/* active CUs per SE (4) and SH (4), as amdgpu_cu_info.bitmap */
 	uint32_t cu_ao_mask;		/* always-on CUs (amdgpu_cu_info.ao_cu_mask) */
 	uint32_t simd_per_cu, max_waves_per_simd, wave_front_size, max_scratch_slots_per_cu, lds_size;
@@ -723,10 +788,43 @@ uint32_t frb_si_get_xclk(struct frb_device *adev);
 int frb_uvd_v3_1_init(struct frb_device *adev);
 int frb_uvd_v3_1_test(struct frb_device *adev, int test);
 void frb_uvd_v3_1_fini(struct frb_device *adev);
+int frb_uvd_v4_2_init(struct frb_device *adev);
+int frb_uvd_v4_2_test(struct frb_device *adev, int test);
+void frb_uvd_v4_2_fini(struct frb_device *adev);
+int frb_uvd_v4_2_set_powergating_state(struct frb_device *adev, int gate);	/* stop / start */
+/* cik_set_uvd_clocks (frb_cik.c): VCLK/DCLK by their DFS dividers, 10 kHz; 0 for the lowest */
+int frb_cik_set_uvd_clocks(struct frb_device *adev, uint32_t vclk, uint32_t dclk);
 /* the SI blocks' clock gating, as amdgpu's late init (gate) and hw_fini (ungate) set it */
 void frb_gmc_v6_0_set_clockgating_state(struct frb_device *adev, int gate);
+void frb_gmc_v6_0_set_mc_clockgating(struct frb_device *adev, int gate);
 void frb_gfx_v6_0_set_clockgating_state(struct frb_device *adev, int gate);
 void frb_si_dma_set_clockgating_state(struct frb_device *adev, int gate);
+/*
+ * gfx_v7_0 and cik_sdma (Sea Islands): the same calls as gfx_v6_0's and
+ * si_dma's (frb_gfx_v7_0.c, frb_cik_sdma.c); cik_sdma's packets are SDMA 3's
+ * but for the sub-window's extent (frb_rect.h); its fill is amdgpu's
+ * (FILLSIZE 0: a byte fill on SDMA 3, not yet measured on CIK)
+ */
+struct frb_gfx7;
+struct frb_cik_sdma;
+int frb_gfx_v7_0_init(struct frb_device *adev);
+void frb_gfx_v7_0_fini(struct frb_device *adev);
+int frb_gfx_v7_0_test(struct frb_device *adev, int test);
+struct frb_ring *frb_gfx_v7_0_ring(struct frb_device *adev);
+int frb_gfx_v7_0_get_info(struct frb_device *adev, struct frb_gfx_info *info);
+int frb_gfx_v7_0_get_register_value(struct frb_device *adev, uint32_t se_num, uint32_t sh_num,
+				    uint32_t reg_offset, uint32_t *value);
+void frb_gfx_v7_0_set_clockgating_state(struct frb_device *adev, int gate);
+int frb_cik_sdma_init(struct frb_device *adev);
+void frb_cik_sdma_fini(struct frb_device *adev);
+int frb_cik_sdma_test(struct frb_device *adev, int instance, int test);
+int frb_cik_sdma_copy_buffer(struct frb_device *adev, int instance, uint64_t src_offset, uint64_t dst_offset,
+			     uint32_t byte_count);
+int frb_cik_sdma_fill_buffer(struct frb_device *adev, int instance, uint32_t src_data, uint64_t dst_addr,
+			     uint32_t byte_count);
+struct frb_ring *frb_cik_sdma_ring(struct frb_device *adev, int instance);
+void frb_cik_sdma_pad_ib(struct frb_ring *ring, struct frb_ib *ib);
+void frb_cik_sdma_set_clockgating_state(struct frb_device *adev, int gate);
 int frb_engine_test(struct frb_device *adev, int engine, int test);
 void frb_engines_fini(struct frb_device *adev);
 /* gfx_v9_0's counterpart of frb_gfx_v8_0_get_info (the GFX9 fields of frb_gfx_info filled in) */
@@ -736,7 +834,8 @@ int frb_gfx_v9_0_get_info(struct frb_device *adev, struct frb_gfx_info *info);
  * The accelerator's engines by family (frb_engines.c), as amdgpu reaches
  * them through adev->gfx.gfx_ring[0], adev->mman.buffer_funcs_ring and
  * buffer_funcs: gfx_v8_0 / sdma_v3_0 on VI (Polaris), gfx_v6_0 / si_dma on
- * SI, gfx_v9_0 / sdma_v4_0 on SOC15 (Vega 20). The kext calls only these;
+ * SI, gfx_v7_0 / cik_sdma on CIK (Hawaii), gfx_v9_0 / sdma_v4_0 on SOC15
+ * (Vega 20). The kext calls only these;
  * every family choice it would otherwise make is here. UVD is uvd_v6_0 on
  * VI and uvd_v7_0 on Vega 20, behind frb_uvd.h's calls (frb_uvd_ring,
  * frb_uvd_ring_begin_use, the idle work), which the video sessions use on
@@ -746,6 +845,11 @@ int frb_gfx_v9_0_get_info(struct frb_device *adev, struct frb_gfx_info *info);
 static inline int frb_is_si(const struct frb_device *adev)
 {
 	return adev->family == AMDGPU_FAMILY_SI;
+}
+/* Sea Islands (CIK: Bonaire, Hawaii): gmc_v7_0, gfx_v7_0, cik_sdma, dce_v8_0, CI DPM */
+static inline int frb_is_cik(const struct frb_device *adev)
+{
+	return adev->family == AMDGPU_FAMILY_CI;
 }
 struct frb_ring *frb_gfx_ring(struct frb_device *adev);			/* NULL unless the ring is up */
 struct frb_ring *frb_sdma_ring(struct frb_device *adev, int instance);	/* NULL unless the ring is up */
@@ -771,14 +875,12 @@ uint32_t frb_get_xclk(struct frb_device *adev);
 void frb_gfx_hang_status(struct frb_device *adev, uint32_t *grbm_status, uint32_t *cp_stat,
 			 uint32_t *cp_stalled_stat1);
 /*
- * the UVD block this driver drives: uvd_v6_0 on VI, uvd_v7_0 on Vega 20;
- * none on another SOC15 chip, and none on SI yet (uvd_v3_1 is ported, not
- * yet run on the card: the plug-in waits for stage uvd to pass there)
+ * the UVD block this driver drives: uvd_v3_1 on SI, uvd_v6_0 on VI,
+ * uvd_v7_0 on Vega 20; none on CIK yet (uvd_v4_2) or another SOC15 chip
  */
 static inline int frb_has_uvd(const struct frb_device *adev)
 {
-	if (frb_is_si(adev))
-		return 0;
+	/* SI's uvd_v3_1, CIK's uvd_v4_2, VI's uvd_v6_0, Vega 20's uvd_v7_0 */
 	return !frb_is_soc15(adev) || adev->asic_type == CHIP_VEGA20;
 }
 
@@ -937,6 +1039,19 @@ int frb_si_gfx_addr_config(struct frb_device *adev);
 /* gmc_v6_0.c (frb_gmc_v6_0.c) */
 int frb_gmc_v6_0_sw_init(struct frb_device *adev);
 int frb_gmc_v6_0_hw_init(struct frb_device *adev);
+
+/* cik.c (frb_cik.c): stage smu on CIK, the reference clock */
+int frb_cik_smc_stage(struct frb_device *adev);
+uint32_t frb_cik_get_xclk(struct frb_device *adev);	/* cik_get_xclk, 10 kHz */
+/* gfx_v7_0_constants_init's GB_ADDR_CONFIG and its HDP/DMIF/SDMA copies (stage dce runs it first, as on SI) */
+int frb_cik_gfx_addr_config(struct frb_device *adev);
+/* cik_srbm_select: the ME/pipe/queue/VMID instance of the SRBM-indexed registers (SH_MEM_*, SDMA0_GFX_VIRTUAL_ADDR ...) */
+void frb_cik_srbm_select(struct frb_device *adev, uint32_t me, uint32_t pipe, uint32_t queue, uint32_t vmid);
+
+/* gmc_v7_0.c (frb_gmc_v7_0.c) */
+int frb_gmc_v7_0_sw_init(struct frb_device *adev);
+int frb_gmc_v7_0_hw_init(struct frb_device *adev);
+void frb_gmc_v7_0_set_clockgating_state(struct frb_device *adev, int gate);
 
 /* gmc_v8_0.c (frb_gmc_v8_0.c) */
 void frb_gmc_v8_0_early_init(struct frb_device *adev);

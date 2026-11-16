@@ -304,6 +304,7 @@ private:
 	void videoPoison(int error, const char *why);
 	int videoBindLocked(FirebrandVideoMemory *memory, UInt32 *first, UInt32 *pages);
 	int videoCommand(UInt32 type, const rdn_uvd_h264_picture *picture, UInt32 bitstreamBytes);
+	bool videoFeedback(UInt32 *words, UInt32 count);
 	void videoCleanup(bool destroy, bool hardware);
 	void videoRetire(void);
 	void videoReleaseAll(void);

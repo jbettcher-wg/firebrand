@@ -7,6 +7,8 @@
  *   boot-arg frb_stage=N           the same, overriding the personality
  *   FirebrandAllowRegWrite / boot-arg frb_regwrite=1   frbctl wr is refused without it
  *   FirebrandBringUp / boot-arg frb_bringup=1  stages past the card row's verified one (new cards)
+ *   FirebrandUnlock / boot-arg frb_unlock=1|0  an UNTESTED card (no row of its own, a ported family)
+ *                                  past display-only (stage dce); `sudo frbctl unlock` / `lock` write it
  *   FirebrandAdopt / boot-arg frb_adopt=1      go on with a card an earlier load already brought
  *                                  up in this boot (SMC running) instead of asking for a reboot
  *   FirebrandDisplay / boot-arg frb_display=1  after stage dce, light the first DP monitor at its
@@ -236,6 +238,7 @@ IOExternalMethod *FirebrandUserClient::getTargetAndMethodForIndex(IOService **ta
 		{ 0, (IOMethod)&FirebrandUserClient::methodLutSet, kIOUCScalarIScalarO, 1, 1 },
 		/* variable: a client built against an older (shorter) frb_user_status gets its prefix */
 		{ 0, (IOMethod)&FirebrandUserClient::methodStatus, kIOUCScalarIStructO, 0, kIOUCVariableStructureSize },
+		{ 0, (IOMethod)&FirebrandUserClient::methodUnlock, kIOUCScalarIScalarO, 1, 1 },
 	};
 
 	/* an 'frbs' client: its own numbers (FRB_US_*), only the status */
@@ -292,6 +295,11 @@ IOReturn FirebrandUserClient::methodSmcRead(UInt32 addr, UInt32 *value)
 IOReturn FirebrandUserClient::methodRunStage(UInt32 stage, SInt32 *result)
 {
 	return fCore->ucRunStage(stage, result);
+}
+
+IOReturn FirebrandUserClient::methodUnlock(UInt32 on, UInt32 *cap)
+{
+	return fCore->ucUnlock(on, cap);
 }
 
 IOReturn FirebrandUserClient::methodVramRead(UInt32 offset, UInt32 *value)

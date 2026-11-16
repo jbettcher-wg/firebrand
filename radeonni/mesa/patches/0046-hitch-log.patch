@@ -1,0 +1,351 @@
+osx-gpu: RDN_HITCH_LOG, where a long frame's time went
+
+A program that runs smoothly and then stops for a tenth of a second or more
+when something new comes into view (Doom 3, T4240, 2026-11-15) raises the
+question of whose time that is: a shader compiled or waited for at a draw, a
+texture or buffer uploaded, the program's thread waiting for glthread, or
+glthread for the driver's thread -- or none of them, and the program's own.
+
+RDN_HITCH_LOG=<ms> in the environment (1: 2 ms) prints one line to stderr,
+with the wall clock's time, for each of these that took at least that long:
+
+  shader-variant at-draw|async   si_create_shader_variant (stage, optimized)
+  shader-main-part async         a shader's main part on the compiler queue
+  shader-wait main-part-at-draw  a draw waiting for that queue
+  tex-upload, tex-upload-compressed   st_TexSubImage and its compressed twin
+  buffer-data, buffer-subdata    glBufferData/glBufferSubData in the driver
+  glthread-sync <call>           the program's thread waiting for glthread
+  glthread-queue-full            the same, with glthread eight batches behind
+  tc-sync <function>             a wait for the driver's thread
+  tc-queue-full                  glthread waiting to queue a batch to it
+
+The GL bundle adds a line for every frame out of step with its neighbours
+and the spread of all frames' times when the program ends (gld/rdn_mesa.c),
+and the OSMesa frontend the wait for the swap before (swap-wait). Unset, each
+site costs one compare.
+
+--- /dev/null
++++ b/src/util/rdn_hitch.h
+@@ -0,0 +1,59 @@
++/*
++ * osx-gpu: where a frame's time went when one frame takes far longer than
++ * its neighbours. RDN_HITCH_LOG=<ms> in the environment (1: 2 ms) prints one
++ * line to stderr for every instrumented step that took at least that long:
++ * a shader compiled or waited for at a draw, a texture or buffer upload, a
++ * wait of the program's thread for glthread or of glthread for the driver
++ * thread. The time is the wall clock's, as the GL bundle's frame lines use.
++ */
++#ifndef RDN_HITCH_H
++#define RDN_HITCH_H
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/time.h>
++
++static inline double
++rdn_hitch_now(void)
++{
++   struct timeval tv;
++
++   gettimeofday(&tv, NULL);
++   return tv.tv_sec + tv.tv_usec / 1e6;
++}
++
++/* The threshold in seconds; 0: off. */
++static inline double
++rdn_hitch_threshold(void)
++{
++   static double threshold = -1;
++
++   if (threshold < 0) {
++      const char *env = getenv("RDN_HITCH_LOG");
++      double ms = env ? atof(env) : 0;
++
++      threshold = !env ? 0 : (ms > 1 ? ms : 2) / 1e3;
++   }
++   return threshold;
++}
++
++static inline double
++rdn_hitch_begin(void)
++{
++   return rdn_hitch_threshold() > 0 ? rdn_hitch_now() : 0;
++}
++
++static inline void
++rdn_hitch_end(double t0, const char *what, const char *detail, long a, long b)
++{
++   double t1;
++
++   if (t0 == 0)
++      return;
++   t1 = rdn_hitch_now();
++   if (t1 - t0 >= rdn_hitch_threshold())
++      fprintf(stderr, "rdn-hitch %.3f %s %s %ld %ld: %.1f ms\n", t1, what,
++              detail ? detail : "", a, b, (t1 - t0) * 1e3);
++}
++
++#endif
+--- a/src/mesa/main/glthread.c
++++ b/src/mesa/main/glthread.c
+@@ -34,6 +34,7 @@
+ 
+ #include "main/mtypes.h"
+ #include "main/glthread.h"
++#include "util/rdn_hitch.h"
+ #include "main/glthread_marshal.h"
+ #include "main/hash.h"
+ #include "main/pixelstore.h"
+@@ -401,8 +402,14 @@
+ 
+    struct glthread_batch *next = glthread->next_batch;
+ 
+-   util_queue_add_job(&glthread->queue, next, &next->fence,
+-                      glthread_unmarshal_batch, NULL, 0);
++   {
++      /* osx-gpu: the program's thread waits here when glthread is eight batches behind. */
++      double rdn_t0 = rdn_hitch_begin();
++
++      util_queue_add_job(&glthread->queue, next, &next->fence,
++                         glthread_unmarshal_batch, NULL, 0);
++      rdn_hitch_end(rdn_t0, "glthread-queue-full", "", 0, 0);
++   }
+    glthread->last = glthread->next;
+    glthread->next = (glthread->next + 1) % MARSHAL_MAX_BATCHES;
+    glthread->next_batch = &glthread->batches[glthread->next];
+@@ -463,7 +470,10 @@
+ void
+ _mesa_glthread_finish_before(struct gl_context *ctx, const char *func)
+ {
++   double rdn_t0 = rdn_hitch_begin();
++
+    _mesa_glthread_finish(ctx);
++   rdn_hitch_end(rdn_t0, "glthread-sync", func, 0, 0);
+ 
+    /* Uncomment this if you want to know where glthread syncs. */
+    /*printf("fallback to sync: %s\n", func);*/
+--- a/src/gallium/auxiliary/util/u_threaded_context.c
++++ b/src/gallium/auxiliary/util/u_threaded_context.c
+@@ -25,6 +25,7 @@
+  **************************************************************************/
+ 
+ #include "util/u_threaded_context.h"
++#include "util/rdn_hitch.h"
+ #include "util/u_cpu_detect.h"
+ #include "util/format/u_format.h"
+ #include "util/u_framebuffer.h"
+@@ -585,8 +586,13 @@
+    }
+ 
+    tc_update_batch_generation(tc, next);
+-   util_queue_add_job(&tc->queue, next, &next->fence, tc_batch_execute,
+-                      NULL, 0);
++   {
++      double rdn_t0 = rdn_hitch_begin();
++
++      util_queue_add_job(&tc->queue, next, &next->fence, tc_batch_execute,
++                         NULL, 0);
++      rdn_hitch_end(rdn_t0, "tc-queue-full", "", 0, 0);
++   }
+    tc->last = tc->next;
+    tc->next = next_id;
+    tc_begin_next_buffer_list(tc);
+@@ -713,7 +719,21 @@
+ }
+ 
+ static void
+-_tc_sync(struct threaded_context *tc, UNUSED const char *info, UNUSED const char *func)
++_tc_sync_real(struct threaded_context *tc, UNUSED const char *info, UNUSED const char *func);
++
++static void
++_tc_sync(struct threaded_context *tc, const char *info, const char *func)
++{
++   double rdn_t0 = rdn_hitch_begin();
++
++   _tc_sync_real(tc, info, func);
++   rdn_hitch_end(rdn_t0, "tc-sync", func, 0, 0);
++   if (rdn_t0 != 0 && info && *info)
++      rdn_hitch_end(rdn_t0, "tc-sync-info", info, 0, 0);
++}
++
++static void
++_tc_sync_real(struct threaded_context *tc, UNUSED const char *info, UNUSED const char *func)
+ {
+    struct tc_batch *last = &tc->batch_slots[tc->last];
+    struct tc_batch *next = &tc->batch_slots[tc->next];
+--- a/src/gallium/drivers/radeonsi/gfx/si_state_shaders.cpp
++++ b/src/gallium/drivers/radeonsi/gfx/si_state_shaders.cpp
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include "util/rdn_hitch.h"
+ #include "si_gfx.h"
+ #include "ac_cmdbuf_cp.h"
+ #include "ac_nir.h"
+@@ -2509,7 +2510,12 @@
+    if (!si_shader_uses_aco(shader) && !*compiler)
+       *compiler = si_create_llvm_compiler(sscreen);
+ 
+-   if (unlikely(!si_create_shader_variant(sscreen, *compiler, shader, debug))) {
++   double rdn_t0 = rdn_hitch_begin();
++   bool rdn_ok = si_create_shader_variant(sscreen, *compiler, shader, debug);
++
++   rdn_hitch_end(rdn_t0, "shader-variant", thread_index < 0 ? "at-draw" : "async",
++                 sel->stage, shader->is_optimized);
++   if (unlikely(!rdn_ok)) {
+       PRINT_ERR("Failed to build shader variant (type=%u)\n", sel->stage);
+       shader->compilation_failed = true;
+       return;
+@@ -2656,7 +2662,12 @@
+     * compilation calls this function too, and therefore must enter
+     * the mutex first.
+     */
+-   util_queue_fence_wait(&sel->ready);
++   {
++      double rdn_t0 = rdn_hitch_begin();
++
++      util_queue_fence_wait(&sel->ready);
++      rdn_hitch_end(rdn_t0, "shader-wait", "main-part-at-draw", sel->stage, 0);
++   }
+ 
+    simple_mtx_lock(&sel->mutex);
+ 
+@@ -2925,8 +2936,19 @@
+  * si_shader_selector initialization. Since it can be done asynchronously,
+  * there is no way to report compile failures to applications.
+  */
++static void si_init_shader_selector_async_real(void *job, void *gdata, int thread_index);
++
+ static void si_init_shader_selector_async(void *job, void *gdata, int thread_index)
+ {
++   double rdn_t0 = rdn_hitch_begin();
++
++   si_init_shader_selector_async_real(job, gdata, thread_index);
++   rdn_hitch_end(rdn_t0, "shader-main-part", "async",
++                 ((struct si_shader_selector *)job)->stage, thread_index);
++}
++
++static void si_init_shader_selector_async_real(void *job, void *gdata, int thread_index)
++{
+    struct si_shader_selector *sel = (struct si_shader_selector *)job;
+    struct si_screen *sscreen = sel->screen;
+    struct ac_llvm_compiler **compiler;
+--- a/src/mesa/state_tracker/st_cb_texture.c
++++ b/src/mesa/state_tracker/st_cb_texture.c
+@@ -25,6 +25,7 @@
+  *
+  **************************************************************************/
+ 
++#include "util/rdn_hitch.h"
+ #include <stdio.h>
+ #include "main/bufferobj.h"
+ #include "main/context.h"
+@@ -2138,6 +2139,14 @@
+ }
+ 
+ 
++static void
++st_TexSubImage_real(struct gl_context *ctx, GLuint dims,
++               struct gl_texture_image *texImage,
++               GLint xoffset, GLint yoffset, GLint zoffset,
++               GLint width, GLint height, GLint depth,
++               GLenum format, GLenum type, const void *pixels,
++               const struct gl_pixelstore_attrib *unpack);
++
+ void
+ st_TexSubImage(struct gl_context *ctx, GLuint dims,
+                struct gl_texture_image *texImage,
+@@ -2146,6 +2155,22 @@
+                GLenum format, GLenum type, const void *pixels,
+                const struct gl_pixelstore_attrib *unpack)
+ {
++   double rdn_t0 = rdn_hitch_begin();
++
++   st_TexSubImage_real(ctx, dims, texImage, xoffset, yoffset, zoffset, width, height,
++                       depth, format, type, pixels, unpack);
++   rdn_hitch_end(rdn_t0, "tex-upload", _mesa_enum_to_string(texImage->InternalFormat),
++                 width, height);
++}
++
++static void
++st_TexSubImage_real(struct gl_context *ctx, GLuint dims,
++               struct gl_texture_image *texImage,
++               GLint xoffset, GLint yoffset, GLint zoffset,
++               GLint width, GLint height, GLint depth,
++               GLenum format, GLenum type, const void *pixels,
++               const struct gl_pixelstore_attrib *unpack)
++{
+    struct st_context *st = st_context(ctx);
+    struct gl_texture_object *stObj = texImage->TexObject;
+    struct pipe_context *pipe = st->pipe;
+@@ -2465,11 +2490,32 @@
+    return try_pbo_upload_common(ctx, surface_templ, &addr, surface_templ->format);
+ }
+ 
++static void
++st_CompressedTexSubImage_real(struct gl_context *ctx, GLuint dims,
++                         struct gl_texture_image *texImage,
++                         GLint x, GLint y, GLint z,
++                         GLsizei w, GLsizei h, GLsizei d,
++                         GLenum format, size_t imageSize, const void *data);
++
+ void
+ st_CompressedTexSubImage(struct gl_context *ctx, GLuint dims,
+                          struct gl_texture_image *texImage,
+                          GLint x, GLint y, GLint z,
+                          GLsizei w, GLsizei h, GLsizei d,
++                         GLenum format, size_t imageSize, const void *data)
++{
++   double rdn_t0 = rdn_hitch_begin();
++
++   st_CompressedTexSubImage_real(ctx, dims, texImage, x, y, z, w, h, d, format,
++                                 imageSize, data);
++   rdn_hitch_end(rdn_t0, "tex-upload-compressed", _mesa_enum_to_string(format), w, h);
++}
++
++static void
++st_CompressedTexSubImage_real(struct gl_context *ctx, GLuint dims,
++                         struct gl_texture_image *texImage,
++                         GLint x, GLint y, GLint z,
++                         GLsizei w, GLsizei h, GLsizei d,
+                          GLenum format, size_t imageSize, const void *data)
+ {
+    struct st_context *st = st_context(ctx);
+--- a/src/mesa/main/bufferobj.c
++++ b/src/mesa/main/bufferobj.c
+@@ -30,6 +30,7 @@
+  * \author Brian Paul, Ian Romanick
+  */
+ 
++#include "util/rdn_hitch.h"
+ #include <stdbool.h>
+ #include <inttypes.h>  /* for PRId64 macro */
+ #include "util/u_debug.h"
+@@ -112,11 +113,13 @@
+     * by using PIPE_MAP_DIRECTLY.
+     */
+    struct pipe_context *pipe = ctx->pipe;
++   double rdn_t0 = rdn_hitch_begin();
+ 
+    pipe->buffer_subdata(pipe, obj->buffer,
+                         _mesa_bufferobj_mapped(obj, MAP_USER) ?
+                            PIPE_MAP_DIRECTLY : 0,
+                         offset, size, data);
++   rdn_hitch_end(rdn_t0, "buffer-subdata", "", (long)size, (long)offset);
+ }
+ 
+ 
+@@ -407,7 +410,11 @@
+                   GLbitfield storageFlags,
+                   struct gl_buffer_object *obj)
+ {
+-   return bufferobj_data(ctx, target, size, data, NULL, 0, usage, storageFlags, obj);
++   double rdn_t0 = rdn_hitch_begin();
++   GLboolean ok = bufferobj_data(ctx, target, size, data, NULL, 0, usage, storageFlags, obj);
++
++   rdn_hitch_end(rdn_t0, "buffer-data", data ? "with-data" : "no-data", (long)size, 0);
++   return ok;
+ }
+ 
+ static GLboolean

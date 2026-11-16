@@ -293,8 +293,9 @@ static int stage_post(struct frb_device *adev)
 			frb_info(adev, "post: ADOPT: an earlier load left the card running (%s); continuing without "
 				 "the reset (FirebrandAdopt)", frb_funcs(adev)->name);
 		} else {
-			frb_info(adev, "post: an earlier load in this boot left the card running (%s: VI's SMC, SI's CP): "
-				 "resetting the ASIC, as amdgpu does on init", frb_funcs(adev)->name);
+			frb_info(adev, "post: an earlier load in this boot left the card running (%s: VI's SMC, SI's CP, "
+				 "CIK's SMC, CP or moved VRAM): resetting the ASIC, as amdgpu does on init",
+				 frb_funcs(adev)->name);
 			r = frb_funcs(adev)->asic_reset ? frb_funcs(adev)->asic_reset(adev) : -ENOSYS;
 			if (r) {
 				frb_err(adev, "post: asic reset on init failed (%d)", r);
@@ -308,6 +309,9 @@ static int stage_post(struct frb_device *adev)
 			 frb_funcs(adev)->family == AMDGPU_FAMILY_SI ? "CONFIG_MEMSIZE" : "BIOS_SCRATCH_7");
 	} else {
 		frb_info(adev, "post: GPU posting now...");
+		/* amdgpu_device_asic_init: amdgpu_asic_pre_asic_init first (CIK: the SMC's clock, frb_cik.c) */
+		if (frb_funcs(adev)->pre_asic_init)
+			frb_funcs(adev)->pre_asic_init(adev);
 		t0 = adev->os->time_ms(adev->os->cookie);
 		r = frb_device_asic_init(adev);
 		adev->asic_init_ms = (uint32_t)(adev->os->time_ms(adev->os->cookie) - t0);
@@ -491,7 +495,9 @@ static void stage_dpm(struct frb_device *adev)
 {
 	int pr;
 
-	if (!adev->want_dpm || adev->stage_done < FRB_STAGE_SDMA || adev->pm || adev->dpm_failed)
+	/* CIK: right after stage smu (frb_ci_dpm.c: a Hawaii heats up at its boot clocks) */
+	if (!adev->want_dpm || adev->stage_done < (frb_is_cik(adev) ? FRB_STAGE_SMU : FRB_STAGE_SDMA) ||
+	    adev->pm || adev->dpm_failed || (frb_is_cik(adev) && frb_pm_enabled(adev)))
 		return;
 	frb_info(adev, "dpm: begin (powerplay hw_init, late_init)");
 	pr = frb_pm_hw_init(adev);
@@ -522,16 +528,26 @@ int frb_device_init(struct frb_device *adev, enum frb_stage stage)
 			adev->subsys_vendor, adev->subsys_device);
 		return -EPERM;
 	}
-	if (adev->row && stage > adev->row->max_stage) {
+	if (adev->row && stage > frb_stage_cap(adev)) {
+		if (adev->row->untested && !frb_asic_ported(adev->asic_type)) {
+			/* nothing of this chip is ported: not even FirebrandBringUp runs a stage on it */
+			frb_err(adev, "stage %s asked, but %s has no Firebrand port yet", frb_stage_name(stage),
+				frb_asic_name(adev->asic_type));
+			return -ENOSYS;
+		}
 		if (!adev->allow_unverified) {
-			frb_err(adev, "stage %s asked, but %s is verified only to stage %s",
-				frb_stage_name(stage), adev->row->board,
-				frb_stage_name((enum frb_stage)adev->row->max_stage));
+			if (adev->row->untested)
+				frb_err(adev, "stage %s asked, but this is an untested card: display-only (stage %s) "
+					"until it is unlocked (sudo frbctl unlock)", frb_stage_name(stage),
+					frb_stage_name(frb_stage_cap(adev)));
+			else
+				frb_err(adev, "stage %s asked, but %s is verified only to stage %s",
+					frb_stage_name(stage), adev->row->board,
+					frb_stage_name((enum frb_stage)adev->row->max_stage));
 			return -EPERM;
 		}
-		frb_info(adev, "BRING-UP: stage %s on %s, verified only to stage %s (FirebrandBringUp)",
-			 frb_stage_name(stage), adev->row->board,
-			 frb_stage_name((enum frb_stage)adev->row->max_stage));
+		frb_info(adev, "BRING-UP: stage %s on %s, allowed only to stage %s (FirebrandBringUp)",
+			 frb_stage_name(stage), adev->row->board, frb_stage_name(frb_stage_cap(adev)));
 	}
 	if (adev->stage_failed) {
 		frb_err(adev, "an earlier stage failed (%d); reboot before trying again",
@@ -562,11 +578,12 @@ int frb_device_init(struct frb_device *adev, enum frb_stage stage)
 done:
 		if (r) {
 			adev->stage_failed = r;
+			adev->stage_failed_at = s;
 			frb_err(adev, "stage %s: FAILED (%d)", frb_stage_name(s), r);
 		} else {
 			adev->stage_done = s;
 			frb_info(adev, "stage %s: done", frb_stage_name(s));
-			if (s == FRB_STAGE_SDMA && !frb_is_soc15(adev))
+			if ((s == FRB_STAGE_SDMA || (s == FRB_STAGE_SMU && frb_is_cik(adev))) && !frb_is_soc15(adev))
 				stage_dpm(adev);
 		}
 	}

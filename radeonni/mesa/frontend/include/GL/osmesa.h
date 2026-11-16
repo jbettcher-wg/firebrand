@@ -331,6 +331,15 @@ GLAPI void GLAPIENTRY
 OSMesaSwapBuffersAsync( OSMesaContext ctx );
 
 /*
+ * A window's swap that the program does not wait for: it runs in
+ * glthread's thread behind the frame, and shown(arg) is called there once
+ * the picture's copy to the surface is with the GPU. The next call waits
+ * for the one before. False: done at once, shown() is not called.
+ */
+GLAPI GLboolean GLAPIENTRY
+OSMesaSwapBuffersNotify( OSMesaContext ctx, void (*shown)(void *), void *arg );
+
+/*
  * osx-gpu: with glthread, the most bytes glBufferData or glBufferSubData
  * can be given in one call without the program's thread waiting for the
  * other one to finish everything before it. 0: the context has no

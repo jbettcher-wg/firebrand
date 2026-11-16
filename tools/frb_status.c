@@ -78,6 +78,20 @@ static int reg_number(io_registry_entry_t e, const char *key, unsigned *out)
 	return ok;
 }
 
+/* a boolean property */
+static int reg_bool(io_registry_entry_t e, const char *key)
+{
+	CFStringRef k = CFStringCreateWithCString(kCFAllocatorDefault, key, kCFStringEncodingUTF8);
+	CFTypeRef v = k ? IORegistryEntryCreateCFProperty(e, k, kCFAllocatorDefault, 0) : 0;
+	int on = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)v);
+
+	if (v)
+		CFRelease(v);
+	if (k)
+		CFRelease(k);
+	return on;
+}
+
 /* IOPCIDevice "reg": phys.hi = bus 23:16, device 15:11, function 10:8 */
 static int pci_location(io_registry_entry_t pci, unsigned *bus, unsigned *dev, unsigned *fn)
 {
@@ -127,22 +141,15 @@ static void find_audio_function(struct frb_card *c)
 	IOObjectRelease(it);
 }
 
-static void read_registry(struct frb_card *c)
+/* the PCI device's own properties: its identity, and the report the driver left there */
+static void read_pci(struct frb_card *c, io_registry_entry_t pci)
 {
-	io_registry_entry_t pci = 0;
-	io_name_t cls;
-	unsigned v;
-
-	if (IOObjectGetClass(c->service, cls) == KERN_SUCCESS)
-		copy_cstr(c->service_class, sizeof(c->service_class), cls);
-	reg_string(c->service, "FirebrandASIC", c->asic, sizeof(c->asic));
-	reg_string(c->service, "FirebrandBoard", c->board, sizeof(c->board));
-	reg_string(c->service, "FirebrandStageDone", c->stage, sizeof(c->stage));
-	reg_string(c->service, "FirebrandVersion", c->version, sizeof(c->version));
-	if (reg_number(c->service, "FirebrandStageFailed", &v))
-		c->stage_failed = (int)v;
-	if (IORegistryEntryGetParentEntry(c->service, kIOServicePlane, &pci) != KERN_SUCCESS)
-		return;
+	reg_string(pci, "FirebrandSupport", c->support, sizeof(c->support));
+	reg_string(pci, "FirebrandStageCap", c->stage_cap, sizeof(c->stage_cap));
+	reg_string(pci, "FirebrandStageFailedAt", c->failed_at, sizeof(c->failed_at));
+	reg_string(pci, "FirebrandStageError", c->stage_error, sizeof(c->stage_error));
+	reg_string(pci, "FirebrandVBIOS", c->vbios, sizeof(c->vbios));
+	c->unlocked = reg_bool(pci, "FirebrandUnlocked");
 	reg_number(pci, "vendor-id", &c->vendor);
 	reg_number(pci, "device-id", &c->device);
 	reg_number(pci, "subsystem-vendor-id", &c->subsys_vendor);
@@ -153,8 +160,60 @@ static void read_registry(struct frb_card *c)
 	reg_number(pci, "IOPCIExpressLinkStatus", &c->reg_link_status);
 	reg_number(pci, "IOPCIExpressLinkCapabilities", &c->reg_link_caps);
 	pci_location(pci, &c->bus, &c->dev, &c->fn);
+}
+
+static void read_registry(struct frb_card *c)
+{
+	io_registry_entry_t pci = 0;
+	io_name_t cls;
+	unsigned v;
+
+	if (c->detached) {
+		/* no driver on the card: everything is on the PCI device */
+		copy_cstr(c->service_class, sizeof(c->service_class), "none");
+		reg_string(c->service, "FirebrandASIC", c->asic, sizeof(c->asic));
+		reg_string(c->service, "FirebrandBoard", c->board, sizeof(c->board));
+		reg_string(c->service, "FirebrandStageDone", c->stage, sizeof(c->stage));
+		reg_string(c->service, "FirebrandVersion", c->version, sizeof(c->version));
+		if (reg_number(c->service, "FirebrandStageFailed", &v))
+			c->stage_failed = (int)v;
+		read_pci(c, c->service);
+		find_audio_function(c);
+		return;
+	}
+	if (IOObjectGetClass(c->service, cls) == KERN_SUCCESS)
+		copy_cstr(c->service_class, sizeof(c->service_class), cls);
+	reg_string(c->service, "FirebrandASIC", c->asic, sizeof(c->asic));
+	reg_string(c->service, "FirebrandBoard", c->board, sizeof(c->board));
+	reg_string(c->service, "FirebrandStageDone", c->stage, sizeof(c->stage));
+	reg_string(c->service, "FirebrandVersion", c->version, sizeof(c->version));
+	if (reg_number(c->service, "FirebrandStageFailed", &v))
+		c->stage_failed = (int)v;
+	if (IORegistryEntryGetParentEntry(c->service, kIOServicePlane, &pci) != KERN_SUCCESS)
+		return;
+	read_pci(c, pci);
 	IOObjectRelease(pci);
 	find_audio_function(c);
+}
+
+int frb_card_support(const struct frb_card *c)
+{
+	if (c->have_status && c->st.version >= 2)
+		return (int)c->st.support;
+	if (!strcmp(c->support, "verified"))
+		return FRB_SUPPORT_VERIFIED;
+	if (!strcmp(c->support, "untested"))
+		return FRB_SUPPORT_UNTESTED;
+	if (!strcmp(c->support, "not ported"))
+		return FRB_SUPPORT_NOT_PORTED;
+	return -1;
+}
+
+int frb_card_unlocked(const struct frb_card *c)
+{
+	if (c->have_status && c->st.version >= 2)
+		return (c->st.flags & FRB_SF_UNLOCKED) != 0;
+	return c->unlocked;
 }
 
 int frb_card_has(const struct frb_card *c, uint32_t bit)
@@ -169,6 +228,12 @@ kern_return_t frb_card_refresh(struct frb_card *c)
 	kern_return_t r;
 
 	reg_string(c->service, "FirebrandStageDone", c->stage, sizeof(c->stage));
+	if (c->detached) {
+		io_registry_entry_t pci = c->service;
+
+		reg_string(pci, "FirebrandStageCap", c->stage_cap, sizeof(c->stage_cap));
+		c->unlocked = reg_bool(pci, "FirebrandUnlocked");
+	}
 	if (!c->conn) {
 		c->have_status = 0;
 		return c->open_error ? c->open_error : kIOReturnNotOpen;
@@ -195,6 +260,7 @@ kern_return_t frb_card_refresh(struct frb_card *c)
 int frb_cards_open(struct frb_card *cards, int max)
 {
 	static const char *classes[] = { FRB_UC_FB_CLASS, FRB_UC_SERVICE_CLASS };
+	struct frb_card *c;
 	int n = 0, k, i, j;
 
 	for (k = 0; k < 2; k++) {
@@ -204,8 +270,6 @@ int frb_cards_open(struct frb_card *cards, int max)
 		if (IOServiceGetMatchingServices(kIOMasterPortDefault, IOServiceMatching(classes[k]), &it) != KERN_SUCCESS)
 			continue;
 		while ((s = IOIteratorNext(it))) {
-			struct frb_card *c;
-
 			if (n >= max) {
 				IOObjectRelease(s);
 				continue;
@@ -220,6 +284,43 @@ int frb_cards_open(struct frb_card *cards, int max)
 			frb_card_refresh(c);
 		}
 		IOObjectRelease(it);
+	}
+	/*
+	 * Cards no Firebrand service stayed on (a start that failed, a Vega 10/12
+	 * it only identifies): the report the driver left on the PCI device.
+	 */
+	{
+		io_iterator_t it = 0;
+		io_service_t s;
+
+		if (IOServiceGetMatchingServices(kIOMasterPortDefault, IOServiceMatching("IOPCIDevice"), &it) == KERN_SUCCESS) {
+			while ((s = IOIteratorNext(it))) {
+				char support[16];
+				unsigned bus, dev, fn;
+				int known = 0;
+
+				if (n >= max || !reg_string(s, "FirebrandSupport", support, sizeof(support)) ||
+				    !pci_location(s, &bus, &dev, &fn)) {
+					IOObjectRelease(s);
+					continue;
+				}
+				for (i = 0; i < n; i++)
+					if (cards[i].bus == bus && cards[i].dev == dev && cards[i].fn == fn)
+						known = 1;
+				if (known) {
+					IOObjectRelease(s);
+					continue;
+				}
+				c = &cards[n++];
+				memset(c, 0, sizeof(*c));
+				c->service = s;
+				c->detached = 1;
+				c->open_error = kIOReturnNotAttached;
+				read_registry(c);
+				frb_card_refresh(c);
+			}
+			IOObjectRelease(it);
+		}
 	}
 	/* by PCI bus, so "card 1" stays the same card */
 	for (i = 1; i < n; i++)
@@ -459,6 +560,28 @@ static void rows_card(const struct frb_card *c, struct rows *rs)
 	    have ? st->vendor : c->vendor, have ? st->device : c->device, have ? st->revision : c->revision,
 	    have ? st->subsys_vendor : c->subsys_vendor, have ? st->subsys_device : c->subsys_device);
 	row(rs, "PCI location", "bus %u, device %u, function %u", c->bus, c->dev, c->fn);
+	if (have && st->version >= 2 && st->vbios_pn[0])
+		row(rs, "VBIOS", "%s%s%s%s%s", st->vbios_pn, st->vbios_ver[0] ? ", version " : "", st->vbios_ver,
+		    st->vbios_date[0] ? ", " : "", st->vbios_date);
+	else if (c->vbios[0])
+		row(rs, "VBIOS", "%s", c->vbios);
+	else
+		row(rs, "VBIOS", FRB_NOT_AVAILABLE);
+	switch (frb_card_support(c)) {
+	case FRB_SUPPORT_VERIFIED:
+		row(rs, "Support", "verified on hardware (this card's own row)");
+		break;
+	case FRB_SUPPORT_UNTESTED:
+		row(rs, "Support", "UNTESTED card (no verified row): %s",
+		    frb_card_unlocked(c) ? "unlocked, every stage the family has (sudo frbctl lock goes back)" :
+		    "display-only (stage dce); sudo frbctl unlock tries the rest");
+		break;
+	case FRB_SUPPORT_NOT_PORTED:
+		row(rs, "Support", "recognised, NOT PORTED yet: identified only, nothing written to the card");
+		break;
+	default:
+		break;
+	}
 }
 
 static void rows_driver(const struct frb_card *c, struct rows *rs)
@@ -478,23 +601,43 @@ static void rows_driver(const struct frb_card *c, struct rows *rs)
 		row(rs, "Status interface", FRB_NOT_AVAILABLE " (IOServiceOpen 'frbs': 0x%x; the driver predates it)",
 		    (unsigned)c->open_error);
 	if (c->have_status) {
-		char verified[32];
+		char verified[48];
 
 		if (st->row_max_stage == 0xff)
 			snprintf(verified, sizeof(verified), "no family-table row");
+		else if (st->version >= 2 && st->support != FRB_SUPPORT_VERIFIED)
+			snprintf(verified, sizeof(verified), "allowed to %s", frb_stage_label(st->stage_cap));
 		else
 			snprintf(verified, sizeof(verified), "verified to %s", frb_stage_label(st->row_max_stage));
-		if (st->stage_failed)
+		if (st->stage_failed && st->version >= 2)
+			row(rs, "Stage", "%s done, stage %s FAILED (error %d); card %s%s", frb_stage_label(st->stage_done),
+			    frb_stage_label(st->stage_failed_at), (int)st->stage_failed, verified,
+			    st->flags & FRB_SF_BRINGUP ? ", bring-up on" : "");
+		else if (st->stage_failed)
 			row(rs, "Stage", "%s done, the next one FAILED (error %d); card %s%s", frb_stage_label(st->stage_done),
 			    (int)st->stage_failed, verified, st->flags & FRB_SF_BRINGUP ? ", bring-up on" : "");
 		else
 			row(rs, "Stage", "%s; card %s%s", frb_stage_label(st->stage_done), verified,
 			    st->flags & FRB_SF_BRINGUP ? ", bring-up on (past the verified stage allowed)" : "");
+		if (st->stage_failed && st->version >= 2 && st->stage_error[0])
+			row(rs, "Stage failure", "%s", st->stage_error);
 		row(rs, "Runs as", "%s%s%s", c->service_class[0] ? c->service_class : "?",
 		    st->flags & FRB_SF_FRAMEBUFFER ? " (the desktop's display)" : " (headless control)",
-		    st->flags & FRB_SF_ACCEL ? ", accelerator on" : ", no accelerator");
+		    !(st->flags & FRB_SF_ACCEL) ? ", no accelerator" :
+		    frb_card_has(c, FRB_ST_VRAM_HEAP) ? ", accelerator on" :
+		    st->stage_done >= 6 ? ", accelerator asked for, not started (it starts with the driver: restart)" :
+		    ", accelerator asked for (it needs stage sdma)");
 		if (st->flags & FRB_SF_STOPPED)
 			row(rs, "State", "stopping: identity only");
+	} else if (c->detached) {
+		if (c->stage_failed)
+			row(rs, "Stage", "%s done, stage %s FAILED (error %d); card allowed to %s", c->stage[0] ? c->stage : "?",
+			    c->failed_at[0] ? c->failed_at : "?", c->stage_failed, c->stage_cap[0] ? c->stage_cap : "?");
+		else
+			row(rs, "Stage", "%s; card allowed to %s", c->stage[0] ? c->stage : "?", c->stage_cap[0] ? c->stage_cap : "?");
+		if (c->stage_error[0])
+			row(rs, "Stage failure", "%s", c->stage_error);
+		row(rs, "Runs as", "nothing: Firebrand did not stay on the card (the report it left on the PCI device)");
 	} else {
 		row(rs, "Stage", "%s%s", c->stage[0] ? c->stage : FRB_NOT_AVAILABLE,
 		    c->stage_failed ? " (the next one FAILED)" : "");
@@ -520,12 +663,17 @@ static void rows_power(const struct frb_card *c, struct rows *rs)
 		row(rs, "DPM", "FAILED to start (error %d)", (int)st->dpm_failed);
 		break;
 	case FRB_DPM_STATE_PENDING:
-		row(rs, "DPM", "asked for; the stages have not reached it");
+		row(rs, "DPM", "asked for; the stages have not reached it%s",
+		    (st->flags & FRB_SF_UNTESTED) && !(st->flags & FRB_SF_UNLOCKED) ?
+		    " (an untested card reaches it once unlocked)" : "");
 		break;
 	default:
 		row(rs, "DPM", "off%s", st->flags & FRB_SF_DPM ? "" : " (FirebrandDPM off)");
 		break;
 	}
+	if (st->version >= 2 && (st->boot_gfx_mhz || st->boot_mem_mhz))
+		row(rs, "Boot clocks", "GPU %u MHz, memory %u MHz (the VBIOS's, without power management)",
+		    st->boot_gfx_mhz, st->boot_mem_mhz);
 	if (frb_card_has(c, FRB_ST_SMU)) {
 		uint64_t f = (uint64_t)st->features_hi << 32 | st->features_lo;
 
@@ -541,7 +689,8 @@ static void rows_power(const struct frb_card *c, struct rows *rs)
 	if (frb_card_has(c, FRB_ST_GATING))
 		row(rs, "Clock gating", "%s (cg_flags 0x%08x)",
 		    st->gating & 2 ? "on, gated now" : st->gating & 1 ? "asked for, ungated now" :
-		    st->family == 110 ? "off (frb_cg=0)" : "off (FirebrandGating off)", (unsigned)st->cg_flags_lo);
+		    st->family == 110 || st->family == 120 ? "off (frb_cg=0)" : "off (FirebrandGating off)",
+		    (unsigned)st->cg_flags_lo);
 	else if (st->family == 110)
 		/* SI gates since 8bda848ce; a driver before 'the status call reports SI's gating' does not say */
 		row(rs, "Clock gating", "on/off unknown (this driver build does not report SI's)");
@@ -864,6 +1013,21 @@ size_t frb_report(struct frb_card *cards, int n, const char *generator, int fenc
 		const char *section = 0;
 
 		put(&o, "\nCard %d of %d: %s\n", i + 1, n, frb_card_name(&cards[i]));
+		switch (frb_card_support(&cards[i])) {
+		case FRB_SUPPORT_UNTESTED:
+			put(&o, "  ** UNTESTED CARD: Firebrand has not been verified on this card. It runs display-only\n"
+				"  ** unless unlocked (sudo frbctl unlock, then restart). Please paste this report into an\n"
+				"  ** issue at " FRB_ISSUES_URL ",\n"
+				"  ** with what you tried and what worked or broke.\n");
+			break;
+		case FRB_SUPPORT_NOT_PORTED:
+			put(&o, "  ** NOT PORTED: Firebrand recognises this chip but has no driver for it yet; it only\n"
+				"  ** identified the card. A report at " FRB_ISSUES_URL "\n"
+				"  ** helps decide what comes next.\n");
+			break;
+		default:
+			break;
+		}
 		nr = frb_card_rows(&cards[i], rows, FRB_MAX_ROWS);
 		for (k = 0; k < nr; k++) {
 			if (!section || strcmp(section, rows[k].section)) {

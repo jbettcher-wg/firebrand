@@ -73,22 +73,46 @@ int clock_getres(clockid_t clock, struct timespec *ts)
 
 /*
  * The block is found again by free() because the pointer handed out is
- * what malloc() returned: Tiger's malloc aligns to 16 bytes, and larger
- * requests go to valloc(), which aligns to a page. More than a page is not
+ * what malloc() returned. Tiger's and Leopard's malloc align to 16 bytes;
+ * a block of more than 1008 bytes comes from the allocator's "small"
+ * regions, which are cut in units of 512 bytes, or (15 KB and more)
+ * straight from the kernel in pages, so asking for at least 1024 bytes gets
+ * a block aligned to 512. That is checked, and what is not aligned as
+ * asked (another allocator in the program's zone), or wants more than 512,
+ * goes to valloc(), which aligns to a page. More than a page is not
  * supported.
+ *
+ * Everything between 16 and a page used to go to valloc(): a page from the
+ * kernel and back for every block. Mesa allocates each buffer and texture
+ * object aligned to a cache line, and a program that makes and drops
+ * buffers all the time (Doom 3's vertex caches) spent 3 % of its three GL
+ * threads in mmap and munmap (T4240, 2026-11-15).
  */
+#define SMALL_REGION_LEAST 1024
+#define SMALL_REGION_ALIGN 512
+
 int posix_memalign(void **memptr, size_t alignment, size_t size)
 {
 	void *p;
 
 	if (alignment < sizeof(void *) || (alignment & (alignment - 1)))
 		return EINVAL;
-	if (alignment <= 16)
+	if (alignment <= 16) {
 		p = malloc(size ? size : 1);
-	else if (alignment <= 4096)
-		p = valloc(size ? size : 1);
-	else
+	} else if (alignment <= 4096) {
+		p = NULL;
+		if (alignment <= SMALL_REGION_ALIGN) {
+			p = malloc(size < SMALL_REGION_LEAST ? SMALL_REGION_LEAST : size);
+			if (p && ((uintptr_t)p & (alignment - 1))) {
+				free(p);
+				p = NULL;
+			}
+		}
+		if (!p)
+			p = valloc(size ? size : 1);
+	} else {
 		return EINVAL;
+	}
 	if (!p)
 		return ENOMEM;
 	*memptr = p;

@@ -90,6 +90,7 @@ struct frb_si_dpm {
 	int forced;			/* enum amd_dpm_forced_level in force */
 	struct amd_pp_display_configuration cfg;
 	int have_cfg;
+	int uvd_active;			/* amdgpu's adev->pm.dpm.uvd_active: the UVD state is the one asked for */
 	struct frb_device *adev;
 	struct si_sw_trace sw;
 };
@@ -265,7 +266,44 @@ static int chip_of(struct frb_device *adev, struct rdn_chip_info *chip)
  */
 #define SI_SYS_PCIE_MASK	(RDN_SI_PCIE_SPEED_25 | RDN_SI_PCIE_SPEED_50)
 
+static int si_dpm_hw_init(struct frb_device *adev);
+
+/*
+ * amdgpu's order: si_dpm's hw_init (the SMC's start and the first state
+ * switch) runs in amdgpu_device_ip_init, the blocks' clock gating only in
+ * amdgpu_device_ip_late_init, after it. Firebrand gates at the end of stage
+ * sdma and starts DPM later, so the gating is taken off for the start and
+ * put back after. FRB_SI_DPM_CG_KEEP leaves it on throughout (what the
+ * attempts up to 2026-11-15 10:31 ran); FRB_SI_DPM_MC_UNGATED keeps the
+ * MC's MGCG and light sleep off afterwards.
+ */
 int frb_si_dpm_hw_init(struct frb_device *adev)
+{
+	int r, regate = 0;
+
+	if (adev->si_dpm)
+		return 0;
+	if (adev->si_dpm_wanted && adev->cg_on && !(adev->si_dpm_quirks & FRB_SI_DPM_CG_KEEP)) {
+		frb_si_dma_set_clockgating_state(adev, 0);
+		frb_gfx_v6_0_set_clockgating_state(adev, 0);
+		frb_gmc_v6_0_set_clockgating_state(adev, 0);
+		regate = 1;
+		frb_info(adev, "si_dpm: clock gating off for the SMC's start and first switch (amdgpu gates after it)");
+	}
+	r = si_dpm_hw_init(adev);
+	if (regate) {
+		frb_gmc_v6_0_set_clockgating_state(adev, 1);
+		frb_gfx_v6_0_set_clockgating_state(adev, 1);
+		frb_si_dma_set_clockgating_state(adev, 1);
+	}
+	if (adev->cg_on && adev->si_dpm && (adev->si_dpm_quirks & FRB_SI_DPM_MC_UNGATED)) {
+		frb_gmc_v6_0_set_mc_clockgating(adev, 0);
+		frb_info(adev, "si_dpm: the MC's clock gating and light sleep stay off (FRB_SI_DPM_MC_UNGATED)");
+	}
+	return r;
+}
+
+static int si_dpm_hw_init(struct frb_device *adev)
 {
 	struct frb_si_dpm *s;
 	const uint8_t *fw = 0;
@@ -281,12 +319,7 @@ int frb_si_dpm_hw_init(struct frb_device *adev)
 	if (!adev->atom)
 		return -ENODEV;
 	if (!adev->si_dpm_wanted) {
-		/*
-		 * The port enables and the SMC starts, but on the R7 450 its first
-		 * SwitchToSwState went unanswered and the card fell off the bus
-		 * (docs/si-bring-up.md): boot clocks unless asked for.
-		 */
-		frb_info(adev, "si_dpm: off (FirebrandSIDPM / frb_sidpm=1 to try it): the R7 450 stays at its boot clocks");
+		frb_info(adev, "si_dpm: off (FirebrandSIDPM false / frb_sidpm=0): the card stays at its boot clocks");
 		return -ENOSYS;
 	}
 	s = (struct frb_si_dpm *)adev->os->alloc(adev->os->cookie, sizeof(*s));
@@ -424,12 +457,12 @@ static int si_dpm_apply(struct frb_si_dpm *s, const struct amd_pp_display_config
 	disp.line_time = cfg->num_display ? cfg->line_time_in_us : 0;
 	disp.wm_high = disp.wm_low = disp.line_time;
 	rdn_si_dpm_display_changed(s->dpm, &disp);
-	r = rdn_si_dpm_set_power_state(s->dpm, RDN_SI_STATE_PERFORMANCE);
+	r = rdn_si_dpm_set_power_state(s->dpm, s->uvd_active ? RDN_SI_STATE_UVD : RDN_SI_STATE_PERFORMANCE);
 	rdn_si_dpm_mclk_held(s->dpm, &why);
 	rdn_si_dpm_clock_range(s->dpm, &slo, &mlo, &shi, &mhi);
-	frb_info(adev, "si_dpm: %s: %u CRTC(s) (mask %x), vblank %u us, line %u ns, %u above 297 MHz: performance state "
+	frb_info(adev, "si_dpm: %s: %u CRTC(s) (mask %x), vblank %u us, line %u ns, %u above 297 MHz: %s state "
 		 "%s (%d), levels %u/%u .. %u/%u kHz; memory clock %s%s", when, cfg->num_display, disp.active_crtcs,
-		 disp.vblank_time_us, disp.line_time, disp.high_pixelclock_count,
+		 disp.vblank_time_us, disp.line_time, disp.high_pixelclock_count, s->uvd_active ? "UVD" : "performance",
 		 r == 1 ? "already the SMC's, no switch" : r ? "FAILED" : "switched to", r, slo * 10, mlo * 10,
 		 shi * 10, mhi * 10, why ? "held: " : "switching", why ? why : "");
 	if (r < 0 && !rdn_si_dpm_enabled(s->dpm))
@@ -448,6 +481,29 @@ void frb_si_dpm_compute_clocks(struct frb_device *adev, const struct amd_pp_disp
 	s->cfg = *cfg;
 	s->have_cfg = 1;
 	si_dpm_apply(s, cfg, "display");
+}
+
+/*
+ * amdgpu_dpm_enable_uvd's SI arm: uvd_active and the state type
+ * POWER_STATE_TYPE_INTERNAL_UVD on, or uvd_active off (the user's state
+ * again), then amdgpu_dpm_compute_clocks with the display configuration
+ * there is: the UVD state's levels with the engine and memory clocks held
+ * (si_apply_state_adjust_rules: a state with VCLK/DCLK), its UPLL clocks set
+ * around the switch (ni_set_uvd_clock_before/after_set_eng_clock).
+ */
+int frb_si_dpm_enable_uvd(struct frb_device *adev, int enable)
+{
+	struct frb_si_dpm *s = adev->si_dpm;
+	struct amd_pp_display_configuration none;
+
+	if (!s || !rdn_si_dpm_enabled(s->dpm))
+		return -ENODEV;
+	if (s->uvd_active == !!enable)
+		return 0;
+	s->uvd_active = !!enable;
+	if (!s->have_cfg)
+		memset(&none, 0, sizeof(none));
+	return si_dpm_apply(s, s->have_cfg ? &s->cfg : &none, enable ? "UVD on" : "UVD off");
 }
 
 int frb_si_dpm_force_performance_level(struct frb_device *adev, enum amd_dpm_forced_level level)
@@ -572,21 +628,4 @@ int frb_si_dpm_get_status(struct frb_device *adev, struct frb_pm_status *st)
 		st->min_vblank_time = s->cfg.min_vblank_time;
 	}
 	return 0;
-}
-
-/*
- * rdn_ci_tables.c carries Sea Islands helpers next to the ones si_dpm
- * shares (the power table and ATOM parsers); the CIK SMC window behind a few
- * of them is RadeonNI's rdn_cik_smc.c, which is not carried. SI never calls
- * them; if anything did, it reads 0 and says so.
- */
-uint32_t rdn_cik_smc_rreg(struct rdn_card *card, uint32_t reg)
-{
-	frb_err(card->adev, "si_dpm: a Sea Islands SMC read (0x%x) on SI: not carried", reg);
-	return 0;
-}
-
-void rdn_cik_smc_wreg(struct rdn_card *card, uint32_t reg, uint32_t v)
-{
-	frb_err(card->adev, "si_dpm: a Sea Islands SMC write (0x%x = 0x%x) on SI: not carried", reg, v);
 }

@@ -173,7 +173,10 @@ struct frb_audio_regs {
 	uint32_t (*dto1_module_khz)(struct frb_device *adev, struct frb_display *d);
 };
 extern const struct frb_audio_regs frb_audio_regs_dce11;	/* frb_dce_audio.c */
-extern const struct frb_audio_regs frb_audio_regs_dce6;		/* frb_dce_v6_0.c */
+extern const struct frb_audio_regs frb_audio_regs_dce6;		/* frb_dce_v6_0_audio.c */
+extern const struct frb_audio_regs frb_audio_regs_dce8;		/* frb_dce_v8_0_audio.c */
+/* DTO1's module on DCE 8 and DCE 11.2, kHz: the DP reference clock (DENTIST's DPREFCLK; frb_dce_audio.c) */
+uint32_t frb_audio_dprefclk_khz(struct frb_device *adev, struct frb_display *d);
 
 struct frb_afmt {
 	bool initialized;
@@ -343,10 +346,10 @@ void frb_dce_v12_0_load_gamma(struct frb_device *adev, struct frb_display *d);
 
 /*
  * One DCE version's display, as amdgpu keeps one file per DCE (dce_v6_0.c,
- * dce_v11_0.c) over the shared atombios_*.c: the family's table
+ * dce_v8_0.c, dce_v11_0.c) over the shared atombios_*.c: the family's table
  * (frb_asic_funcs.display) names it, and frb_display.c's frb_display_*
  * entry points dispatch to it. has_audio: the file ports the DCE's DP audio
- * (frb_dce_audio.c is DCE 11.2's and DCE 6's through audio_regs; DCE 12's
+ * (frb_dce_audio.c is DCE 11.2's, DCE 8's and DCE 6's through audio_regs; DCE 12's
  * is DC's, in frb_dce12_hwseq.c, with no audio_regs); without it
  * FirebrandAudio is ignored. A NULL hook: the DCE has no such step
  * (frb_dce_v12_0_funcs: no hw_fini, hpd_pad or dpm_changed).
@@ -365,7 +368,7 @@ struct frb_display_funcs {
 	uint32_t hpd_gpio_reg;		/* dce_vX_0_hpd_get_gpio_reg: DC_GPIO_HPD_A, the HPD pins' GPIO register */
 	int (*hw_init)(struct frb_device *adev, struct frb_display *d);
 	void (*hw_fini)(struct frb_device *adev, struct frb_display *d);	/* hpd_fini */
-	/* a connector's hot-plug sense: DCE 6/11 by its HPD pin, DCE 12 by its link's */
+	/* a connector's hot-plug sense: DCE 6/8/11 by its HPD pin, DCE 12 by its link's */
 	int (*hpd_sense)(struct frb_device *adev, const struct frb_connector *c);
 	int (*hpd_pad)(struct frb_device *adev, int hpd);
 	int (*detect)(struct frb_device *adev, struct frb_display *d);
@@ -385,6 +388,7 @@ struct frb_display_funcs {
 };
 extern const struct frb_display_funcs frb_dce_v11_0_funcs;	/* frb_dce_v11_0.c */
 extern const struct frb_display_funcs frb_dce_v6_0_funcs;	/* frb_dce_v6_0.c */
+extern const struct frb_display_funcs frb_dce_v8_0_funcs;	/* frb_dce_v8_0.c */
 extern const struct frb_display_funcs frb_dce_v12_0_funcs;	/* frb_dce_v12_0.c */
 
 /* frb_display.c: the entry points, for the family's DCE */

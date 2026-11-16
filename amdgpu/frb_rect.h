@@ -24,6 +24,21 @@
  * The IB says which engine it is for (frb_rect_ib.sdma4; the kext sets it
  * from frb_is_soc15). Everything else here is the same on both.
  *
+ * Sea Islands' SDMA (cik_sdma.c, cikd.h SDMA_PACKET; frb_rect_ib.cik): the
+ * same opcodes and fields as SDMA 3 (SDMA_PACKET's sub-opcode in 15:8 and
+ * extra bits in 31:16 are tonga's SUB_OP and header bits; FILLSIZE is
+ * extra 15:14 = header 31:30), with two differences:
+ *   COPY_LINEAR_SUB_WINDOW  the extent as it is, not less one, and the
+ *                           depth 1 (Mesa's cik_sdma_copy_texture for GFX7;
+ *                           ac_emit_sdma_copy_linear_sub_window takes one
+ *                           off only from SDMA 2.4, VI's). The 14-bit
+ *                           fields then hold 16383 at most, so a rectangle
+ *                           16384 wide or high goes in two packets
+ *   CONSTANT_FILL           packets of at most 0x1fffe0 bytes (cik_sdma's
+ *                           fill_max_bytes is 0x1fffff); FILLSIZE 2, the count
+ *                           as it is (cik_sdma_emit_fill_buffer's), as on
+ *                           SDMA 3
+ *
  * Southern Islands' DMA engine (si_dma.c, sid.h DMA_PACKET; frb_rect_ib.si_dma):
  *   COPY                    linear, a byte count (amdgpu's si_dma_emit_copy_buffer):
  *                           no sub-window packet, so one per row, or one for
@@ -67,6 +82,8 @@
 #define FRB_RECT_SI_COPY_DW	5u		/* SI DMA COPY (one row or run) */
 #define FRB_RECT_SI_FILL_DW	4u		/* SI DMA CONSTANT_FILL */
 #define FRB_RECT_SI_MAX_BYTES	0xffff8u	/* si_dma's copy_max_bytes and fill_max_bytes */
+#define FRB_RECT_CIK_FILL_MAX_BYTES 0x1fffe0u	/* cik_sdma's fill_max_bytes (0x1fffff), 32-byte aligned */
+#define FRB_RECT_CIK_MAX_EXTENT	0x3fffu		/* CIK: the sub-window's 14-bit extent, not less one */
 
 struct frb_rect_surface {
 	uint64_t gpu_addr;		/* pixel (0, 0) */
@@ -85,6 +102,7 @@ struct frb_rect_ib {
 	uint32_t len_dw, cap_dw;
 	int sdma4;			/* for SDMA 4 (SOC15): its pitch field and count less one */
 	int si_dma;			/* for SI's DMA engine (si_dma.c): its COPY and CONSTANT_FILL */
+	int cik;			/* for CIK's SDMA (cik_sdma.c): SDMA 3's packets, the extent as it is */
 };
 
 /* usable: dword-aligned, pitch >= width, every field inside the packet's */

@@ -1,5 +1,5 @@
 /*
- * H.264 decode messages for UVD 6 (Polaris) and UVD 7 (Vega 20), behind
+ * H.264 decode messages for UVD 3.1 (SI), UVD 6 (Polaris) and UVD 7 (Vega 20), behind
  * RadeonNI's 'rdnv' protocol: the client sends the same host-order
  * rdn_uvd_h264_config and rdn_uvd_h264_picture it sends RadeonNI
  * (RadeonNI's hw/rdn_uvd_h264.h, checked here exactly as there), and
@@ -16,6 +16,17 @@
  *  - a linear progressive NV12 target (dt_pitch, chroma at
  *    dt_chroma_top_offset, dt_wa_chroma_top_offset = dt_pitch / 2 from
  *    Stoney on), db_pitch the width aligned to 16.
+ *
+ * Before Tonga (UVD 3.1 on SI: struct frb_uvd_h264_hw.legacy), Mesa's other
+ * arm, which radeonsi's radeon_uvd.c and RadeonNI's hw/rdn_uvd_h264.c (Turks)
+ * build the same way:
+ *  - stream type H264 (0);
+ *  - no session context buffer, no context buffer, no IT scaling table: the
+ *    DPB holds the 17 pictures, the macroblock context (17 x mbs x 192) and
+ *    the IT surface (mbs x 32), ac_uvd_dec_dpb_size's family < POLARIS10
+ *    arm; dpb_reserved 0; the scaling lists only in the message;
+ *  - no dt_wa_chroma_top_offset (family < CHIP_STONEY);
+ *  - the IB names msg, DPB, feedback, bitstream and target (Mesa 26's order).
  *
  * What Mesa does differently from CHIP_VEGA10 on (struct frb_uvd_h264_hw):
  *  - the GPCOM registers at their SOC15 addresses (RUVD_*_SOC15: the UVD
@@ -59,15 +70,18 @@
 #define FRB_UVD_CMD_ITSCALING_TABLE	0x204
 #define FRB_UVD_CMD_CONTEXT_BUFFER	0x206
 
+#define FRB_UVD_CODEC_H264		0u	/* before Tonga */
 #define FRB_UVD_CODEC_H264_PERF		7u
 
 /* the UVD block the messages and IBs are for */
 struct frb_uvd_h264_hw {
 	uint32_t reg_base;		/* dword index the GPCOM registers are relative to (frb_uvd_reg_base) */
 	uint32_t dpb_alignment;		/* ac_uvd_dec_dpb_alignment: 16 before Vega, 32 from Vega 10 on */
+	uint32_t legacy;		/* family < CHIP_TONGA: stream type H264, the legacy DPB (above) */
 };
-#define FRB_UVD_H264_HW_UVD6		{ 0x3800, 16 }	/* UVD_BASE_SI */
-#define FRB_UVD_H264_HW_VEGA20		{ 0x7e00, 32 }	/* UVD_BASE__INST0_SEG1 */
+#define FRB_UVD_H264_HW_UVD3		{ 0x3800, 16, 1 }	/* UVD_BASE_SI; SI */
+#define FRB_UVD_H264_HW_UVD6		{ 0x3800, 16, 0 }	/* UVD_BASE_SI */
+#define FRB_UVD_H264_HW_VEGA20		{ 0x7e00, 32, 0 }	/* UVD_BASE__INST0_SEG1 */
 /* the GPCOM registers from reg_base (uvd_6_0_d.h less UVD_BASE_SI = uvd_7_0_offset.h) */
 #define FRB_UVD_H264_GPCOM_VCPU_CMD	0x03c3
 #define FRB_UVD_H264_GPCOM_VCPU_DATA0	0x03c4
@@ -81,9 +95,9 @@ struct frb_uvd_h264_layout {
 	uint32_t width, height;		/* coded, multiples of 16 */
 	uint32_t db_pitch;		/* align(width, dpb_alignment) */
 	uint32_t image_bytes;		/* one NV12 picture, aligned to 1 KB */
-	uint32_t dpb_bytes;		/* 17 pictures */
-	uint32_t ctx_bytes;		/* the macroblock context: 17 x align(mbs x 192, 256) */
-	uint32_t session_bytes;		/* the session context */
+	uint32_t dpb_bytes;		/* 17 pictures (legacy: + the macroblock context and IT surface) */
+	uint32_t ctx_bytes;		/* the macroblock context: 17 x align(mbs x 192, 256); legacy 0 */
+	uint32_t session_bytes;		/* the session context; legacy 0 */
 	uint32_t target_pitch;		/* align(width, 256) */
 	uint32_t target_rows;		/* height */
 	uint32_t chroma_offset;		/* pitch x rows */
@@ -91,7 +105,7 @@ struct frb_uvd_h264_layout {
 	uint32_t packed_nv12_bytes;	/* width x height x 3 / 2 */
 };
 
-/* GPU addresses a decode IB names; all disjoint, 64-bit, the msg 64-byte aligned */
+/* GPU addresses a decode IB names; all disjoint, 64-bit, the msg 64-byte aligned (legacy: no session, ctx, its) */
 struct frb_uvd_h264_buffers {
 	uint64_t session, msg, dpb, ctx, its, feedback, bitstream, target;
 };
@@ -117,8 +131,9 @@ void frb_uvd_h264_pack_its(const struct rdn_uvd_h264_picture *p, uint8_t *out);
  * The IB's dwords as numbers (the caller stores them in the ring's byte
  * order: frb_uvd_ib_write), NO_OP-padded to 16. type: RDN_UVD_H264_MSG_*.
  * Create and destroy name only session and msg (destroy only msg, as
- * Linux's and old radeonsi's); decode all eight. Returns the count, or 0
- * when a buffer is missing or misaligned.
+ * Linux's and old radeonsi's); decode all eight. Legacy: no session in
+ * create, decode msg, DPB, feedback, bitstream and target. Returns the
+ * count, or 0 when a buffer is missing or misaligned.
  */
 uint32_t frb_uvd_h264_build_ib(uint32_t type, const struct frb_uvd_h264_hw *hw,
 			       const struct frb_uvd_h264_buffers *b, uint32_t out[FRB_UVD_H264_IB_MAX_DW]);

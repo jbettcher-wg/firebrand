@@ -41,6 +41,12 @@
  *   frbctl report [--md]         every card's status, as Firebrand Monitor's Copy Report
  *                                (frb_status.c; any user, through the read-only 'frbs' client);
  *                                --md wraps it in a ``` block for a GitHub issue
+ *   frbctl unlock | lock         an UNTESTED card (no verified row) past display-only, or back:
+ *                                FirebrandUnlock in the installed kext's personalities (kextd
+ *                                takes it at the next start; /System/Library/Extensions touched),
+ *                                and at once on a loaded driver, so `frbctl stage 7` can try the
+ *                                rest without a restart. A verified card is not affected. Root.
+ *   frbctl unlock status         the installed setting and each loaded card's
  *
  * Builds on Mac OS X 10.5 (IOKit only; scripts/build-mac.sh does this):
  *   gcc -std=gnu99 -I../kext/Firebrand -I../shared -o frbctl frbctl.c frb_status.c ../shared/frb_edid.c \
@@ -54,6 +60,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include "frb_user.h"
 #include "frb_mode.h"
 #include "frb_status.h"
@@ -75,6 +86,221 @@ static int report(int argc, char **argv)
 	}
 	frb_cards_close(cards, n);
 	return n ? 0 : 1;
+}
+
+/* --- frbctl unlock / lock --------------------------------------------------- */
+
+#define FRB_INSTALLED_KEXT	"/System/Library/Extensions/Firebrand.kext"
+#define FRB_INSTALLED_PLIST	FRB_INSTALLED_KEXT "/Contents/Info.plist"
+#define FRB_UNLOCK_KEY		"<key>FirebrandUnlock</key>"
+
+static char *slurp(const char *path, size_t *len)
+{
+	FILE *f = fopen(path, "rb");
+	char *buf = 0;
+	long n;
+
+	if (!f)
+		return 0;
+	if (fseek(f, 0, SEEK_END) == 0 && (n = ftell(f)) > 0 && fseek(f, 0, SEEK_SET) == 0 &&
+	    (buf = (char *)malloc((size_t)n + 1)) && fread(buf, 1, (size_t)n, f) == (size_t)n) {
+		buf[n] = 0;
+		*len = (size_t)n;
+	} else {
+		free(buf);
+		buf = 0;
+	}
+	fclose(f);
+	return buf;
+}
+
+/*
+ * The installed setting: -1 no installed Firebrand.kext (or unreadable), -2 one
+ * without the key (older than the untested-card policy), else 0/1 (1 only when
+ * every personality says true). *count: personalities that carry the key.
+ */
+static int installed_unlock(int *count)
+{
+	size_t len = 0;
+	char *p = slurp(FRB_INSTALLED_PLIST, &len), *at;
+	int on = 1;
+
+	*count = 0;
+	if (!p)
+		return -1;
+	for (at = strstr(p, FRB_UNLOCK_KEY); at; at = strstr(at + 1, FRB_UNLOCK_KEY)) {
+		char *v = at + strlen(FRB_UNLOCK_KEY);
+
+		while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r')
+			v++;
+		(*count)++;
+		if (strncmp(v, "<true/>", 7))
+			on = 0;
+	}
+	free(p);
+	return *count ? on : -2;
+}
+
+/* FirebrandUnlock true/false in every personality of the installed kext, written atomically */
+static int write_unlock(int on)
+{
+	size_t len = 0, outlen = 0;
+	char *p = slurp(FRB_INSTALLED_PLIST, &len), *out, *at, *from;
+	char tmp[] = FRB_INSTALLED_PLIST ".frbctl";
+	struct stat sb;
+	int fd, n = 0;
+
+	if (!p) {
+		fprintf(stderr, "frbctl: no %s (Firebrand is not installed)\n", FRB_INSTALLED_PLIST);
+		return 1;
+	}
+	if (stat(FRB_INSTALLED_PLIST, &sb)) {
+		perror(FRB_INSTALLED_PLIST);
+		free(p);
+		return 1;
+	}
+	/* at most one byte more per personality (<false/> for <true/>) */
+	for (at = strstr(p, FRB_UNLOCK_KEY); at; at = strstr(at + 1, FRB_UNLOCK_KEY))
+		n++;
+	out = (char *)malloc(len + (size_t)n + 1);
+	n = 0;
+	if (!out) {
+		free(p);
+		return 1;
+	}
+	for (from = p; (at = strstr(from, FRB_UNLOCK_KEY)); ) {
+		char *v = at + strlen(FRB_UNLOCK_KEY), *end;
+
+		while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r')
+			v++;
+		if (!strncmp(v, "<true/>", 7))
+			end = v + 7;
+		else if (!strncmp(v, "<false/>", 8))
+			end = v + 8;
+		else {
+			fprintf(stderr, "frbctl: %s: FirebrandUnlock is not a boolean; nothing changed\n", FRB_INSTALLED_PLIST);
+			free(p);
+			free(out);
+			return 1;
+		}
+		memcpy(out + outlen, from, (size_t)(v - from));
+		outlen += (size_t)(v - from);
+		memcpy(out + outlen, on ? "<true/>" : "<false/>", on ? 7 : 8);
+		outlen += on ? 7 : 8;
+		from = end;
+		n++;
+	}
+	if (!n) {
+		fprintf(stderr, "frbctl: the installed Firebrand.kext has no FirebrandUnlock setting (it predates the "
+			"untested-card policy); install this release first\n");
+		free(p);
+		free(out);
+		return 1;
+	}
+	memcpy(out + outlen, from, len - (size_t)(from - p));
+	outlen += len - (size_t)(from - p);
+	free(p);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0 || write(fd, out, outlen) != (ssize_t)outlen || fsync(fd) || fchown(fd, sb.st_uid, sb.st_gid) ||
+	    fchmod(fd, sb.st_mode & 07777) || close(fd) || rename(tmp, FRB_INSTALLED_PLIST)) {
+		fprintf(stderr, "frbctl: could not write %s: %s; nothing changed\n", FRB_INSTALLED_PLIST, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		unlink(tmp);
+		free(out);
+		return 1;
+	}
+	free(out);
+	/* kextd rebuilds its caches from the folder's date, as an installer leaves it */
+	utimes("/System/Library/Extensions", 0);
+	sync();
+	printf("installed Firebrand.kext: FirebrandUnlock %s in %d personalities (%s)\n", on ? "true" : "false", n,
+	       FRB_INSTALLED_PLIST);
+	return 0;
+}
+
+/* every loaded Firebrand (control or framebuffer): FRB_UC_UNLOCK on, or only report */
+static void loaded_unlock(int set, int on)
+{
+	static const char *classes[] = { FRB_UC_FB_CLASS, FRB_UC_SERVICE_CLASS };
+	struct frb_card cards[FRB_MAX_CARDS];
+	int k, n = 0, i;
+
+	for (k = 0; k < 2; k++) {
+		io_iterator_t it = 0;
+		io_service_t s;
+
+		if (IOServiceGetMatchingServices(kIOMasterPortDefault, IOServiceMatching(classes[k]), &it) != KERN_SUCCESS)
+			continue;
+		while ((s = IOIteratorNext(it))) {
+			io_connect_t c = 0;
+			uint32_t cap = 0;
+			kern_return_t r = IOServiceOpen(s, mach_task_self(), FRB_UC_TYPE, &c);
+
+			n++;
+			if (!r && set)
+				r = IOConnectMethodScalarIScalarO(c, FRB_UC_UNLOCK, 1, 1, on, &cap);
+			if (set)
+				printf("loaded driver %d: %s", n, r ? "" : "now ");
+			if (set && r == kIOReturnBadArgument)
+				printf("too old for frbctl unlock (0x%x); the setting takes effect at the next start\n", r);
+			else if (set && r)
+				printf("not reached (0x%x); the setting takes effect at the next start\n", r);
+			else if (set)
+				printf("allowed to stage %u (%s)%s\n", cap, frb_stage_label(cap),
+				       on && cap == 7 ? "; `sudo frbctl stage 7` runs the rest now, or restart" :
+				       !on ? "; stages already run stay until the next start" : "");
+			if (c)
+				IOServiceClose(c);
+			IOObjectRelease(s);
+		}
+		IOObjectRelease(it);
+	}
+	if (set && !n)
+		printf("no Firebrand loaded: the setting takes effect at the next start\n");
+	n = frb_cards_open(cards, FRB_MAX_CARDS);
+	for (i = 0; i < n; i++) {
+		int sup = frb_card_support(&cards[i]);
+
+		printf("card %d: %s: %s%s\n", i + 1, frb_card_name(&cards[i]),
+		       sup == FRB_SUPPORT_VERIFIED ? "verified (the unlock does not apply)" :
+		       sup == FRB_SUPPORT_UNTESTED ? (frb_card_unlocked(&cards[i]) ? "untested, unlocked" :
+						      "untested, display-only") :
+		       sup == FRB_SUPPORT_NOT_PORTED ? "not ported (identified only; the unlock does not apply)" :
+		       "a driver too old to say", cards[i].detached ? " (no driver stayed on it)" : "");
+	}
+	frb_cards_close(cards, n);
+}
+
+static int unlock_cmd(int argc, char **argv)
+{
+	int on = !strcmp(argv[1], "unlock"), count, cur, r;
+
+	if (argc > 2 && !strcmp(argv[2], "status")) {
+		cur = installed_unlock(&count);
+		printf("installed Firebrand.kext: %s\n", cur == -1 ? "none" : cur == -2 ? "no FirebrandUnlock setting (older)" :
+		       cur ? "unlocked (FirebrandUnlock true)" : "locked (FirebrandUnlock false: untested cards display-only)");
+		loaded_unlock(0, 0);
+		return 0;
+	}
+	if (argc > 2) {
+		fprintf(stderr, "usage: frbctl unlock | lock | unlock status\n");
+		return 2;
+	}
+	if (geteuid() != 0) {
+		fprintf(stderr, "frbctl %s changes the installed driver: run it with sudo\n", argv[1]);
+		return 1;
+	}
+	r = write_unlock(on);
+	loaded_unlock(1, on);
+	if (!r)
+		printf(on ? "Untested cards run every stage at the next start (restart now, or `sudo frbctl stage 7`).\n"
+			"If the machine misbehaves: start with the boot argument frb_unlock=0 (on a G5: Open Firmware's\n"
+			"boot-args, or `sudo nvram boot-args=frb_unlock=0` beforehand), or in single-user mode (Firebrand\n"
+			"does not load there), then `sudo frbctl lock`.\n"
+			"Please send `frbctl report --md` (or Firebrand Monitor's Copy Report) as an issue either way.\n" :
+			"Untested cards are display-only again from the next start.\n");
+	return r;
 }
 
 static int scalar(int method, int nin, int a, int b, int *out)
@@ -158,11 +384,13 @@ int main(int argc, char **argv)
 
 	if (argc < 2) {
 		fprintf(stderr, "usage: frbctl info|log|rd|wr|smc|regfile|stage|vram|trace|"
-			"display|detect|edid|modes|mode|off|fill|report ...\n");
+			"display|detect|edid|modes|mode|off|fill|report|unlock|lock ...\n");
 		return 2;
 	}
 	if (!strcmp(argv[1], "report"))
 		return report(argc, argv);
+	if (!strcmp(argv[1], "unlock") || !strcmp(argv[1], "lock"))
+		return unlock_cmd(argc, argv);
 	/* the control personality, or the framebuffer when it owns the card */
 	service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(FRB_UC_SERVICE_CLASS));
 	if (!service)

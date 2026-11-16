@@ -1,0 +1,226 @@
+osx-gpu: buffer textures on a big-endian host
+
+A buffer holds host-order data on a big-endian host and the shaders swap
+what they load from it (si_nir_lower_be_memory), but texelFetch on a
+samplerBuffer went through the descriptor's format as little-endian data:
+an R32F texel 1.0 read back as 4.6e-41. For that reason radeonsi offered no
+buffer format wider than bytes to a sampler, which withheld
+ARB_texture_buffer_object_rgb32, the one GL 4.0-4.6 requirement missing:
+every context that asked for 4.x (RDNGLRequestCompatibilityContext, SDL3's
+RadeonNI path, OpenGOAL's 4.3) got 3.3.
+
+The fetch is now fixed in the shader at run time from the descriptor's word
+3 (GFX6-9): 32-bit channels swapped, 16-bit channels fetched as UINT,
+swapped and converted by the view's NUM_FORMAT, bytes left alone; DST_SEL
+says which results came from the buffer. 32-bit float/int/uint buffer
+formats are offered to samplers (not images), which gives
+ARB_texture_buffer_object_rgb32 and GL 4.6 compatibility on radeonsi.
+
+diff --git a/src/gallium/drivers/radeonsi/si_state.c b/src/gallium/drivers/radeonsi/si_state.c
+--- a/src/gallium/drivers/radeonsi/si_state.c
++++ b/src/gallium/drivers/radeonsi/si_state.c
+@@ -2190,6 +2190,38 @@
+    return ac_is_reduction_mode_supported(&sscreen->info, format, true);
+ }
+ 
++/*
++ * osx-gpu: a buffer format a sampler reads right on a big-endian host
++ * because the shader swaps what it fetched (si_nir_lower_resource.c,
++ * be_buffer_fetch): 32-bit float, int and uint channels, which the fetch
++ * passes through as bits (GFX6-9 descriptors). This is what
++ * ARB_texture_buffer_object_rgb32 asks for (R32G32B32 float, int, uint),
++ * the one extension that held the version of a 4.6 context at 3.3. The
++ * shader also handles 16-bit channels, but these are not offered: the
++ * state tracker's PBO upload would then take them too, and that is left
++ * as it was. R32G32B32A32_UINT is not offered either: the state
++ * tracker's compressed PBO upload copies blocks through it as raw bytes,
++ * which the swap would reverse. A GL buffer texture of any format is
++ * swapped all the same (glTexBuffer does not ask the driver).
++ */
++static bool si_be_buffer_fetch_swapped(enum pipe_format format)
++{
++   const struct util_format_description *desc = util_format_description(format);
++   bool any = false;
++
++   if (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || format == PIPE_FORMAT_R32G32B32A32_UINT)
++      return false;
++   for (unsigned i = 0; i < desc->nr_channels; i++) {
++      if (desc->channel[i].type == UTIL_FORMAT_TYPE_VOID)
++         continue;
++      if (desc->channel[i].size != 32 || desc->channel[i].normalized ||
++          !(desc->channel[i].type == UTIL_FORMAT_TYPE_FLOAT || desc->channel[i].pure_integer))
++         return false;
++      any = true;
++   }
++   return any;
++}
++
+ bool si_is_format_supported(struct pipe_screen *screen, enum pipe_format format,
+                                    enum pipe_texture_target target, unsigned sample_count,
+                                    unsigned storage_sample_count, unsigned usage)
+@@ -2199,6 +2231,17 @@
+ 
+    usage &= ~PIPE_BIND_OPENCL;
+ 
++   /*
++    * osx-gpu: a buffer read by a sampler through a format whose fetch the
++    * shader swaps (si_be_buffer_fetch_swapped, above) on a big-endian
++    * host; the host-order check below would refuse it. This answers what
++    * the rest of the function would for such a buffer view.
++    */
++   if (UTIL_ARCH_BIG_ENDIAN && target == PIPE_BUFFER && usage == PIPE_BIND_SAMPLER_VIEW &&
++       sample_count <= 1 && storage_sample_count <= 1 &&
++       sscreen->info.gfx_level <= GFX9 && si_be_buffer_fetch_swapped(format))
++      return si_is_vertex_format_supported(screen, format, PIPE_BIND_SAMPLER_VIEW) != 0;
++
+    if (target >= PIPE_MAX_TEXTURE_TYPES) {
+       PRINT_ERR("radeonsi: unsupported texture type %d\n", target);
+       return false;
+diff --git a/src/gallium/drivers/radeonsi/gfx/si_nir_lower_resource.c b/src/gallium/drivers/radeonsi/gfx/si_nir_lower_resource.c
+--- a/src/gallium/drivers/radeonsi/gfx/si_nir_lower_resource.c
++++ b/src/gallium/drivers/radeonsi/gfx/si_nir_lower_resource.c
+@@ -502,6 +502,123 @@
+    return sampler;
+ }
+ 
++/*
++ * osx-gpu: a buffer texture on a big-endian host.
++ *
++ * A buffer holds host-order data (si_nir_lower_be_memory), and texelFetch
++ * on a samplerBuffer reads it through the format in the descriptor, which
++ * the hardware takes as little-endian: an R32F texel 1.0 came back as
++ * 4.6e-41. The format is the bound buffer view's, not the shader's, so the
++ * fix is chosen at run time from the descriptor's word 3 (GFX6-9 layout):
++ *
++ *  - 8-bit channels (DATA_FORMAT 8, 8_8, 8_8_8_8): bytes, left alone;
++ *  - 32-bit channels (32, 32_32, 32_32_32, 32_32_32_32): float, int and
++ *    uint are the bits, so each channel the format supplies is swapped;
++ *  - 16-bit channels (16, 16_16, 16_16_16_16): the fetch converts, so the
++ *    descriptor is changed to UINT, the half-words swapped, and the
++ *    conversion of the view's NUM_FORMAT (UNORM, SNORM, UINT, SINT, FLOAT)
++ *    done here.
++ *
++ * Which result channel comes from the buffer is DST_SEL (X..W = 4..7); a
++ * constant 0 or 1 (DST_SEL 0 or 1) is not swapped, and for the 16-bit case
++ * the 1 is written in the view's type, since the UINT fetch would give an
++ * integer 1.
++ *
++ * ac_nir_lower_image_tex has already turned the texelFetch into a
++ * nir_texop_descriptor_amd (a buffer, not an image) and a formatted
++ * load_buffer_amd from it; the descriptor is changed where it is lowered
++ * here and each load from it fixed after. Only in shaders whose memory is
++ * host-order (not radeonsi's own), and only when every load from the
++ * descriptor has 32-bit results and no residency code; otherwise it is left
++ * as it was.
++ */
++static bool be_buffer_fetch_load(nir_src *use)
++{
++   if (nir_src_is_if(use) || nir_src_use_instr(use)->type != nir_instr_type_intrinsic)
++      return false;
++   nir_intrinsic_instr *load = nir_instr_as_intrinsic(nir_src_use_instr(use));
++   return load->intrinsic == nir_intrinsic_load_buffer_amd && use == &load->src[0] &&
++          (nir_intrinsic_access(load) & ACCESS_USES_FORMAT_AMD) &&
++          !(nir_intrinsic_access(load) & ACCESS_SPARSE) && load->def.bit_size == 32;
++}
++
++static bool be_buffer_fetch(nir_builder *b, nir_tex_instr *tex, nir_def *image,
++                            struct lower_resource_state *s)
++{
++   if (!UTIL_ARCH_BIG_ENDIAN || tex->op != nir_texop_descriptor_amd ||
++       tex->sampler_dim != GLSL_SAMPLER_DIM_BUF ||
++       (tex->backend_flags & AC_NIR_TEX_BACKEND_FLAG_IS_IMAGE) || image->num_components != 4 ||
++       s->shader->selector->screen->info.gfx_level > GFX9 || !si_nir_host_order_memory(b->shader))
++      return false;
++
++   bool any = false;
++   nir_foreach_use_including_if(use, &tex->def) {
++      if (!be_buffer_fetch_load(use))
++         return false;
++      any = true;
++   }
++   return any;
++}
++
++static nir_def *be_is_16bit(nir_builder *b, nir_def *dfmt)
++{
++   return nir_ior(b, nir_ieq_imm(b, dfmt, V_008F0C_BUF_DATA_FORMAT_16),
++                  nir_ior(b, nir_ieq_imm(b, dfmt, V_008F0C_BUF_DATA_FORMAT_16_16),
++                          nir_ieq_imm(b, dfmt, V_008F0C_BUF_DATA_FORMAT_16_16_16_16)));
++}
++
++static nir_def *be_buffer_fetch_desc(nir_builder *b, nir_def *desc)
++{
++   nir_def *w3 = nir_channel(b, desc, 3);
++   nir_def *is16 = be_is_16bit(b, nir_ubfe_imm(b, w3, 15, 4));
++   nir_def *uint_w3 = nir_ior_imm(b, nir_iand_imm(b, w3, C_008F0C_NUM_FORMAT),
++                                  S_008F0C_NUM_FORMAT(V_008F0C_BUF_NUM_FORMAT_UINT));
++
++   return nir_vector_insert_imm(b, desc, nir_bcsel(b, is16, uint_w3, w3), 3);
++}
++
++static void be_buffer_fetch_result(nir_builder *b, nir_def *res, nir_def *w3)
++{
++   nir_def *dfmt = nir_ubfe_imm(b, w3, 15, 4);
++   nir_def *nfmt = nir_ubfe_imm(b, w3, 12, 3);
++   nir_def *is32 = nir_ior(b, nir_ior(b, nir_ieq_imm(b, dfmt, V_008F0C_BUF_DATA_FORMAT_32),
++                                      nir_ieq_imm(b, dfmt, V_008F0C_BUF_DATA_FORMAT_32_32)),
++                           nir_ior(b, nir_ieq_imm(b, dfmt, V_008F0C_BUF_DATA_FORMAT_32_32_32),
++                                   nir_ieq_imm(b, dfmt, V_008F0C_BUF_DATA_FORMAT_32_32_32_32)));
++   nir_def *is16 = be_is_16bit(b, dfmt);
++   nir_def *is_int = nir_ior(b, nir_ieq_imm(b, nfmt, V_008F0C_BUF_NUM_FORMAT_UINT),
++                             nir_ieq_imm(b, nfmt, V_008F0C_BUF_NUM_FORMAT_SINT));
++   nir_def *one = nir_bcsel(b, is_int, nir_imm_int(b, 1), nir_imm_int(b, 0x3f800000));
++   nir_def *chan[NIR_MAX_VEC_COMPONENTS];
++
++   for (unsigned c = 0; c < res->num_components; c++) {
++      nir_def *x = nir_channel(b, res, c);
++      nir_def *sel = nir_ubfe_imm(b, w3, 3 * c, 3);
++      nir_def *from_buffer = nir_uge(b, sel, nir_imm_int(b, V_008F0C_SQ_SEL_X));
++
++      /* 16-bit: the UINT fetch zero-extended the little-endian half-word. */
++      nir_def *h = nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, x, 0xff), 8),
++                           nir_iand_imm(b, nir_ushr_imm(b, x, 8), 0xff));
++      nir_def *hs = nir_ishr_imm(b, nir_ishl_imm(b, h, 16), 16);
++      nir_def *conv = h; /* UINT */
++      conv = nir_bcsel(b, nir_ieq_imm(b, nfmt, V_008F0C_BUF_NUM_FORMAT_SINT), hs, conv);
++      conv = nir_bcsel(b, nir_ieq_imm(b, nfmt, V_008F0C_BUF_NUM_FORMAT_UNORM),
++                       nir_fmul_imm(b, nir_u2f32(b, h), 1.0 / 65535.0), conv);
++      conv = nir_bcsel(b, nir_ieq_imm(b, nfmt, V_008F0C_BUF_NUM_FORMAT_SNORM),
++                       nir_fmax(b, nir_fmul_imm(b, nir_i2f32(b, hs), 1.0 / 32767.0),
++                                nir_imm_float(b, -1.0)), conv);
++      conv = nir_bcsel(b, nir_ieq_imm(b, nfmt, V_008F0C_BUF_NUM_FORMAT_FLOAT),
++                       nir_f2f32(b, nir_unpack_32_2x16_split_x(b, h)), conv);
++      nir_def *konst = nir_bcsel(b, nir_ieq_imm(b, sel, V_008F0C_SQ_SEL_1), one, nir_imm_int(b, 0));
++
++      nir_def *v16 = nir_bcsel(b, from_buffer, conv, konst);
++      nir_def *v32 = nir_bcsel(b, from_buffer, si_nir_be_swap(b, x), x);
++      chan[c] = nir_bcsel(b, is32, v32, nir_bcsel(b, is16, v16, x));
++   }
++
++   nir_def_rewrite_uses_after(res, nir_vec(b, chan, res->num_components));
++}
++
+ static bool lower_resource_tex(nir_builder *b, nir_tex_instr *tex,
+                                struct lower_resource_state *s)
+ {
+@@ -550,6 +667,20 @@
+    if (tex->op == nir_texop_descriptor_amd) {
+       nir_def *image = load_tex_descriptor(b, texture_deref, texture_handle, desc_type, s, true,
+                                            tex->backend_flags);
++      if (be_buffer_fetch(b, tex, image, s)) {
++         nir_def *w3 = nir_channel(b, image, 3);
++         nir_def *desc = be_buffer_fetch_desc(b, image);
++
++         nir_def_replace(&tex->def, desc);
++         /* The uses of desc are the loads be_buffer_fetch checked. */
++         nir_foreach_use_safe(use, desc) {
++            nir_intrinsic_instr *load = nir_instr_as_intrinsic(nir_src_use_instr(use));
++
++            b->cursor = nir_after_instr(&load->instr);
++            be_buffer_fetch_result(b, &load->def, w3);
++         }
++         return true;
++      }
+       nir_def_replace(&tex->def, image);
+       return true;
+    }

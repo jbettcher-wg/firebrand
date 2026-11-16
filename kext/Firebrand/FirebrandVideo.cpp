@@ -1,7 +1,7 @@
 /*
  * The 'rdnv' video client (FirebrandVideo.h): RadeonNIVideo.cpp's user
  * client and RadeonNIVideoMemory.cpp's memory, ported; the session
- * (RadeonNIUvdSession.cpp's shape) on UVD 6.3.
+ * (RadeonNIUvdSession.cpp's shape) on UVD 6.3, 7.2, SI's 3.1 and CIK's 4.2.
  *
  * One stream in the whole system, as on RadeonNI (max_sessions 1). Every
  * call that touches a session holds fVideoLock; the core's lock is taken
@@ -20,6 +20,27 @@
  *   upload FirebrandVideoMemory the client writes the slice data into; the
  *          kernel copies it into the GTT bitstream before every decode, so
  *          the engine never reads memory the client can still change.
+ *
+ * UVD before 5.0 (SI's 3.1, CIK's 4.2; frb_uvd.address_64_bit false) addresses 28 bits
+ * within a 256 MB segment that UVD_LMI_ADDR_EXT names per memory client
+ * (uvd_v3_1_mc_resume: the VCPU bo's segment for the VCPU, 0 for the
+ * decoder's own clients). Linux keeps every buffer a decode names in the
+ * first 256 MB of its domain (amdgpu_uvd_cs_pass1's
+ * amdgpu_uvd_force_into_uvd_segment, the msg and feedback forced into
+ * VRAM); RadeonNI found on Turks's UVD that the decoder's reference and
+ * output pictures follow UVD_LMI_ADDR_EXT's nibbles 1 and 2, not the
+ * addresses' own bits 28-31 (its docs/UVD.md, "split mode"). The GART here
+ * is at 0x4000_0000 (segments 4-7), so the slots and a GTT bitstream are out
+ * of reach: everything the IB names is in VRAM inside the VCPU bo's
+ * segment, VRAM's first 256 MB (the CPU window, the VCPU bo at its top):
+ * the control pages (msg, feedback, IT scaling table, IB) written through
+ * BAR0 (the msg built in host memory, only the dwords that changed copied;
+ * the feedback read back after an HDP invalidate), the bitstream (copied in
+ * by SDMA1 from a GTT staging buffer the CPU fills), one decode target
+ * (copied out by SDMA1 into the client's slot) and the DPB. The IB in VRAM
+ * is also in the ring's 4 GB (uvd_v3_1_start's LMI_EXT40_ADDR for the RBC).
+ * The messages are the legacy ones (stream type H264, frb_uvd_h264.h).
+ *
  * The create message goes out at CREATE with the decoder powered up
  * (begin_use); the destroy message at DESTROY or the client's end, then the
  * idle work powers it down. A decode that times out poisons the decoder
@@ -54,9 +75,13 @@ enum {
 	kVideoQuota = 20u * 1024 * 1024,
 	/* the control GTT object: one page each */
 	kCtlMsg = 0, kCtlFeedback = 1 * kVideoPage, kCtlIts = 2 * kVideoPage, kCtlIb = 3 * kVideoPage,
-	kCtlBytes = 4 * kVideoPage
+	kCtlBytes = 4 * kVideoPage,
+	/* UVD before 5.0: the VRAM in the VCPU's segment is control pages | bitstream | target */
+	kSegBitstream = kCtlBytes, kSegTarget = kCtlBytes + RDN_VIDEO_MAX_UPLOAD_BYTES
 };
 #define kGuardWord	0xa5a5a5a5u
+/* UVD before 5.0: a buffer's GPU address range stays inside one of these (amdgpu_uvd_cs_pass2) */
+#define kUvdSegment	(256ull << 20)
 
 struct FirebrandVideoSession {
 	FirebrandVideoClient *owner;
@@ -71,6 +96,12 @@ struct FirebrandVideoSession {
 	/* GTT: the kernel's */
 	struct frb_gtt control, bitstream;
 	bool controlUp, bitstreamUp;
+	/* UVD before 5.0 (segmented): control pages, bitstream and target in VRAM, in the VCPU's segment */
+	bool segmented, ctlAllocated;
+	UInt64 ctlOffset, ctlBytes;	/* BAR0 offset and size */
+	UInt64 vramTarget;		/* GPU address of the decode target there (copied out to a slot) */
+	UInt8 msg[FRB_UVD_H264_MSG_BYTES];	/* the next message, built here */
+	UInt8 msgVram[FRB_UVD_H264_MSG_BYTES];	/* what the VRAM msg page holds now */
 	/* the client's */
 	FirebrandVideoMemory *upload, *slot[2];
 	UInt32 slotFirst[2], slotPages[2];
@@ -512,17 +543,51 @@ int FirebrandAccel::videoBindLocked(FirebrandVideoMemory *memory, UInt32 *first,
 }
 
 /*
+ * VRAM through BAR0, a dword at a time (little-endian words, as the GTT
+ * pages are written); with a shadow only the dwords that differ from it,
+ * and the shadow follows. fCore's lock held, the accelerator not retired.
+ */
+static void videoVramCopy(struct frb_device *adev, UInt64 offset, const UInt8 *src, UInt32 bytes, UInt8 *shadow)
+{
+	UInt32 i, v;
+
+	for (i = 0; i + 4 <= bytes; i += 4) {
+		v = frb_get_le32(src, i);
+		if (shadow) {
+			if (frb_get_le32(shadow, i) == v)
+				continue;
+			frb_put_le32(shadow, i, v);
+		}
+		frb_vram_write32(adev, (uint32_t)(offset + i), v);
+	}
+}
+
+static void videoVramZero(struct frb_device *adev, UInt64 offset, UInt32 bytes)
+{
+	UInt32 i;
+
+	for (i = 0; i + 4 <= bytes; i += 4)
+		frb_vram_write32(adev, (uint32_t)(offset + i), 0);
+}
+
+/*
  * One message to the decoder and the wait for it: the msg (and for a
  * decode the IT scaling table) in the control pages, the IB after them in
  * the ring's byte order, submitted on the UVD ring with its fence; then
- * naps until the fence passes. 0, -ECANCELED (retiring), -ETIMEDOUT
- * (poisoned), or another errno.
+ * naps until the fence passes. With the control pages in VRAM (segmented)
+ * the msg is built in the session and copied through BAR0 with the
+ * feedback's reset and the IB, under the core's lock. 0, -ECANCELED
+ * (retiring), -ETIMEDOUT (poisoned), or another errno.
  */
 int FirebrandAccel::videoCommand(UInt32 type, const rdn_uvd_h264_picture *picture, UInt32 bitstreamBytes)
 {
 	FirebrandVideoSession *s = fVideoSession;
 	struct frb_device *adev = fCore->adev();
-	UInt8 *ctl = (UInt8 *)s->control.cpu;
+	bool vram = s->ctlAllocated;
+	UInt8 *ctl = vram ? 0 : (UInt8 *)s->control.cpu;
+	UInt8 *msg = vram ? s->msg : ctl + kCtlMsg;
+	UInt8 its[FRB_UVD_H264_ITS_BYTES];
+	bool withIts = type == RDN_UVD_H264_MSG_DECODE && !s->layout.hw.legacy;
 	uint32_t words[FRB_UVD_H264_IB_MAX_DW], n, i, seq = 0;
 	struct frb_uvd_h264_buffers b = s->buffers;
 	struct frb_ring *ring;
@@ -531,16 +596,17 @@ int FirebrandAccel::videoCommand(UInt32 type, const rdn_uvd_h264_picture *pictur
 	int r;
 
 	if (type == RDN_UVD_H264_MSG_CREATE)
-		r = frb_uvd_h264_pack_create(&s->config, &s->layout, s->handle, ctl + kCtlMsg);
+		r = frb_uvd_h264_pack_create(&s->config, &s->layout, s->handle, msg);
 	else if (type == RDN_UVD_H264_MSG_DECODE)
 		r = frb_uvd_h264_pack_decode(&s->config, picture, &s->layout, s->handle, s->nextRequest,
-					     bitstreamBytes, ctl + kCtlMsg);
+					     bitstreamBytes, msg);
 	else
-		r = frb_uvd_h264_pack_destroy(s->handle, ctl + kCtlMsg);
+		r = frb_uvd_h264_pack_destroy(s->handle, msg);
 	if (r)
 		return -EINVAL;
-	if (type == RDN_UVD_H264_MSG_DECODE) {
-		frb_uvd_h264_pack_its(picture, ctl + kCtlIts);
+	if (withIts)
+		frb_uvd_h264_pack_its(picture, vram ? its : ctl + kCtlIts);
+	if (type == RDN_UVD_H264_MSG_DECODE && !vram) {
 		/* the feedback buffer: zero, its size first (little-endian) */
 		bzero(ctl + kCtlFeedback, FRB_UVD_H264_FEEDBACK_BYTES);
 		frb_put_le32(ctl + kCtlFeedback, 0, FRB_UVD_H264_FEEDBACK_BYTES);
@@ -556,12 +622,29 @@ int FirebrandAccel::videoCommand(UInt32 type, const rdn_uvd_h264_picture *pictur
 		return -ECANCELED;
 	}
 	bzero(&ib, sizeof(ib));
-	ib.cpu = ctl + kCtlIb;
-	ib.gpu_addr = s->control.gpu_addr + kCtlIb;
 	ib.size_dw = kVideoPage / 4;
+	if (vram) {
+		/* BAR0: the msg's changed dwords, the feedback reset, the IT table; the IB below */
+		videoVramCopy(adev, s->ctlOffset + kCtlMsg, msg, FRB_UVD_H264_MSG_BYTES, s->msgVram);
+		if (type == RDN_UVD_H264_MSG_DECODE) {
+			frb_vram_write32(adev, (uint32_t)(s->ctlOffset + kCtlFeedback), FRB_UVD_H264_FEEDBACK_BYTES);
+			videoVramZero(adev, s->ctlOffset + kCtlFeedback + 4, FRB_UVD_H264_FEEDBACK_BYTES - 4);
+		}
+		if (withIts)
+			videoVramCopy(adev, s->ctlOffset + kCtlIts, its, FRB_UVD_H264_ITS_BYTES, 0);
+		ib.cpu = 0;
+		ib.bar_offset = (uint32_t)(s->ctlOffset + kCtlIb);
+		ib.gpu_addr = vramAddr(s->ctlOffset + kCtlIb);
+	} else {
+		ib.cpu = ctl + kCtlIb;
+		ib.gpu_addr = s->control.gpu_addr + kCtlIb;
+	}
 	for (i = 0; i < n; i++)
 		frb_uvd_ib_write(adev, &ib, words[i]);
-	/* the CPU's stores into the snooped pages are ordered before the WPTR's MMIO store (sync) */
+	/*
+	 * The CPU's stores into the snooped pages are ordered before the WPTR's
+	 * MMIO store (sync); BAR0's go out of the HDP with frb_ib_schedule's flush.
+	 */
 	OSSynchronizeIO();
 	frb_uvd_ring_begin_use(ring);
 	r = frb_ib_schedule(ring, &ib, &seq);
@@ -593,6 +676,30 @@ int FirebrandAccel::videoCommand(UInt32 type, const rdn_uvd_h264_picture *pictur
 	}
 	s->uvdUs += videoTimeUs() - t0;
 	return 0;
+}
+
+/* the feedback's first dwords: from the GTT page, or VRAM after an HDP invalidate. false: retiring */
+bool FirebrandAccel::videoFeedback(UInt32 *words, UInt32 count)
+{
+	FirebrandVideoSession *s = fVideoSession;
+	struct frb_device *adev = fCore->adev();
+	UInt32 i;
+
+	if (!s->ctlAllocated) {
+		for (i = 0; i < count; i++)
+			words[i] = frb_get_le32((const UInt8 *)s->control.cpu + kCtlFeedback, 4 * i);
+		return true;
+	}
+	fCore->lock();
+	if (fRetired) {
+		fCore->unlock();
+		return false;
+	}
+	frb_invalidate_hdp(adev);
+	for (i = 0; i < count; i++)
+		words[i] = frb_vram_read32(adev, (uint32_t)(s->ctlOffset + kCtlFeedback + 4 * i));
+	fCore->unlock();
+	return true;
 }
 
 static bool videoGuards(const FirebrandVideoSession *s, UInt32 slot)
@@ -643,7 +750,7 @@ void FirebrandAccel::videoCleanup(bool destroy, bool hardware)
 			videoGttDrop(&s->control);
 		if (s->bitstreamUp)
 			videoGttDrop(&s->bitstream);
-		s->controlUp = s->bitstreamUp = s->vramAllocated = s->awake = false;
+		s->controlUp = s->bitstreamUp = s->vramAllocated = s->ctlAllocated = s->awake = false;
 		s->quarantined = false;
 		destroy = false;
 	}
@@ -682,7 +789,9 @@ void FirebrandAccel::videoCleanup(bool destroy, bool hardware)
 	s->controlUp = s->bitstreamUp = false;
 	if (s->vramAllocated)
 		frb_vram_mgr_free(&fVram, s->vramOffset, s->vramBytes);
-	s->vramAllocated = false;
+	if (s->ctlAllocated)
+		frb_vram_mgr_free(&fVram, s->ctlOffset, s->ctlBytes);
+	s->vramAllocated = s->ctlAllocated = false;
 	fCore->unlock();
 	for (i = 0; i < 2; i++) {
 		if (s->slot[i])
@@ -713,6 +822,8 @@ IOReturn FirebrandAccel::videoCreate(FirebrandVideoClient *owner, bool administr
 	IOReturn result = kIOReturnNoMemory;
 	const char *stage = "session";
 	UInt64 ctxAt, dpbAt, bytes = 0, t0 = videoTimeUs();
+	UInt64 vcpu = 0, ringGpu = 0, window = 0, segLo = 0, segHi = 0;
+	bool segmented = false;
 	unsigned i;
 	int r = 0;
 
@@ -733,10 +844,26 @@ IOReturn FirebrandAccel::videoCreate(FirebrandVideoClient *owner, bool administr
 	fCore->lock();
 	uvdRing = frb_uvd_ring(adev);
 	hw.reg_base = frb_uvd_reg_base(adev, uvdRing ? uvdRing->me : 0);
+	/* UVD before 5.0 (SI): 32-bit addresses in 256 MB segments, the VCPU bo's the msg's */
+	if (uvdRing && adev->uvd && !adev->uvd->address_64_bit) {
+		segmented = true;
+		vcpu = adev->uvd->inst[uvdRing->me].gpu_addr;
+		ringGpu = uvdRing->gpu_addr;
+	}
 	fCore->unlock();
 	hw.dpb_alignment = adev->asic_type >= CHIP_VEGA10 ? 32 : 16;
+	/* ac_uvd_create_video_decoder: stream type H264_PERF from Tonga on, H264 and the legacy DPB before */
+	hw.legacy = adev->asic_type < CHIP_TONGA;
 	if (!videoProfile(in->config.profile_idc) || frb_uvd_h264_layout_init(&hw, &in->config, &layout))
 		return kIOReturnUnsupported;
+	if (segmented) {
+		/* the VCPU's segment in VRAM offsets: the msg and feedback go there */
+		UInt64 seg = vcpu & ~(kUvdSegment - 1), base = vramAddr(0);
+
+		window = kUvdSegment;
+		segLo = seg > base ? seg - base : 0;
+		segHi = seg + kUvdSegment - base;
+	}
 
 	IOLockLock(fVideoLock);
 	if (!videoReady(administrator, (in->flags & RDN_VIDEO_CREATE_VALIDATION) != 0)) {
@@ -763,16 +890,22 @@ IOReturn FirebrandAccel::videoCreate(FirebrandVideoClient *owner, bool administr
 	/* a stream handle of its own each session (Mesa: a base XOR a counter), never 0 */
 	s->handle = (0x46524256u ^ (UInt32)fVideoEpoch) | 0x80000000u;
 	s->nextRequest = s->nextOutput = 1;
+	s->segmented = segmented;
 
-	/* VRAM: session context | macroblock context | DPB */
+	/*
+	 * VRAM: session context | macroblock context | DPB (before Polaris the
+	 * DPB alone); segmented, in the VCPU's segment (the visible heap)
+	 */
 	stage = "vram";
 	ctxAt = (UInt64)layout.session_bytes;
 	dpbAt = ctxAt + ((layout.ctx_bytes + kVideoPage - 1) & ~(kVideoPage - 1));
 	s->vramBytes = dpbAt + ((layout.dpb_bytes + kVideoPage - 1) & ~(kVideoPage - 1));
 	fCore->lock();
-	r = frb_vram_mgr_alloc(&fVram, s->vramBytes, 64 * 1024, FRB_VRAM_INVISIBLE, &s->vramOffset, &bytes);
+	r = segmented ? -ENOMEM :
+		frb_vram_mgr_alloc(&fVram, s->vramBytes, 64 * 1024, FRB_VRAM_INVISIBLE, &s->vramOffset, &bytes);
 	if (r)
-		r = frb_vram_mgr_alloc(&fVram, s->vramBytes, 64 * 1024, FRB_VRAM_VISIBLE, &s->vramOffset, &bytes);
+		r = frb_vram_mgr_alloc_windowed(&fVram, s->vramBytes, 64 * 1024, FRB_VRAM_VISIBLE, vramAddr(0), window,
+						segLo, segHi, &s->vramOffset, &bytes);
 	if (!r) {
 		s->vramAllocated = true;
 		s->vramBytes = bytes;
@@ -780,27 +913,61 @@ IOReturn FirebrandAccel::videoCreate(FirebrandVideoClient *owner, bool administr
 	fCore->unlock();
 	if (r)
 		goto fail;
-	s->buffers.session = vramAddr(s->vramOffset);
-	s->buffers.ctx = vramAddr(s->vramOffset + ctxAt);
+	s->buffers.session = layout.session_bytes ? vramAddr(s->vramOffset) : 0;
+	s->buffers.ctx = layout.ctx_bytes ? vramAddr(s->vramOffset + ctxAt) : 0;
 	s->buffers.dpb = vramAddr(s->vramOffset + dpbAt);
 
-	/* GTT: the control pages and the bitstream */
-	stage = "gtt";
-	fCore->lock();
-	r = fCore->gttAlloc(kCtlBytes, &s->control);
-	if (!r) {
-		s->controlUp = true;
+	if (segmented) {
+		/*
+		 * In the VCPU's segment: the control pages (zeroed through BAR0),
+		 * the bitstream and the decode target; the bitstream's GTT
+		 * staging buffer anywhere (SDMA1 copies it in).
+		 */
+		stage = "segment-vram";
+		s->ctlBytes = kSegTarget + ((layout.target_bytes + kVideoPage - 1) & ~(kVideoPage - 1));
+		fCore->lock();
+		r = fRetired ? -ECANCELED :
+			frb_vram_mgr_alloc_windowed(&fVram, s->ctlBytes, 64 * 1024, FRB_VRAM_VISIBLE, vramAddr(0),
+						    kUvdSegment, segLo, segHi, &s->ctlOffset, &s->ctlBytes);
+		if (!r) {
+			s->ctlAllocated = true;
+			videoVramZero(adev, s->ctlOffset, kCtlBytes);
+			frb_flush_hdp(adev);
+		}
+		fCore->unlock();
+		if (r)
+			goto fail;
+		s->buffers.msg = vramAddr(s->ctlOffset + kCtlMsg);
+		s->buffers.feedback = vramAddr(s->ctlOffset + kCtlFeedback);
+		s->buffers.its = vramAddr(s->ctlOffset + kCtlIts);
+		s->vramTarget = vramAddr(s->ctlOffset + kSegTarget);
+		stage = "gtt";
+		fCore->lock();
 		r = fCore->gttAlloc(RDN_VIDEO_MAX_UPLOAD_BYTES, &s->bitstream);
 		if (!r)
 			s->bitstreamUp = true;
+		fCore->unlock();
+		if (r)
+			goto fail;
+	} else {
+		/* GTT: the control pages and the bitstream */
+		stage = "gtt";
+		fCore->lock();
+		r = fCore->gttAlloc(kCtlBytes, &s->control);
+		if (!r) {
+			s->controlUp = true;
+			r = fCore->gttAlloc(RDN_VIDEO_MAX_UPLOAD_BYTES, &s->bitstream);
+			if (!r)
+				s->bitstreamUp = true;
+		}
+		fCore->unlock();
+		if (r)
+			goto fail;
+		s->buffers.msg = s->control.gpu_addr + kCtlMsg;
+		s->buffers.feedback = s->control.gpu_addr + kCtlFeedback;
+		s->buffers.its = s->control.gpu_addr + kCtlIts;
 	}
-	fCore->unlock();
-	if (r)
-		goto fail;
-	s->buffers.msg = s->control.gpu_addr + kCtlMsg;
-	s->buffers.feedback = s->control.gpu_addr + kCtlFeedback;
-	s->buffers.its = s->control.gpu_addr + kCtlIts;
-	s->buffers.bitstream = s->bitstream.gpu_addr;
+	s->buffers.bitstream = segmented ? vramAddr(s->ctlOffset + kSegBitstream) : s->bitstream.gpu_addr;
 
 	/* the client's: the upload, and the two slots bound into the GART */
 	stage = "upload-ram";
@@ -830,6 +997,37 @@ IOReturn FirebrandAccel::videoCreate(FirebrandVideoClient *owner, bool administr
 		s->slotTarget[i] = gartAddr(s->slotFirst[i] * kVideoPage) + kVideoPage;
 	}
 
+	/*
+	 * Every buffer the IB names, and the IB, in the VCPU bo's segment (the
+	 * placement amdgpu_uvd_cs_pass1 makes; pass2's checks are weaker), and
+	 * the IB in the ring's 4 GB (its LMI_EXT40_ADDR): refused here rather
+	 * than found out by the decoder.
+	 */
+	if (segmented) {
+		struct { const char *name; UInt64 start, bytes; } spans[] = {
+			{ "msg", s->buffers.msg, FRB_UVD_H264_MSG_BYTES },
+			{ "feedback", s->buffers.feedback, FRB_UVD_H264_FEEDBACK_BYTES },
+			{ "DPB", s->buffers.dpb, layout.dpb_bytes },
+			{ "bitstream", s->buffers.bitstream, RDN_VIDEO_MAX_UPLOAD_BYTES },
+			{ "target", s->vramTarget, layout.target_bytes },
+			{ "IB", vramAddr(s->ctlOffset + kCtlIb), kVideoPage },
+		};
+
+		stage = "segments";
+		for (i = 0; i < sizeof(spans) / sizeof(spans[0]); i++) {
+			UInt64 a = spans[i].start, e = spans[i].start + spans[i].bytes - 1;
+
+			if ((a >> 28) != (vcpu >> 28) || (e >> 28) != (vcpu >> 28) ||
+			    (i == 5 && (a >> 32) != (ringGpu >> 32))) {
+				IOLog("FirebrandAccel: video: the %s at 0x%llx-0x%llx breaks UVD's segments (VCPU 0x%llx, "
+				      "ring 0x%llx)\n", spans[i].name, (unsigned long long)a, (unsigned long long)e,
+				      (unsigned long long)vcpu, (unsigned long long)ringGpu);
+				r = -ERANGE;
+				goto fail;
+			}
+		}
+	}
+
 	/* the contexts and the DPB start out zero (Mesa clears them; nothing of another client shows) */
 	stage = "vram-clear";
 	fCore->lock();
@@ -853,10 +1051,16 @@ IOReturn FirebrandAccel::videoCreate(FirebrandVideoClient *owner, bool administr
 	      (unsigned)s->token.high, (unsigned)s->token.low, (unsigned)s->handle, (unsigned)layout.width,
 	      (unsigned)layout.height, (unsigned)in->config.profile_idc, (unsigned)in->config.level_idc,
 	      (unsigned)in->config.max_num_ref_frames, (unsigned long long)(s->vramBytes >> 10),
-	      (unsigned long long)s->buffers.session, (unsigned)(layout.ctx_bytes >> 10),
+	      (unsigned long long)vramAddr(s->vramOffset), (unsigned)(layout.ctx_bytes >> 10),
 	      (unsigned)(layout.dpb_bytes >> 10), (unsigned)(s->slotBytes >> 10),
 	      (unsigned long long)s->slotTarget[0], (unsigned long long)s->slotTarget[1],
 	      (unsigned long long)((videoTimeUs() - t0) / 1000), s->validation ? " (validation)" : "");
+	if (segmented)
+		IOLog("FirebrandAccel: video: UVD before 5.0, all in the VCPU bo's segment (bo at 0x%llx): msg/feedback/IB "
+		      "0x%llx, bitstream 0x%llx, target 0x%llx, DPB 0x%llx; stream type H264\n",
+		      (unsigned long long)vcpu, (unsigned long long)s->buffers.msg,
+		      (unsigned long long)s->buffers.bitstream, (unsigned long long)s->vramTarget,
+		      (unsigned long long)s->buffers.dpb);
 
 	out->version = RDN_VIDEO_API_VERSION;
 	out->bytes = sizeof(*out);
@@ -890,10 +1094,9 @@ IOReturn FirebrandAccel::videoDecode(FirebrandVideoClient *owner, const rdn_vide
 {
 	FirebrandVideoSession *s;
 	IOReturn result = kIOReturnNotReady;
-	UInt32 slot = 0, seqFb, status;
+	UInt32 slot = 0, seqFb, status, fb[8];
 	uint32_t padded = 0;
 	UInt64 t0, t1, t2, t3;
-	const UInt8 *fb;
 	int r;
 
 	if (in->version != RDN_VIDEO_API_VERSION || in->bytes != sizeof(*in) || !videoZero(in->reserved, 2) ||
@@ -927,7 +1130,20 @@ IOReturn FirebrandAccel::videoDecode(FirebrandVideoClient *owner, const rdn_vide
 	/* the snapshot: the client's slice data into the GTT bitstream, zero to the 128-byte end */
 	memcpy(s->bitstream.cpu, s->upload->bytes(), in->bitstream_bytes);
 	bzero((UInt8 *)s->bitstream.cpu + in->bitstream_bytes, padded - in->bitstream_bytes);
-	s->buffers.target = s->slotTarget[slot];
+	if (s->segmented) {
+		/* into the VCPU's segment: SDMA1 from the snooped staging pages; the decode target is the VRAM one */
+		fCore->lock();
+		r = fRetired ? -ECANCELED :
+			frb_sdma_copy_buffer(fCore->adev(), 1, s->bitstream.gpu_addr, s->buffers.bitstream, padded);
+		fCore->unlock();
+		if (r) {
+			result = r == -ECANCELED ? kIOReturnNotReady : kIOReturnIOError;
+			goto done;
+		}
+		s->buffers.target = s->vramTarget;
+	} else {
+		s->buffers.target = s->slotTarget[slot];
+	}
 	t1 = videoTimeUs();
 	r = videoCommand(RDN_UVD_H264_MSG_DECODE, &in->picture, in->bitstream_bytes);
 	if (r) {
@@ -935,14 +1151,16 @@ IOReturn FirebrandAccel::videoDecode(FirebrandVideoClient *owner, const rdn_vide
 		goto done;
 	}
 	t2 = videoTimeUs();
-	fb = (const UInt8 *)s->control.cpu + kCtlFeedback;
-	seqFb = frb_get_le32(fb, 4);
-	status = frb_get_le32(fb, 8);
+	if (!videoFeedback(fb, 8)) {
+		result = kIOReturnNotReady;
+		goto done;
+	}
+	seqFb = fb[1];
+	status = fb[2];
 	if (s->validation && s->nextRequest <= 8)
 		IOLog("FirebrandAccel: video: feedback request %u: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-		      (unsigned)s->nextRequest, (unsigned)frb_get_le32(fb, 0), (unsigned)seqFb, (unsigned)status,
-		      (unsigned)frb_get_le32(fb, 12), (unsigned)frb_get_le32(fb, 16), (unsigned)frb_get_le32(fb, 20),
-		      (unsigned)frb_get_le32(fb, 24), (unsigned)frb_get_le32(fb, 28));
+		      (unsigned)s->nextRequest, (unsigned)fb[0], (unsigned)seqFb, (unsigned)status, (unsigned)fb[3],
+		      (unsigned)fb[4], (unsigned)fb[5], (unsigned)fb[6], (unsigned)fb[7]);
 	/* completed malformed pictures report a nonzero status: no partial pixels (RadeonNI's rule) */
 	if (seqFb != s->nextRequest || status) {
 		IOLog("FirebrandAccel: video: picture %u failed: feedback sequence %u status 0x%x\n",
@@ -950,6 +1168,17 @@ IOReturn FirebrandAccel::videoDecode(FirebrandVideoClient *owner, const rdn_vide
 		s->decodeFailed = true;
 		result = kIOReturnIOError;
 		goto done;
+	}
+	if (s->segmented) {
+		/* the picture out to the client's slot (SDMA1, VRAM to the slot's snooped pages) */
+		fCore->lock();
+		r = fRetired ? -ECANCELED :
+			frb_sdma_copy_buffer(fCore->adev(), 1, s->vramTarget, s->slotTarget[slot], s->layout.target_bytes);
+		fCore->unlock();
+		if (r) {
+			result = r == -ECANCELED ? kIOReturnNotReady : kIOReturnIOError;
+			goto done;
+		}
 	}
 	if (!videoGuards(s, slot)) {
 		videoPoison(-EIO, "the decoder wrote past its target (a slot's guard page changed)");

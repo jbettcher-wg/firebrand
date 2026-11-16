@@ -1,7 +1,12 @@
 /*
  * atombios_crtc.c (Linux 6.16), the table calls DCE 11.2 uses: lock, enable,
  * blank, power gating, DTD timing, overscan, scaler, AdjustDisplayPll 1.3,
- * SetDCEClock 2.1, SetPixelClock 1.7 and prepare_pll. Each parameter block
+ * SetDCEClock 2.1, SetPixelClock 1.7 and prepare_pll; and DCE 6's and DCE 8's
+ * (Linux 7.0.2): SetPixelClock 1.5/1.6 with the driver's dividers, the
+ * spread, the display engine PLL (PPLL0 on SI, ATOM_EXT_PLL1 on CIK). A
+ * CRTC with no pixel PLL (ATOM_PPLL_INVALID: DP on a DCE 8 board's external
+ * clock) still gets SetPixelClock, the PLL id 0xff, and no spread, as in
+ * amdgpu. Each parameter block
  * is a little-endian byte image (struct frb_ps) filled at the offsetof()
  * positions of the atombios.h structure the comment names; the interpreter
  * reads it as LE dwords and writes outputs back the same way.
@@ -466,7 +471,7 @@ void frb_atombios_crtc_set_disp_eng_pll(struct frb_device *adev, uint32_t dispcl
 		case CHIP_OLAND:
 			frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ucPpll), ATOM_PPLL0);
 			break;
-		default:
+		default:	/* CIK (dce_v8_0): Bonaire, Hawaii */
 			frb_ps_u8(&ps, OFS(PIXEL_CLOCK_PARAMETERS_V6, ucPpll), ATOM_EXT_PLL1);
 			break;
 		}

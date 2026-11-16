@@ -181,6 +181,13 @@ struct context {
 	unsigned sig_age;
 	/* Flushed since its last drawing call: acquire the surface first (rdn_mesa_surface_arm). */
 	int acquire_armed;
+	/*
+	 * The swap in progress tells the window server itself, from glthread's
+	 * thread (surface_shown), about the surface as it was when the swap
+	 * was asked for. Written only with no swap under way.
+	 */
+	int swap_notifies;
+	unsigned long shown_connection, shown_window, shown_surface;
 };
 
 #define MAX_CONTEXTS 64
@@ -3508,9 +3515,13 @@ int rdn_swap(void *rend)
 					usleep(10000);
 				}
 			}
+			/* -1: the swap may tell the window server itself (rdn_mesa_present). */
+			contexts[i].swap_notifies = -1;
 			rdn_mesa_present(contexts[i].gld_ctx);
-			rdn_surface_flush(contexts[i].connection, contexts[i].window,
-					  contexts[i].surface);
+			if (contexts[i].swap_notifies <= 0)
+				rdn_surface_flush(contexts[i].connection, contexts[i].window,
+						  contexts[i].surface);
+			contexts[i].swap_notifies = 0;
 			return 1;
 		}
 	}
@@ -3524,6 +3535,29 @@ static int ws_finish(void)
 	if (known < 0)
 		known = getenv("RDN_GLD_WS_FINISH") != NULL;
 	return known;
+}
+
+/*
+ * A double-buffered window's swap does not wait for its own frame
+ * (OSMesaSwapBuffersNotify). RDN_GLD_SWAP_SYNC=1 in the program's
+ * environment: it waits for glthread and the driver's thread at every
+ * swap, as before.
+ */
+static int swap_sync(void)
+{
+	static int known = -1;
+
+	if (known < 0)
+		known = getenv("RDN_GLD_SWAP_SYNC") != NULL;
+	return known;
+}
+
+/* In glthread's thread: the swapped picture's copy to the surface is with the GPU. */
+static void surface_shown(void *arg)
+{
+	struct context *c = arg;
+
+	rdn_surface_flush(c->shown_connection, c->shown_window, c->shown_surface);
 }
 
 static int swap_finish(void)
@@ -3587,6 +3621,78 @@ void rdn_mesa_samples(int samples)
  * whose environment is not ours to set): frames a second, once a second, in
  * /tmp/rdn-fps.log. A frame is one present of the program's own drawable.
  */
+/*
+ * RDN_HITCH_LOG=<ms> (see Mesa's util/rdn_hitch.h): a line for every frame
+ * that took at least that long and twice the running mean of the frames
+ * before it, beside the lines of the steps that took the time; and when the
+ * program ends, how the times of all its frames (presents) were spread.
+ */
+#define HITCH_FRAMES 65536
+static float *hitch_ms;
+static unsigned hitch_n;
+
+static int hitch_cmp(const void *a, const void *b)
+{
+	float x = *(const float *)a, y = *(const float *)b;
+
+	return x < y ? -1 : x > y;
+}
+
+/* When the program ends: how its frames' times were spread. */
+static void hitch_summary(void)
+{
+	unsigned i, over[4] = { 0, 0, 0, 0 }, n = hitch_n;
+	static const float limit[4] = { 33, 50, 100, 250 };
+	double sum = 0;
+
+	if (!hitch_ms || n < 2)
+		return;
+	qsort(hitch_ms, n, sizeof(*hitch_ms), hitch_cmp);
+	for (i = 0; i < n; i++) {
+		unsigned k;
+
+		sum += hitch_ms[i];
+		for (k = 0; k < 4; k++)
+			over[k] += hitch_ms[i] > limit[k];
+	}
+	fprintf(stderr, "rdn-hitch frames %u: mean %.1f median %.1f p90 %.1f p99 %.1f max %.1f ms; "
+		"over 33 ms %u, 50 ms %u, 100 ms %u, 250 ms %u\n",
+		n, sum / n, hitch_ms[n / 2], hitch_ms[n * 9 / 10], hitch_ms[n * 99 / 100],
+		hitch_ms[n - 1], over[0], over[1], over[2], over[3]);
+}
+
+static void hitch_frame(void)
+{
+	static double threshold = -1, last, mean;
+	static unsigned long frame;
+	struct timeval tv;
+	double now, dt;
+
+	if (threshold < 0) {
+		const char *env = getenv("RDN_HITCH_LOG");
+		double ms = env ? atof(env) : 0;
+
+		threshold = !env ? 0 : (ms > 1 ? ms : 2) / 1e3;
+		if (threshold != 0 && (hitch_ms = malloc(HITCH_FRAMES * sizeof(*hitch_ms))))
+			atexit(hitch_summary);
+	}
+	if (threshold == 0)
+		return;
+	gettimeofday(&tv, NULL);
+	now = tv.tv_sec + tv.tv_usec / 1e6;
+	frame++;
+	if (last != 0) {
+		dt = now - last;
+		if (hitch_ms && hitch_n < HITCH_FRAMES)
+			hitch_ms[hitch_n++] = (float)(dt * 1e3);
+		if (mean != 0 && dt >= threshold && dt >= 2 * mean)
+			fprintf(stderr, "rdn-hitch %.3f frame %lu (mean %.1f ms): %.1f ms\n",
+				now, frame, mean * 1e3, dt * 1e3);
+		mean = mean == 0 ? dt : mean + (dt - mean) / 16;
+	}
+	last = now;
+}
+
 static void fps_count(void)
 {
 	static int on = -1;
@@ -3629,6 +3735,7 @@ void rdn_mesa_present(void *gld_ctx)
 	if (!c || !c->rend || !mesa_finish || !read_record(c, &d))
 		return;
 	fps_count();
+	hitch_frame();
 	/* A direct surface may have moved or been covered; stored surfaces only resize. */
 	if (c->rend != rdn_current_rend || !c->bound ||
 	    memcmp(&d, &c->drawable, sizeof(d)) != 0 ||
@@ -3644,7 +3751,20 @@ void rdn_mesa_present(void *gld_ctx)
 		 */
 		if (c->type == DRAWABLE_SCREEN && !rdn_window_server && !swap_finish())
 			OSMesaSwapBuffersAsync(c->mesa);
-		else
+		else if (c->type == DRAWABLE_SURFACE && c->stored && !surface_direct() &&
+			 !rdn_window_server && c->swap_notifies < 0 &&
+			 !swap_finish() && !swap_sync()) {
+			/*
+			 * A window: the program's thread is not held for the
+			 * frame either. The window server is told when the
+			 * copy to the surface is on the ring, from the thread
+			 * that put it there.
+			 */
+			c->shown_connection = c->connection;
+			c->shown_window = c->window;
+			c->shown_surface = c->surface;
+			c->swap_notifies = OSMesaSwapBuffersNotify(c->mesa, surface_shown, c) != 0;
+		} else
 			OSMesaSwapBuffers(c->mesa);
 	}
 	/*

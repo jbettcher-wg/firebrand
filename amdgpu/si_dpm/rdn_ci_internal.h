@@ -171,6 +171,9 @@ static inline void udelay(struct rdn_card *card, uint32_t us)
  * order. These are those wrappers, explicit about the host's byte order
  * rather than relying on PowerPC being big-endian.
  */
+#ifndef RDN_BIG_ENDIAN
+#error "RDN_BIG_ENDIAN is not defined (rdn_card.h): the SMC tables would be byte-reversed on a big-endian host"
+#endif
 static inline uint16_t cpu_to_be16(uint16_t v)
 {
 #if RDN_BIG_ENDIAN

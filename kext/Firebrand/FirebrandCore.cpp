@@ -199,6 +199,17 @@ static void os_log(void *cookie, enum frb_log_level level, const char *fmt, va_l
 	vsnprintf(line, sizeof(line), fmt, ap);
 	IOLog("Firebrand: %s\n", line);
 	((FirebrandCore *)cookie)->logLine(line);
+	if (level == FRB_LOG_ERROR)
+		((FirebrandCore *)cookie)->errorLine(line);
+}
+
+void FirebrandCore::errorLine(const char *line)
+{
+	char *d = fErrLines[fErrCount % 4];
+
+	strncpy(d, line, sizeof(fErrLines[0]) - 1);
+	d[sizeof(fErrLines[0]) - 1] = 0;
+	fErrCount++;
 }
 
 void FirebrandCore::logLine(const char *line)
@@ -683,6 +694,7 @@ UInt32 FirebrandCore::configuredStage(void)
 
 int FirebrandCore::runStages(UInt32 stage)
 {
+	UInt32 errs;
 	int r;
 
 	if (stage >= FRB_STAGE_COUNT)
@@ -691,9 +703,20 @@ int FirebrandCore::runStages(UInt32 stage)
 		IOLog("Firebrand: stages to %s: no aperture or dummy page\n", frb_stage_name((enum frb_stage)stage));
 		return -ENOMEM;
 	}
+	errs = fErrCount;
 	frb_trace_start(&fAdev);
 	r = frb_device_init(&fAdev, (enum frb_stage)stage);
 	frb_trace_stop(&fAdev);
+	if (r && fAdev.stage_failed && fErrCount > errs) {
+		/* the failed stage's own words, first cause first ("... / stage gmc: FAILED (-2)"), for the report */
+		UInt32 first = fErrCount - errs > 3 ? fErrCount - 3 : errs, i, len = 0;
+
+		fStageError[0] = 0;
+		for (i = first; i < fErrCount && len + 4 < sizeof(fStageError); i++) {
+			snprintf(fStageError + len, sizeof(fStageError) - len, "%s%s", len ? " / " : "", fErrLines[i % 4]);
+			len = strlen(fStageError);
+		}
+	}
 	IOLog("Firebrand: stages to %s: %d; %lu register accesses traced (%lu lost, %lu repeated reads not stored)\n",
 	      frb_stage_name((enum frb_stage)stage), r, (unsigned long)fAdev.trace_len,
 	      (unsigned long)fAdev.trace_lost, (unsigned long)fAdev.trace_squashed);
@@ -747,6 +770,40 @@ void FirebrandCore::publishState(void)
 {
 	fOwner->setProperty("FirebrandStageDone", frb_stage_name(fAdev.stage_done));
 	fOwner->setProperty("FirebrandStageFailed", (unsigned long long)(SInt64)fAdev.stage_failed, 32);
+	publishReport();
+}
+
+/* the support level's word, as the report and the registry say it */
+static const char *supportWord(const struct frb_device *adev)
+{
+	if (!adev->row)
+		return "unknown";
+	if (!adev->row->untested)
+		return "verified";
+	return frb_asic_ported(adev->asic_type) ? "untested" : "not ported";
+}
+
+void FirebrandCore::publishReport(void)
+{
+	char vbios[112];
+
+	if (!fDevice)
+		return;
+	fDevice->setProperty("FirebrandSupport", supportWord(&fAdev));
+	fDevice->setProperty("FirebrandUnlocked", fAdev.unlocked ? kOSBooleanTrue : kOSBooleanFalse);
+	fDevice->setProperty("FirebrandStageCap", frb_stage_name(frb_stage_cap(&fAdev)));
+	fDevice->setProperty("FirebrandStageDone", frb_stage_name(fAdev.stage_done));
+	fDevice->setProperty("FirebrandStageFailed", (unsigned long long)(SInt64)fAdev.stage_failed, 32);
+	fDevice->setProperty("FirebrandStageFailedAt", fAdev.stage_failed ? frb_stage_name(fAdev.stage_failed_at) : "");
+	fDevice->setProperty("FirebrandStageError", fAdev.stage_failed ? fStageError : "");
+	fDevice->setProperty("FirebrandASIC", frb_asic_name(fAdev.asic_type));
+	if (fAdev.row)
+		fDevice->setProperty("FirebrandBoard", fAdev.row->board);
+	snprintf(vbios, sizeof(vbios), "%s%s%s%s%s", fAdev.vbios_pn[0] ? fAdev.vbios_pn : "unknown",
+		 fAdev.vbios_ver[0] ? ", version " : "", fAdev.vbios_ver, fAdev.vbios_date[0] ? ", " : "", fAdev.vbios_date);
+	fDevice->setProperty("FirebrandVBIOS", vbios);
+	if (OSDynamicCast(OSString, fOwner ? fOwner->getProperty("FirebrandVersion") : 0))
+		fDevice->setProperty("FirebrandVersion", fOwner->getProperty("FirebrandVersion"));
 }
 
 /*
@@ -833,6 +890,14 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 	}
 	fAllowRegWrite = flag("FirebrandAllowRegWrite", "frb_regwrite");
 	fBringUp = flag("FirebrandBringUp", "frb_bringup");
+	{
+		/* FirebrandUnlock (frbctl unlock writes it); boot-arg frb_unlock=1 on, frb_unlock=0 off over the personality */
+		int arg;
+
+		fUnlock = fOwner && fOwner->getProperty("FirebrandUnlock") == kOSBooleanTrue;
+		if (PE_parse_boot_arg("frb_unlock", &arg))
+			fUnlock = arg != 0;
+	}
 	fAdopt = flag("FirebrandAdopt", "frb_adopt");
 	fDisplayAuto = flag("FirebrandDisplay", "frb_display");
 	fAccelWanted = flag("FirebrandAccel", "frb_accel");
@@ -882,8 +947,12 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 	fAdev.revision = fDevice->configRead8(kIOPCIConfigRevisionID);
 	fAdev.subsys_vendor = fDevice->configRead16(kIOPCIConfigSubSystemVendorID);
 	fAdev.subsys_device = fDevice->configRead16(kIOPCIConfigSubSystemID);
-	fAdev.asic_type = frb_asic_type_of(fAdev.device);
+	fAdev.asic_type = frb_asic_type_of_rev(fAdev.device, fAdev.revision);
 	fAdev.row = frb_asic_lookup(fAdev.device, fAdev.revision, fAdev.subsys_vendor, fAdev.subsys_device);
+	fAdev.unlocked = fUnlock;
+	/* a card of a family Firebrand knows, with no verified row of its own: an untested card */
+	if (!fAdev.row && fAdev.asic_type != CHIP_UNKNOWN_FRB)
+		frb_asic_untested_row(&fAdev);
 	/* the family's IP blocks (si_set_ip_blocks / vi_set_ip_blocks) */
 	fAdev.funcs = frb_asic_funcs_of(fAdev.asic_type);
 	if (!fAdev.funcs) {
@@ -897,6 +966,13 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 	fAdev.gart_legacy = fAccelWanted;
 	fAdev.trace = (struct frb_trace_ent *)fTraceMem->getBytesNoCopy();
 	fAdev.trace_cap = FRB_TRACE_ENTRIES;
+	/*
+	 * An untested card runs its family's own path to stage dce, power
+	 * management included where the family has it there (CIK: CI DPM right
+	 * after stage smu, for the heat; Vega 20: the SMU's DPM in stage smu,
+	 * which the display and the thermal limits need). SI and Polaris start
+	 * DPM after stage sdma, so an untested one gets it with the unlock.
+	 */
 	fAdev.want_dpm = fDpmWanted;
 	fAdev.want_audio = fAudioWanted;
 	fAdev.force_tmds = flag("FirebrandForceTMDS", "frb_force_tmds");
@@ -914,9 +990,30 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 		fAdev.si_dpm_quirks = q ? q->unsigned32BitValue() : 0;
 		if (PE_parse_boot_arg("frb_sidpm_quirks", &arg))
 			fAdev.si_dpm_quirks = (uint32_t)arg;
-		/* SI DPM only on request until its state switch works (docs/si-bring-up.md) */
-		fAdev.si_dpm_wanted = (fOwner && fOwner->getProperty("FirebrandSIDPM") == kOSBooleanTrue) ||
-				      (PE_parse_boot_arg("frb_sidpm", &arg) && arg);
+		/*
+		 * SI DPM with the rest (FirebrandDPM) since its tables reach the
+		 * SMC in the SMC's byte order (docs/si-bring-up.md, "The cause");
+		 * FirebrandSIDPM false or frb_sidpm=0 leaves SI at its boot clocks.
+		 */
+		fAdev.si_dpm_wanted = !(fOwner && fOwner->getProperty("FirebrandSIDPM") == kOSBooleanFalse);
+		if (PE_parse_boot_arg("frb_sidpm", &arg))
+			fAdev.si_dpm_wanted = arg != 0;
+	}
+	{
+		/*
+		 * CIK DPM (frb_ci_dpm.c), right after stage smu, with FirebrandDPM:
+		 * FirebrandCIDPM / boot-arg frb_cidpm, 1 on (the default since the
+		 * W8100's SMC tables were verified against Linux radeon's,
+		 * docs/cik-bring-up.md), 0 off (boot clocks), 2 upload only (the SMC
+		 * image and tables in its SRAM, the SMC held in reset)
+		 */
+		OSNumber *n = fOwner ? OSDynamicCast(OSNumber, fOwner->getProperty("FirebrandCIDPM")) : 0;
+		int arg, v = n ? (int)n->unsigned32BitValue() : 1;
+
+		if (PE_parse_boot_arg("frb_cidpm", &arg))
+			v = arg;
+		fAdev.ci_dpm_wanted = v != 0;
+		fAdev.ci_dpm_quirks = v == 2 ? FRB_CI_DPM_UPLOAD_ONLY : 0;
 	}
 	fAdev.audio_pin = -1;		/* RadeonNI's pin choice until frbctl audio pin N */
 	fAdev.psp_only = fPspOnly;	/* SOC15: stage smu stops after the PSP's firmware loads */
@@ -939,6 +1036,22 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 	      frb_asic_name(fAdev.asic_type), fDevice->configRead16(kIOPCIConfigCommand),
 	      fAdev.row ? fAdev.row->board : "no row in the family table: survey only");
 
+	if (!frb_asic_ported(fAdev.asic_type)) {
+		/*
+		 * Vega 10 / Vega 12: recognised, not ported. The VBIOS (from the
+		 * option ROM) for the report, and nothing else: the register BAR
+		 * is not even mapped.
+		 */
+		fDevice->setMemoryEnable(true);
+		if (loadBios())
+			frb_atombios_survey_strings(&fAdev);
+		fOwner->setProperty("FirebrandASIC", frb_asic_name(fAdev.asic_type));
+		publishReport();
+		IOLog("Firebrand: %s has no Firebrand port yet: identified for a report (frbctl report), "
+		      "nothing written; please report it as an issue\n", frb_asic_name(fAdev.asic_type));
+		goto fail;
+	}
+
 	/* amdgpu_device_init: the register BAR is 5 from Bonaire on (CIK, VI: 256 KB; Vega 20: 512 KB), 2 on SI */
 	fDevice->setMemoryEnable(true);
 	fRegMap = fDevice->mapDeviceMemoryWithRegister((UInt8)fAdev.funcs->rmmio_bar);
@@ -954,6 +1067,9 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 
 	if (!loadBios()) {
 		IOLog("Firebrand: no usable VBIOS; nothing done\n");
+		snprintf(fStageError, sizeof(fStageError), "no usable VBIOS (the option ROM, the firmware's copy and the personality's all failed)");
+		fAdev.stage_failed = -ENOENT;
+		publishReport();
 		goto fail;
 	}
 	if (frb_is_soc15(&fAdev))
@@ -968,18 +1084,19 @@ bool FirebrandCore::start(IOService *owner, IOPCIDevice *dev)
 		fOwner->setProperty("FirebrandBoard", fAdev.row->board);
 	publishState();
 
-	if (!fAdev.row) {
-		/* a Polaris nobody has verified: the survey is all it gets */
-		IOLog("Firebrand: survey done; not staying on a card without a row\n");
-		goto fail;
-	}
+	if (fAdev.row->untested)
+		IOLog("Firebrand: %04x:%04x rev %02x subsystem %04x:%04x is an UNTESTED card: %s; "
+		      "please send its report (frbctl report --md, or Firebrand Monitor's Copy Report) as a GitHub issue\n",
+		      fAdev.vendor, fAdev.device, fAdev.revision, fAdev.subsys_vendor, fAdev.subsys_device,
+		      fAdev.unlocked ? "unlocked (FirebrandUnlock / frb_unlock=1): every stage the family has" :
+		      "display-only (stage dce); `sudo frbctl unlock` and a restart try the rest");
 
 	stage = configuredStage();
-	if (stage > fAdev.row->max_stage && !fBringUp) {
-		IOLog("Firebrand: stage %lu asked, %s is verified to stage %s; running that far\n",
-		      (unsigned long)stage, fAdev.row->board,
-		      frb_stage_name((enum frb_stage)fAdev.row->max_stage));
-		stage = fAdev.row->max_stage;
+	if (stage > (UInt32)frb_stage_cap(&fAdev) && !fBringUp) {
+		IOLog("Firebrand: stage %lu asked, %s %s stage %s; running that far\n",
+		      (unsigned long)stage, fAdev.row->board, fAdev.row->untested ? "may run to" : "is verified to",
+		      frb_stage_name(frb_stage_cap(&fAdev)));
+		stage = frb_stage_cap(&fAdev);
 	}
 	if (stage > FRB_STAGE_SURVEY) {
 		IOLockLock(fLock);
@@ -1323,6 +1440,25 @@ IOReturn FirebrandCore::ucSmcRead(UInt32 addr, UInt32 *value)
 	return kIOReturnSuccess;
 }
 
+/*
+ * frbctl unlock / lock on a loaded driver. Only an untested card's cap moves
+ * (frb_stage_cap); a verified row keeps its own. Unlocking lets frbctl stage
+ * N run the rest now (power management with stage sdma, as at a start);
+ * locking stops further stages but leaves the ones already run until the
+ * next start.
+ */
+IOReturn FirebrandCore::ucUnlock(UInt32 on, UInt32 *cap)
+{
+	IOLockLock(fLock);
+	fAdev.unlocked = on ? 1 : 0;
+	*cap = frb_stage_cap(&fAdev);
+	IOLog("Firebrand: frbctl %s: %s may run to stage %s\n", on ? "unlock" : "lock",
+	      fAdev.row ? fAdev.row->board : "the card", frb_stage_name(frb_stage_cap(&fAdev)));
+	publishReport();
+	IOLockUnlock(fLock);
+	return kIOReturnSuccess;
+}
+
 IOReturn FirebrandCore::ucRunStage(UInt32 stage, SInt32 *result)
 {
 	IOLockLock(fLock);
@@ -1651,15 +1787,20 @@ IOReturn FirebrandCore::ucDisplayInfo(struct frb_user_display *out)
 			goto done;
 		}
 		/*
-		 * that codec pin's HOT_PLUG_CONTROL, CHANNEL_SPEAKER (AZF0ENDPOINTn
-		 * index/data, 4 apart): DCE 11.2's pair, so only where its audio
-		 * block is the one ported (DCE 6 has the pair at 0x1780)
+		 * that codec pin's HOT_PLUG_CONTROL, CHANNEL_SPEAKER through its
+		 * AZF0ENDPOINTn index/data pair, from the DCE's audio table: DCE
+		 * 11.2's (0x17a8, 4 apart) and DCE 8's (0x1780, 6 apart; reads
+		 * need no write-enable bit). DCE 6 is not read here, as before.
 		 */
-		if (frb_funcs(&fAdev)->display && frb_funcs(&fAdev)->display->audio_regs == &frb_audio_regs_dce11) {
-			frb_wreg(&fAdev, 0x17a8 + 4 * out->audio_ep, 0x54);
-			out->audio_hot_plug = frb_rreg(&fAdev, 0x17a9 + 4 * out->audio_ep);
-			frb_wreg(&fAdev, 0x17a8 + 4 * out->audio_ep, 0x25);
-			out->audio_speakers = frb_rreg(&fAdev, 0x17a9 + 4 * out->audio_ep);
+		if (frb_funcs(&fAdev)->display && (frb_funcs(&fAdev)->display->audio_regs == &frb_audio_regs_dce11 ||
+						   frb_funcs(&fAdev)->display->audio_regs == &frb_audio_regs_dce8)) {
+			const struct frb_audio_regs *ar = frb_funcs(&fAdev)->display->audio_regs;
+			UInt32 pin = ar->pin_stride * (UInt32)out->audio_ep;
+
+			frb_wreg(&fAdev, ar->ep_index + pin, 0x54);
+			out->audio_hot_plug = frb_rreg(&fAdev, ar->ep_data + pin);
+			frb_wreg(&fAdev, ar->ep_index + pin, 0x25);
+			out->audio_speakers = frb_rreg(&fAdev, ar->ep_data + pin);
 		}
 		out->crtc_control = frb_rreg(&fAdev, 0x1b9c + c->crtc_offset);	/* mmCRTC_CONTROL */
 		out->crtc_status_frame_count = frb_rreg(&fAdev, 0x1ba6 + c->crtc_offset);	/* mmCRTC_STATUS_FRAME_COUNT */
@@ -1681,7 +1822,7 @@ IOReturn FirebrandCore::ucAudio(UInt32 op, SInt32 arg, SInt32 *result, SInt32 *d
 
 	IOLockLock(fLock);
 	d = display();
-	if (!d || !fAdev.want_audio || frb_is_soc15(&fAdev)) {	/* DCE 12: DP audio not ported (frb_dce_audio.c is DCE 11's) */
+	if (!d || !fAdev.want_audio || frb_is_soc15(&fAdev)) {	/* DCE 12: DP audio is DC's (frb_dce_audio.c is DCE 6/8/11's) */
 		r = -ENODEV;
 	} else {
 		switch (op) {
@@ -2013,11 +2154,16 @@ IOReturn FirebrandCore::ucDpm(UInt32 op, struct frb_user_dpm *out)
 	bzero(&st, sizeof(st));
 	IOLockLock(fLock);
 	/* a change is traced (frbctl trace dump); a status read keeps the last trace */
-	/* frbctl dpm on N: SI's DPM switches (RDN_SI_DPM_*, FRB_SI_DPM_*) for this try, above the op */
-	if ((op & 0xff) == FRB_DPM_OP_ENABLE && (op >> 8)) {
+	/*
+	 * frbctl dpm on N: SI's DPM switches (RDN_SI_DPM_*, FRB_SI_DPM_*) for this
+	 * try, above the op; on CIK the CI DPM switches (FRB_CI_DPM_*), cleared by
+	 * a plain dpm on (which starts an SMC FRB_CI_DPM_UPLOAD_ONLY left in reset)
+	 */
+	if ((op & 0xff) == FRB_DPM_OP_ENABLE && frb_is_cik(&fAdev))
+		fAdev.ci_dpm_quirks = op >> 8;
+	else if ((op & 0xff) == FRB_DPM_OP_ENABLE && (op >> 8))
 		fAdev.si_dpm_quirks = op >> 8;
-		op &= 0xff;
-	}
+	op &= 0xff;
 	if (op != FRB_DPM_OP_STATUS)
 		frb_trace_start(&fAdev);
 	if (frb_is_soc15(&fAdev)) {
@@ -2068,11 +2214,12 @@ IOReturn FirebrandCore::ucDpm(UInt32 op, struct frb_user_dpm *out)
 	case FRB_DPM_OP_ENABLE:
 		if (frb_pm_enabled(&fAdev))
 			r = 0;
-		else if (fAdev.stage_done < FRB_STAGE_SDMA)
+		else if (fAdev.stage_done < (frb_is_cik(&fAdev) ? FRB_STAGE_SMU : FRB_STAGE_SDMA))
 			r = -EPERM;
 		else {
 			fAdev.dpm_failed = 0;
 			fAdev.si_dpm_wanted = 1;	/* frbctl dpm on is the request SI's opt-in waits for */
+			fAdev.ci_dpm_wanted = 1;	/* and CIK's */
 			r = frb_pm_hw_init(&fAdev);
 			fAdev.dpm_failed = r;
 			/* as at load: the watermarks and powerplay's display configuration */
@@ -2405,11 +2552,22 @@ IOReturn FirebrandCore::ucStatus(struct frb_user_status *out)
 	out->stage_failed = adev->stage_failed;
 	out->flags = (fBringUp ? FRB_SF_BRINGUP : 0) | (fOwner && fOwner->metaCast("FirebrandFramebuffer") ? FRB_SF_FRAMEBUFFER : 0) |
 		     (fAccelWanted ? FRB_SF_ACCEL : 0) | (fDpmWanted ? FRB_SF_DPM : 0) | (fAudioWanted ? FRB_SF_AUDIO : 0) |
-		     (fGating ? FRB_SF_GATING : 0);
+		     (fGating ? FRB_SF_GATING : 0) | (adev->row && adev->row->untested ? FRB_SF_UNTESTED : 0) |
+		     (adev->unlocked ? FRB_SF_UNLOCKED : 0);
 	statusCopy(out->asic, sizeof(out->asic), frb_asic_name(adev->asic_type));
 	statusCopy(out->board, sizeof(out->board), adev->row ? adev->row->board : "");
 	statusCopy(out->driver_version, sizeof(out->driver_version), kmod_info.version);
 	snprintf(out->build, sizeof(out->build), "%s%s%s", FRB_BUILD_ID, FRB_BUILD_ID[0] ? ", " : "", __DATE__);
+	out->support = !adev->row || !adev->row->untested ? FRB_SUPPORT_VERIFIED :
+		       frb_asic_ported(adev->asic_type) ? FRB_SUPPORT_UNTESTED : FRB_SUPPORT_NOT_PORTED;
+	out->stage_cap = frb_stage_cap(adev);
+	out->stage_failed_at = adev->stage_failed ? adev->stage_failed_at : 0;
+	statusCopy(out->vbios_pn, sizeof(out->vbios_pn), adev->vbios_pn);
+	statusCopy(out->vbios_ver, sizeof(out->vbios_ver), adev->vbios_ver);
+	statusCopy(out->vbios_date, sizeof(out->vbios_date), adev->vbios_date);
+	statusCopy(out->stage_error, sizeof(out->stage_error), adev->stage_failed ? fStageError : "");
+	out->boot_gfx_mhz = adev->default_sclk / 100;
+	out->boot_mem_mhz = adev->default_mclk / 100;
 	vram = adev->gmc.real_vram_size ? adev->gmc.real_vram_size : adev->gmc.mc_vram_size;
 	out->vram_mb = (UInt32)(vram >> 20);
 	out->vram_visible_mb = (UInt32)((adev->aper_size && adev->aper_size < vram ? adev->aper_size : vram) >> 20);
@@ -2499,6 +2657,12 @@ IOReturn FirebrandCore::ucStatus(struct frb_user_status *out)
 	if (frb_is_soc15(adev)) {
 		/* SOC15 clock gating (VI's is not ported: no bit, "not available") */
 		out->gating = (adev->want_gating ? 1u : 0u) | (adev->cg_gated ? 2u : 0u);
+		out->cg_flags_lo = (UInt32)adev->cg_flags;
+		out->cg_flags_hi = (UInt32)(adev->cg_flags >> 32);
+		out->valid |= FRB_ST_GATING;
+	} else if (frb_is_si(adev) || frb_is_cik(adev)) {
+		/* SI, CIK: gated at the end of stage sdma unless frb_cg=0 (si_sdma_stage, cik_sdma_stage) */
+		out->gating = (adev->no_cg ? 0u : 1u) | (adev->cg_on ? 2u : 0u);
 		out->cg_flags_lo = (UInt32)adev->cg_flags;
 		out->cg_flags_hi = (UInt32)(adev->cg_flags >> 32);
 		out->valid |= FRB_ST_GATING;

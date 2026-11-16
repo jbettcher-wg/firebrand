@@ -3,7 +3,10 @@
  * DIGxEncoderControl 1.5, UNIPHYTransmitterControl 1.6, SelectCRTC_Source
  * 1.3, the transmitter INIT pass, and the DIG dpms sequence with DP link
  * training; and the arms DCE 6 takes (Linux 7.0.2): DIGxEncoderControl
- * 1.4, UNIPHYTransmitterControl 1.5, SelectCRTC_Source 1.2. Each parameter
+ * 1.4, UNIPHYTransmitterControl 1.5, SelectCRTC_Source 1.2, which are the
+ * FirePro W8100's (DCE 8) as well; there DP on the card's external clock
+ * takes ENCODER_REFCLK_SRC_EXTCLK as the PHY's reference (dp_extclk,
+ * frb_dce_v8_0.c's pick_pll programs no PPLL for it). Each parameter
  * block is built byte by byte, its bitfield bytes by hand (atombios.h's
  * bitfields lay out the other way round on a big-endian compiler).
  *

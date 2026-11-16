@@ -278,7 +278,8 @@ int FirebrandFramebuffer::bootPattern(void)
 		return FRB_PATTERN_BLACK;
 	if (s && s->isEqualTo("grey"))
 		return FRB_PATTERN_GREY;
-	return adev->row && adev->stage_done <= adev->row->max_stage ? FRB_PATTERN_SPLASH : FRB_PATTERN_BARS;
+	/* within the stages the card may run to (its row's, or an untested card's by the unlock): the splash */
+	return adev->row && adev->stage_done <= frb_stage_cap(adev) ? FRB_PATTERN_SPLASH : FRB_PATTERN_BARS;
 }
 
 /*
@@ -292,10 +293,11 @@ IOReturn FirebrandFramebuffer::showBootPicture(void)
 	const struct frb_device *adev = fCore.adev();
 	IOReturn r = programMode(fPreferred, kDepth32, pattern);
 
-	IOLog("FirebrandFramebuffer: boot picture: %s (%s, verified to stage %s, running to %s): %s\n",
+	IOLog("FirebrandFramebuffer: boot picture: %s (%s, %s stage %s, running to %s): %s\n",
 	      pattern == FRB_PATTERN_SPLASH ? "the splash" : pattern == FRB_PATTERN_BARS ? "the colour bars" :
 	      "a test fill", adev->row ? adev->row->board : "no row",
-	      adev->row ? frb_stage_name((enum frb_stage)adev->row->max_stage) : "-",
+	      adev->row && adev->row->untested ? "allowed to" : "verified to",
+	      adev->row ? frb_stage_name(frb_stage_cap(adev)) : "-",
 	      frb_stage_name(adev->stage_done), r == kIOReturnSuccess ? "set" : "not set");
 	return r;
 }

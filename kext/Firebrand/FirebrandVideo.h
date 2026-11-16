@@ -4,7 +4,8 @@
  * RadeonNIUvdSession.cpp), unchanged at the interface, so the client
  * library FrostByte compiles in (RadeonNI's video/rdnvd_rdnv.c) and
  * its rdnvdh264dec element work as they do on RadeonNI. Underneath, UVD 6.3
- * (amdgpu/frb_uvd_v6_0.c) and the Polaris messages (amdgpu/frb_uvd_h264.c).
+ * (amdgpu/frb_uvd_v6_0.c), 7.2 (frb_uvd_v7_0.c) or SI's 3.1 (frb_uvd_v3_1.c)
+ * and the messages for each (amdgpu/frb_uvd_h264.c).
  *
  * What changes under the protocol (FirebrandVideo.cpp has the details):
  *  - the decode target is the output slot itself: two buffers in system
@@ -12,7 +13,9 @@
  *    read-only (RadeonNI decoded into VRAM and copied each picture out with
  *    CP DMA). A page of guard bytes on either side, checked every picture.
  *  - messages, feedback, the IT scaling table, the IB and the bitstream are
- *    in GTT too, written by the CPU through its cache (snooped);
+ *    in GTT too, written by the CPU through its cache (snooped); on UVD
+ *    before 5.0 (SI) the msg, feedback and IB are in VRAM instead, in the
+ *    VCPU's 256 MB segment, and nothing crosses a 256 MB boundary;
  *  - the session context, the macroblock context and the DPB are one VRAM
  *    allocation (the invisible heap when it has room), cleared by SDMA1
  *    before the create message.

@@ -5,7 +5,8 @@
  * the packets are SDMA v3's (tonga_sdma_pkt_open.h), laid out as Mesa's
  * radeonsi emits them for GFX8 (cik_sdma.c, si_sdma_clear_buffer), with
  * SDMA v4's two differences (vega10_sdma_pkt_open.h; ac_cmdbuf_sdma.c):
- * the sub-window's pitch field and the fill's count less one.
+ * the sub-window's pitch field and the fill's count less one, and CIK's
+ * (cikd.h; Mesa's cik_sdma.c for GFX7): the sub-window's extent as it is.
  *
  * Copyright (c) 2026 Jordan Bettcher
  * SPDX-License-Identifier: MIT
@@ -132,9 +133,11 @@ static uint32_t subwin_pitch(const struct frb_rect_ib *ib, uint32_t pitch)
 
 /*
  * COPY_LINEAR_SUB_WINDOW with 4-byte elements: x, y in elements, pitches
- * and the extent minus one (GFX8 and GFX9; GFX7 took the extent as it is),
- * depth 1, no swap, no cache hints. SDMA 3's DW_4 and DW_9 pitch fields are
- * laid out alike (SRC_PITCH stands for both); SDMA 4's: subwin_pitch.
+ * and the extent minus one (GFX8 and GFX9; GFX7, ib->cik, takes the extent
+ * and the depth as they are: w, h, 1), depth 1, no swap, no cache hints.
+ * SDMA 3's DW_4 and DW_9 pitch fields are laid out alike (SRC_PITCH stands
+ * for both); SDMA 4's: subwin_pitch. CIK's w and h are at most
+ * FRB_RECT_CIK_MAX_EXTENT (emit_rect_copy cuts).
  */
 static void emit_sub_window(struct frb_rect_ib *ib, const struct frb_rect_surface *dst, uint32_t dx, uint32_t dy,
 			    const struct frb_rect_surface *src, uint32_t sx, uint32_t sy, uint32_t w, uint32_t h)
@@ -152,8 +155,21 @@ static void emit_sub_window(struct frb_rect_ib *ib, const struct frb_rect_surfac
 	emit(ib, SDMA_PKT_COPY_LINEAR_SUBWIN_DW_8_DST_X(dx) | SDMA_PKT_COPY_LINEAR_SUBWIN_DW_8_DST_Y(dy));
 	emit(ib, SDMA_PKT_COPY_LINEAR_SUBWIN_DW_9_DST_Z(0) | subwin_pitch(ib, dst->pitch));
 	emit(ib, SDMA_PKT_COPY_LINEAR_SUBWIN_DW_10_DST_SLICE_PITCH(dst->pitch * dst->height - 1));
+	if (ib->cik) {
+		emit(ib, SDMA_PKT_COPY_LINEAR_SUBWIN_DW_11_RECT_X(w) | SDMA_PKT_COPY_LINEAR_SUBWIN_DW_11_RECT_Y(h));
+		emit(ib, SDMA_PKT_COPY_LINEAR_SUBWIN_DW_12_RECT_Z(1));
+		return;
+	}
 	emit(ib, SDMA_PKT_COPY_LINEAR_SUBWIN_DW_11_RECT_X(w - 1) | SDMA_PKT_COPY_LINEAR_SUBWIN_DW_11_RECT_Y(h - 1));
 	emit(ib, SDMA_PKT_COPY_LINEAR_SUBWIN_DW_12_RECT_Z(0));
+}
+
+/* CIK: how many sub-windows an extent of n takes (its field holds 16383 at most); 1 elsewhere */
+static uint32_t cik_pieces(const struct frb_rect_ib *ib, uint32_t n)
+{
+	if (!ib->cik || n <= FRB_RECT_CIK_MAX_EXTENT)
+		return 1;
+	return (n + FRB_RECT_CIK_MAX_EXTENT - 1) / FRB_RECT_CIK_MAX_EXTENT;
 }
 
 /* SI DMA: a linear copy of `bytes` (si_dma_emit_copy_buffer) */
@@ -182,7 +198,7 @@ static uint32_t copy_dw(const struct frb_rect_ib *ib, const struct frb_rect_surf
 	uint64_t bytes;
 
 	if (!ib->si_dma)
-		return FRB_RECT_COPY_DW;
+		return FRB_RECT_COPY_DW * cik_pieces(ib, w) * cik_pieces(ib, h);
 	if (dx == 0 && sx == 0 && w == dst->pitch && w == src->pitch) {
 		bytes = (uint64_t)w * h * 4;
 		return (uint32_t)((bytes + FRB_RECT_SI_MAX_BYTES - 1) / FRB_RECT_SI_MAX_BYTES) * FRB_RECT_SI_COPY_DW;
@@ -199,7 +215,16 @@ static void emit_rect_copy(struct frb_rect_ib *ib, const struct frb_rect_surface
 	uint32_t i;
 
 	if (!ib->si_dma) {
-		emit_sub_window(ib, dst, dx, dy, src, sx, sy, w, h);
+		uint32_t cx, cy, cw, ch;
+
+		/* one packet; on CIK, one per piece of at most 16383 a side (cik_pieces) */
+		for (cy = 0; cy < h; cy += ch) {
+			ch = ib->cik && h - cy > FRB_RECT_CIK_MAX_EXTENT ? FRB_RECT_CIK_MAX_EXTENT : h - cy;
+			for (cx = 0; cx < w; cx += cw) {
+				cw = ib->cik && w - cx > FRB_RECT_CIK_MAX_EXTENT ? FRB_RECT_CIK_MAX_EXTENT : w - cx;
+				emit_sub_window(ib, dst, dx + cx, dy + cy, src, sx + cx, sy + cy, cw, ch);
+			}
+		}
 		return;
 	}
 	if (dx == 0 && sx == 0 && w == dst->pitch && w == src->pitch) {
@@ -232,7 +257,7 @@ int frb_rect_emit_fill(struct frb_rect_ib *ib, const struct frb_rect_surface *ds
 	data = frb_get_le32(&pixel, 0);
 	at = dst->gpu_addr + ((uint64_t)y * dst->pitch + x) * 4;
 	fill_dw = ib->si_dma ? FRB_RECT_SI_FILL_DW : FRB_RECT_FILL_DW;
-	max_bytes = ib->si_dma ? FRB_RECT_SI_MAX_BYTES : FRB_RECT_FILL_MAX_BYTES;
+	max_bytes = ib->si_dma ? FRB_RECT_SI_MAX_BYTES : ib->cik ? FRB_RECT_CIK_FILL_MAX_BYTES : FRB_RECT_FILL_MAX_BYTES;
 	if (x == 0 && w == dst->pitch) {
 		/* whole rows: one run, in packets of at most fill_max_bytes */
 		uint64_t left = (uint64_t)h * w * 4;

@@ -156,6 +156,9 @@ int frb_pm_hw_init(struct frb_device *adev)
 		return 0;
 	if (frb_is_soc15(adev))
 		return -ENOSYS;	/* SOC15's DPM is frb_vega20_hwmgr.c, run in stage smu */
+	/* CIK runs radeon's ci_dpm (frb_ci_dpm.c) right after stage smu */
+	if (frb_is_cik(adev))
+		return adev->stage_done < FRB_STAGE_SMU ? -EPERM : frb_ci_dpm_hw_init(adev);
 	if (adev->stage_done < FRB_STAGE_SDMA)
 		return -EPERM;
 	/* powerplay is VI's (smu7_hwmgr); SI runs radeon's si_dpm (frb_si_dpm.c) */
@@ -232,6 +235,8 @@ int frb_pm_enabled(struct frb_device *adev)
 {
 	if (frb_is_si(adev))
 		return frb_si_dpm_enabled(adev);
+	if (frb_is_cik(adev))
+		return frb_ci_dpm_enabled(adev);
 	return adev->pm && adev->pm->dpm_enabled;
 }
 
@@ -255,7 +260,8 @@ static void pp_dpm_powergate_uvd(struct pp_hwmgr *hwmgr, bool gate)
 }
 
 /*
- * amdgpu_dpm_enable_uvd (not SI): amdgpu_dpm_set_powergating_by_smu with
+ * amdgpu_dpm_enable_uvd: on SI its legacy arm (the UVD power state,
+ * frb_si_dpm_enable_uvd); otherwise amdgpu_dpm_set_powergating_by_smu with
  * its "already in the target state" check, then pp_set_powergating_by_smu's
  * UVD arm. Returns 0, or -ENODEV without DPM.
  */
@@ -265,7 +271,9 @@ int frb_pm_enable_uvd(struct frb_device *adev, int enable)
 	int pwr_state = enable ? POWER_STATE_ON : POWER_STATE_OFF;
 
 	if (frb_is_si(adev))
-		return -ENODEV;	/* si_dpm's UVD clocks: with uvd_v3_1 */
+		return frb_si_dpm_enable_uvd(adev, enable);
+	if (frb_is_cik(adev))
+		return frb_ci_dpm_enable_uvd(adev, enable);
 	if (!pm || !pm->dpm_enabled)
 		return -ENODEV;
 	if (pm->uvd_pwr_state == pwr_state)
@@ -282,6 +290,10 @@ void frb_pm_fini(struct frb_device *adev)
 
 	if (frb_is_si(adev)) {
 		frb_si_dpm_fini(adev);
+		return;
+	}
+	if (frb_is_cik(adev)) {
+		frb_ci_dpm_fini(adev);
 		return;
 	}
 	if (!pm)
@@ -308,6 +320,10 @@ void frb_pm_compute_clocks(struct frb_device *adev, const struct amd_pp_display_
 
 	if (frb_is_si(adev)) {
 		frb_si_dpm_compute_clocks(adev, cfg);
+		return;
+	}
+	if (frb_is_cik(adev)) {
+		frb_ci_dpm_compute_clocks(adev, cfg);
 		return;
 	}
 	if (!pm || !pm->dpm_enabled)
@@ -351,6 +367,8 @@ int frb_pm_force_performance_level(struct frb_device *adev, enum amd_dpm_forced_
 
 	if (frb_is_si(adev))
 		return frb_si_dpm_force_performance_level(adev, level);
+	if (frb_is_cik(adev))
+		return frb_ci_dpm_force_performance_level(adev, level);
 	if (!adev->pm || !adev->pm->dpm_enabled)
 		return -ENODEV;
 	hwmgr = &adev->pm->hwmgr;
@@ -377,6 +395,8 @@ uint32_t frb_pm_get_sclk(struct frb_device *adev, int low)
 
 	if (frb_is_si(adev))
 		return frb_si_dpm_get_sclk(adev, low);
+	if (frb_is_cik(adev))
+		return frb_ci_dpm_get_sclk(adev, low);
 	if (!adev->pm || !adev->pm->dpm_enabled)
 		return 0;
 	hwmgr = &adev->pm->hwmgr;
@@ -391,6 +411,8 @@ uint32_t frb_pm_get_mclk(struct frb_device *adev, int low)
 
 	if (frb_is_si(adev))
 		return frb_si_dpm_get_mclk(adev, low);
+	if (frb_is_cik(adev))
+		return frb_ci_dpm_get_mclk(adev, low);
 	if (!adev->pm || !adev->pm->dpm_enabled)
 		return 0;
 	hwmgr = &adev->pm->hwmgr;
@@ -425,6 +447,8 @@ int frb_pm_get_status(struct frb_device *adev, struct frb_pm_status *st)
 
 	if (frb_is_si(adev))
 		return frb_si_dpm_get_status(adev, st);
+	if (frb_is_cik(adev))
+		return frb_ci_dpm_get_status(adev, st);
 	memset(st, 0, sizeof(*st));
 	if (!adev->pm || !adev->pm->dpm_enabled)
 		return -ENODEV;
@@ -536,8 +560,24 @@ int frb_pm_read_sensors(struct frb_device *adev, struct frb_pm_sensors *s)
 		return frb_vega20_read_sensors(adev, s);
 	if (frb_is_si(adev))
 		return frb_si_read_sensors(adev, s);
-	if (adev->family != AMDGPU_FAMILY_VI || !adev->pm || !adev->pm->dpm_enabled)
+	if (frb_is_cik(adev))
+		return frb_ci_read_sensors(adev, s);
+	if (adev->family != AMDGPU_FAMILY_VI)
 		return -ENODEV;
+	if (!adev->pm || !adev->pm->dpm_enabled) {
+		/*
+		 * No powerplay (DPM off, or an untested card at display-only): the
+		 * thermal sensor alone (smu7_thermal_get_temperature's read), once
+		 * stage smu has the SMC's index registers in use.
+		 */
+		if (adev->stage_done < FRB_STAGE_SMU)
+			return -ENODEV;
+		v = (frb_smc_rreg(adev, ixCG_MULT_THERMAL_STATUS) & CG_MULT_THERMAL_STATUS__CTF_TEMP_MASK) >>
+			CG_MULT_THERMAL_STATUS__CTF_TEMP__SHIFT;
+		s->temp_mc = v & 0x200 ? 255000 : (int32_t)(v & 0x1ff) * 1000;
+		s->valid |= FRB_PMS_TEMP;
+		return 0;
+	}
 	hwmgr = &adev->pm->hwmgr;
 	data = (struct smu7_hwmgr *)hwmgr->backend;
 	s->dpm_enabled = 1;

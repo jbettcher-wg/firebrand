@@ -141,10 +141,18 @@ static NSString *clockText(unsigned mhz)
 	int n, i;
 
 	[nameLabel setStringValue:utf8(frb_card_name(c))];
-	[idLabel setStringValue:[NSString stringWithFormat:U("%@ " DOT " %04x:%04x rev %02x " DOT " stage %@"),
-				 utf8(frb_family_label(c)), c->have_status ? st->vendor : c->vendor,
-				 c->have_status ? st->device : c->device, c->have_status ? st->revision : c->revision,
-				 c->have_status ? utf8(frb_stage_label(st->stage_done)) : utf8(c->stage)]];
+	{
+		/* the untested-card policy in a word, where it applies (Copy Report has the rest) */
+		int support = frb_card_support(c);
+		NSString *tag = support == FRB_SUPPORT_UNTESTED ?
+			(frb_card_unlocked(c) ? U(" " DOT " untested card, unlocked") : U(" " DOT " untested card: display-only")) :
+			support == FRB_SUPPORT_NOT_PORTED ? U(" " DOT " not ported yet: identified only") : @"";
+
+		[idLabel setStringValue:[NSString stringWithFormat:U("%@ " DOT " %04x:%04x rev %02x " DOT " stage %@%@"),
+					 utf8(frb_family_label(c)), c->have_status ? st->vendor : c->vendor,
+					 c->have_status ? st->device : c->device, c->have_status ? st->revision : c->revision,
+					 c->have_status ? utf8(frb_stage_label(st->stage_done)) : utf8(c->stage), tag]];
+	}
 
 	/* GPU and memory clocks: the scale is the DPM ladder's top */
 	if (frb_card_has(c, FRB_ST_CLOCKS)) {

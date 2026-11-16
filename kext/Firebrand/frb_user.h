@@ -67,6 +67,9 @@ enum {
 				   frame through an identity LUT, whatever ramp the window server loaded */
 	FRB_UC_STATUS,		/* struct out: struct frb_user_status. Reads only; on an 'frbs' client
 				   it is method FRB_US_STATUS (0) instead */
+	FRB_UC_UNLOCK,		/* in: 1 unlock, 0 lock (an untested card past display-only, for frbctl stage N
+				   now; frbctl unlock also writes FirebrandUnlock for the next start); out: the
+				   stage the card may run to now */
 	FRB_UC_METHOD_COUNT
 };
 
@@ -85,7 +88,7 @@ enum {
  * bookkeeping, not its registers. Only appended to in later versions; a
  * client checks size.
  */
-#define FRB_STATUS_VERSION	1
+#define FRB_STATUS_VERSION	2	/* 2: support, stage_cap, stage_failed_at, vbios_*, stage_error */
 
 enum {
 	FRB_ST_CLOCKS		= 1u << 0,	/* gfx_mhz, mem_mhz */
@@ -119,7 +122,16 @@ enum {
 	FRB_SF_DPM		= 1u << 3,	/* FirebrandDPM: power management asked for */
 	FRB_SF_AUDIO		= 1u << 4,	/* FirebrandAudio: DP audio asked for */
 	FRB_SF_GATING		= 1u << 5,	/* FirebrandGating (SOC15 clock gating) asked for */
-	FRB_SF_STOPPED		= 1u << 6	/* the driver is stopping: identity only */
+	FRB_SF_STOPPED		= 1u << 6,	/* the driver is stopping: identity only */
+	FRB_SF_UNTESTED		= 1u << 7,	/* no verified row: an untested card (support FRB_SUPPORT_UNTESTED) */
+	FRB_SF_UNLOCKED		= 1u << 8	/* the unlock is on (FirebrandUnlock, frb_unlock=1, frbctl unlock) */
+};
+
+/* support: what Firebrand knows of this card (the untested-card policy) */
+enum {
+	FRB_SUPPORT_VERIFIED = 0,	/* a family-table row: verified on this card, to row_max_stage */
+	FRB_SUPPORT_UNTESTED,		/* a ported family, not this card: display-only unless unlocked */
+	FRB_SUPPORT_NOT_PORTED		/* recognised (Vega 10/12), no port: identified only */
 };
 
 /* dpm_state */
@@ -227,6 +239,17 @@ struct frb_user_status {
 	char board[64];			/* the family table's row, "" none */
 	char driver_version[16];	/* the kext's version */
 	char build[48];			/* the build's source (git commit) and date, "" unknown */
+	/* version 2: the untested-card policy, and what an issue report needs */
+	uint32_t support;		/* FRB_SUPPORT_* */
+	uint32_t stage_cap;		/* the stage the card may run to now: its row's, display-only (dce) for an
+					   untested card, every stage when unlocked */
+	uint32_t stage_failed_at;	/* the stage that failed (with stage_failed) */
+	char vbios_pn[48];		/* the VBIOS part number ("113-C6750200-100") */
+	char vbios_ver[24];		/* its version string, "" none */
+	char vbios_date[20];		/* its build date ("20YY/MM/DD HH:MM") */
+	char stage_error[200];		/* the failed stage's error lines, "" none */
+	uint32_t boot_gfx_mhz, boot_mem_mhz;	/* the VBIOS's boot clocks (FirmwareInfo), 0 unknown: what the card
+						   runs at without power management */
 };
 
 /* FRB_UC_FUNCTIONS: the device's PCI functions (the hidden HD Audio function; bring-up) */

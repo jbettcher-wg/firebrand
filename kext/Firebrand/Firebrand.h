@@ -79,6 +79,7 @@ public:
 	IOReturn methodRegWrite(UInt32 reg, UInt32 value);
 	IOReturn methodSmcRead(UInt32 addr, UInt32 *value);
 	IOReturn methodRunStage(UInt32 stage, SInt32 *result);
+	IOReturn methodUnlock(UInt32 on, UInt32 *cap);
 	IOReturn methodVramRead(UInt32 offset, UInt32 *value);
 	IOReturn methodTrace(UInt32 on, UInt32 *entries);
 	IOReturn methodDisplayInfo(void *out, IOByteCount *outSize);

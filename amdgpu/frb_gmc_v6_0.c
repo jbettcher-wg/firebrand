@@ -818,6 +818,13 @@ static void gmc_v6_0_enable_hdp_ls(struct frb_device *adev,
 }
 
 
+/* the MC's part alone (si_dpm's bring-up switch FRB_SI_DPM_MC_UNGATED) */
+void frb_gmc_v6_0_set_mc_clockgating(struct frb_device *adev, int gate)
+{
+	gmc_v6_0_enable_mc_mgcg(adev, gate);
+	gmc_v6_0_enable_mc_ls(adev, gate);
+}
+
 void frb_gmc_v6_0_set_clockgating_state(struct frb_device *adev, int gate)
 {
 	/* not an APU */

@@ -51,6 +51,17 @@ void frb_vram_mgr_fini(struct frb_vram_mgr *m);
  */
 int frb_vram_mgr_alloc(struct frb_vram_mgr *m, uint64_t size, uint64_t align, uint32_t where,
 		       uint64_t *offset, uint64_t *size_out);
+/*
+ * frb_vram_mgr_alloc with two more limits, for UVD before 5.0 (SI, CIK),
+ * which takes no buffer across a 256 MB segment and wants its message and
+ * feedback in the VCPU's (amdgpu_uvd_cs_pass2): the buffer lies inside one
+ * window of `window` bytes (a power of two) of GPU address, gpu_base +
+ * offset, and inside the VRAM offsets [lo, hi) (hi == 0: no such limit).
+ * The windows are tried lowest first.
+ */
+int frb_vram_mgr_alloc_windowed(struct frb_vram_mgr *m, uint64_t size, uint64_t align, uint32_t where,
+				uint64_t gpu_base, uint64_t window, uint64_t lo, uint64_t hi,
+				uint64_t *offset, uint64_t *size_out);
 /* gives back what frb_vram_mgr_alloc handed out at offset, size bytes */
 void frb_vram_mgr_free(struct frb_vram_mgr *m, uint64_t offset, uint64_t size);
 

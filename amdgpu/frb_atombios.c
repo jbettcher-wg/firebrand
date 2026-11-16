@@ -391,6 +391,13 @@ void frb_atombios_survey_strings(struct frb_device *adev)
 	date[10] = ' '; date[11] = rom[0x59]; date[12] = rom[0x5a]; date[13] = rom[0x5b];
 	date[14] = rom[0x5c]; date[15] = rom[0x5d]; date[16] = 0;
 	frb_info(adev, "ATOM BIOS: %s, ver: %s, %s (%u bytes)", pn, ver[0] ? ver : "?", date, size);
+	/* kept for the status call and the report (frbctl report, Firebrand Monitor's Copy Report) */
+	memcpy(adev->vbios_pn, pn, sizeof(adev->vbios_pn) < sizeof(pn) ? sizeof(adev->vbios_pn) : sizeof(pn));
+	adev->vbios_pn[sizeof(adev->vbios_pn) - 1] = 0;
+	memcpy(adev->vbios_ver, ver, sizeof(adev->vbios_ver) < sizeof(ver) ? sizeof(adev->vbios_ver) : sizeof(ver));
+	adev->vbios_ver[sizeof(adev->vbios_ver) - 1] = 0;
+	memcpy(adev->vbios_date, date, sizeof(adev->vbios_date) < sizeof(date) ? sizeof(adev->vbios_date) : sizeof(date));
+	adev->vbios_date[sizeof(adev->vbios_date) - 1] = 0;
 }
 
 /*

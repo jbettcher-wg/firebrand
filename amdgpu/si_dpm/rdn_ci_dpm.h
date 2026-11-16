@@ -623,6 +623,7 @@ struct rdn_ci_dpm {
 	struct ci_power_info pi;
 
 	bool enabled;
+	bool uploaded;				/* Firebrand: rdn_ci_dpm_upload ran (the tables are in the SRAM) */
 	/*
 	 * ni_copy_and_switch_arb_sets()'s closing switch request (MC_CG_CONFIG,
 	 * MC_ARB_CG), which Linux makes and this port did not; false keeps the
@@ -653,6 +654,13 @@ void rdn_ci_dpm_fini(struct rdn_ci_dpm *dpm);
  * running, as Linux does. Returns 0 or a negative errno.
  */
 int rdn_ci_dpm_enable(struct rdn_ci_dpm *dpm, const void *smc_fw, size_t smc_size);
+/*
+ * Firebrand: rdn_ci_dpm_enable in two halves (rdn_ci_dpm.c, ci_dpm_enable_upload):
+ * the image and every table into the SMC's SRAM with the SMC held in reset,
+ * then the SMC and DPM started.
+ */
+int rdn_ci_dpm_upload(struct rdn_ci_dpm *dpm, const void *smc_fw, size_t smc_size);
+int rdn_ci_dpm_start(struct rdn_ci_dpm *dpm);
 
 /* ci_dpm_disable(): everything off, the SMC in reset, arbiter set F0. */
 int rdn_ci_dpm_disable(struct rdn_ci_dpm *dpm);

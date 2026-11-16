@@ -294,9 +294,10 @@ IOReturn FirebrandAccel::slotLocked(UInt32 count, UInt32 *slots, struct frb_rect
 		slots[i] = s;
 		ibs[i].buf = (uint8_t *)fIbArena.cpu + s * kIbSlotBytes;
 		ibs[i].len_dw = 0;
-		ibs[i].cap_dw = kIbSlotBytes / 4 - 8;	/* sdma_v3_0 / sdma_v4_0 / si_dma_ring_pad_ib's room */
+		ibs[i].cap_dw = kIbSlotBytes / 4 - 8;	/* sdma_v3_0 / sdma_v4_0 / cik_sdma / si_dma_ring_pad_ib's room */
 		ibs[i].sdma4 = frb_is_soc15(fCore->adev());	/* SDMA 4's packet encodings (frb_rect.h) */
 		ibs[i].si_dma = frb_is_si(fCore->adev());	/* SI DMA packets (frb_rect.h) */
+		ibs[i].cik = frb_is_cik(fCore->adev());	/* CIK SDMA: the sub-window's extent as it is (frb_rect.h) */
 	}
 	fSlotNext = (fSlotNext + count) % kIbSlots;
 	profSlotNs += nowNs() - t0;
@@ -646,6 +647,7 @@ IOReturn FirebrandAccel::movesLocked(struct frb_bo_table *bos, const struct frb_
 	like.cap_dw = kIbSlotBytes / 4 - 8;
 	like.sdma4 = frb_is_soc15(fCore->adev());
 	like.si_dma = frb_is_si(fCore->adev());
+	like.cik = frb_is_cik(fCore->adev());
 	need[0] = need[1] = need[2] = 0;
 	for (phase = through ? 1 : 0; phase <= (through ? 2 : 0); phase++) {
 		c = frb_rect_moves_ibs(&like, &s, through ? &scratch : 0, m, n, phase);

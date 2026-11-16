@@ -1,14 +1,18 @@
 /*
  * DisplayPort audio, RadeonNI's (RadeonNI's hw/rdn_dce8_afmt.c) on
- * DCE 11.2's registers (its DCE8 arm) and DCE 6's (its DCE6 arm).
+ * DCE 11.2's registers (its DCE8 arm), DCE 8's (the same arm, on its own
+ * registers) and DCE 6's (its DCE6 arm).
  *
  * PER DCE. Every register and layout fact comes from the DCE's table,
  * frb_display_funcs.audio_regs (struct frb_audio_regs): frb_audio_regs_dce11
  * at the end of this file, frb_audio_regs_dce6 in frb_dce_v6_0_audio.c (the
  * endpoint index's write-enable bit, DCE 6's DTO1 pair, six pins 6 dwords
- * apart, no AFMT_CNTL, DTO1's module from the display engine clock). What
- * follows describes the DCE 11.2 table; tests/frb_audio_test.c holds both
- * against RadeonNI's two arms, write for write.
+ * apart, no AFMT_CNTL, DTO1's module from the display engine clock),
+ * frb_audio_regs_dce8 in frb_dce_v8_0_audio.c (RadeonNI's DCE8 arm at its
+ * own registers: seven pins 6 dwords apart, no write-enable bit, no
+ * AFMT_CNTL, DTO1's module the DP reference clock as here). What follows
+ * describes the DCE 11.2 table; tests/frb_audio_test.c holds all three
+ * against RadeonNI's arms, write for write.
  *
  * WHY RADEONNI'S. It is the DP audio that has been heard on this platform
  * and this monitor: an LG HDR 4K played it from the R7 450
@@ -34,7 +38,7 @@
  * AFMT_CNTL; its AFMT runs on an ungated clock). It goes on in dp_mode_set
  * before the first AFMT write and off when the DIG's audio is released.
  *
- * WHEN (frb_dce_v11_0.c frb_display_set_mode, as rdn_modeset):
+ * WHEN (frb_dce_v11_0.c's set_mode, and dce_v6_0's and dce_v8_0's, as rdn_modeset):
  *   - hw_init at stage dce, after the display engine clocks
  *     (rdn_dce8_afmt_init after SetPixelClock's display engine PLL);
  *   - encoder prepare: dp_enable(false), DP_VIDEO_OFF, transmitter off,
@@ -187,8 +191,10 @@ uint32_t frb_audio_decode_dfs_div(uint32_t did)
  * The DP audio DTO1 MODULE, in kHz: rdn_dce8_dispclk_khz's DCE8 arm.
  * FirmwareInfo v2.2 ulGPUPLL_OutputFreq (0 -> 360000, 3.6 GHz), scaled by
  * the DENTIST DPREFCLK divider (clock * 100 / div): the DP reference clock.
+ * DCE 11.2's and DCE 8's (frb_dce_v8_0_audio.c) table both take it;
+ * DENTIST_DISPCLK_CNTL is 0x124 with the divider in bits 24-30 on both.
  */
-static uint32_t frb_dce8_dispclk_khz(struct frb_device *adev, struct frb_display *d)
+uint32_t frb_audio_dprefclk_khz(struct frb_device *adev, struct frb_display *d)
 {
 	uint16_t data_offset = 0, size = 0;
 	uint8_t frev = 0, crev = 0;
@@ -641,5 +647,5 @@ const struct frb_audio_regs frb_audio_regs_dce11 = {
 	.hdmi_infoframe_control1 = HDMI_INFOFRAME_CONTROL1,
 	.afmt_cntl = FRB_AFMT_CNTL,
 	.afmt_audio_clock_en = FRB_AFMT_AUDIO_CLOCK_EN,
-	.dto1_module_khz = frb_dce8_dispclk_khz,
+	.dto1_module_khz = frb_audio_dprefclk_khz,
 };

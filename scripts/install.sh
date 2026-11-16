@@ -2,7 +2,7 @@
 # Install Firebrand on Mac OS X 10.5.8 (PowerPC). Run it from the built package directory
 # (build/dist/Firebrand, which scripts/build-mac.sh makes), on the Mac itself, as root:
 #
-#   sudo ./install.sh [--no-gl] [--no-audio]
+#   sudo ./install.sh [--no-gl] [--no-audio] [--unlock]
 #
 # Installs into /System/Library/Extensions:
 #   Firebrand.kext            the driver, set up as the framebuffer with 2D, OpenGL, video,
@@ -11,6 +11,12 @@
 #   RadeonNIGA.plugin         the window server's 2D plug-in
 #   HDAudio.kext              DisplayPort audio (--no-audio leaves it out)
 # and frbctl into /usr/local/bin.
+#
+# The driver matches every AMD card of the Southern Islands, Sea Islands, Polaris and Vega
+# families (the IOPCIMatch list in Firebrand.kext's Info.plist). A card Firebrand has been
+# verified on runs everything; any other card of those families starts display-only, and
+# --unlock (or `sudo frbctl unlock` later) lets it try the rest. README.md, "Your card isn't
+# listed as verified?".
 #
 # Install it while the old graphics card is still in the Mac, then shut down and swap the cards
 # (README.md, "Installing"). An existing RadeonNIGLDriver.bundle or RadeonNIGA.plugin from another
@@ -32,11 +38,13 @@ fail() { echo "install.sh: $*" >&2; exit 1; }
 
 gl=1
 audio=1
+unlock=false
 for arg in "$@"; do
 	case "$arg" in
 	--no-gl) gl=0 ;;
 	--no-audio) audio=0 ;;
-	*) fail "unknown option $arg (options: --no-gl, --no-audio)" ;;
+	--unlock) unlock=true ;;
+	*) fail "unknown option $arg (options: --no-gl, --no-audio, --unlock)" ;;
 	esac
 done
 
@@ -54,20 +62,36 @@ if [ "$gl" = 1 ] && [ ! -d "$here/RadeonNIGLDriver.bundle" ]; then
 fi
 [ "$audio" = 0 ] || [ -d "$here/HDAudio.kext" ] || fail "HDAudio.kext is not next to this script (or use --no-audio)"
 
-# Is a supported card in the Mac now? Fine if not: install with the old card in, then swap.
+# Is a card the driver matches in the Mac now? Fine if not: install with the old card in, then
+# swap. The ids are the kext's own IOPCIMatch list. The registry shows an id as four bytes,
+# big-endian on PowerPC (1002:699f: <00001002>, <0000699f>); a little-endian <9f690000> is
+# read too.
+ids=$(perl -0777 -ne 'if (/<key>IOPCIMatch<\/key>\s*<string>([^<]*)</) { for (split " ", $1) { print "$1\n" if /^0x([0-9a-fA-F]{4})1002$/ } }' \
+	"$here/Firebrand.kext/Contents/Info.plist" | tr 'A-F' 'a-f' | sort -u)
+[ -n "$ids" ] || fail "Firebrand.kext's Info.plist names no AMD device ids"
 card=
-for c in "9f690000:an AMD Polaris 12 card (1002:699f)" "2b680000:an AMD Cape Verde card (1002:682b)" \
-	 "a1660000:an AMD Vega 20 card (1002:66a1)"; do
-	if ioreg -r -c IOPCIDevice -l -w0 2>/dev/null | grep -q "\"device-id\" = <${c%%:*}>"; then
-		card="${c#*:}"
+# each PCI device's vendor and device id, as "vvvv dddd" (one device per "+-o" entry)
+present=$(ioreg -r -c IOPCIDevice -l -w0 2>/dev/null | awk '
+	function id16(s) {
+		sub(/.*-id" = </, "", s)
+		return substr(s, 1, 4) == "0000" ? substr(s, 5, 4) : substr(s, 3, 2) substr(s, 1, 2)
+	}
+	/\+-o / { if (v != "") print v, d; v = ""; d = "" }
+	/"vendor-id" = </ { v = id16($0) }
+	/"device-id" = </ { d = id16($0) }
+	END { if (v != "") print v, d }')
+for id in $(echo "$present" | awk '$1 == "1002" { print $2 }'); do
+	if echo "$ids" | grep -qx "$id"; then
+		card="1002:$id"
 		break
 	fi
 done
 if [ -n "$card" ]; then
-	echo "Found $card."
+	echo "Found an AMD card Firebrand matches ($card). If it is not one of the verified cards in"
+	echo "README.md it starts display-only; see \"Your card isn't listed as verified?\" there."
 else
-	echo "No supported card (1002:699f, 682b or 66a1) in the Mac right now: the driver is installed"
-	echo "and will start when the card is in."
+	echo "No card Firebrand matches is in the Mac right now: the driver is installed and will start"
+	echo "when the card is in."
 fi
 
 set -e
@@ -84,7 +108,8 @@ for b in Firebrand.kext RadeonNIGA.plugin; do cp -R "$here/$b" "$STAGE/"; done
 [ "$audio" = 0 ] || cp -R "$here/HDAudio.kext" "$STAGE/"
 
 # The settings of an installed driver: the framebuffer personality at the last bring-up stage
-# (7, video), with the accelerator; OpenGL announced only with the GL bundle installed.
+# (7, video), with the accelerator; OpenGL announced only with the GL bundle installed. An
+# untested card stays display-only unless --unlock (FirebrandUnlock; frbctl unlock / lock).
 glval=false
 [ "$gl" = 1 ] && glval=true
 perl -0777 -pi -e "
@@ -93,6 +118,7 @@ perl -0777 -pi -e "
 	s{(<key>FirebrandAccel</key>\s*)<(true|false)/>}{\${1}<true/>}g;
 	s{(<key>FirebrandAccelGL</key>\s*)<(true|false)/>}{\${1}<$glval/>}g;
 	s{(<key>FirebrandBringUp</key>\s*)<(true|false)/>}{\${1}<false/>}g;
+	s{(<key>FirebrandUnlock</key>\s*)<(true|false)/>}{\${1}<$unlock/>}g;
 	s{(<key>FirebrandAllowRegWrite</key>\s*)<(true|false)/>}{\${1}<false/>}g;
 " "$STAGE/Firebrand.kext/Contents/Info.plist"
 plutil -lint "$STAGE/Firebrand.kext/Contents/Info.plist" >/dev/null || fail "the edited Info.plist does not parse"
@@ -165,7 +191,10 @@ Firebrand is installed. Next:
   2. Shut down, put the AMD card in (if it is not in yet) and connect a DisplayPort monitor.
   3. Start the Mac. There is no picture until the driver starts (the card has no Open
      Firmware driver); then the Firebrand boot screen appears, then the login window.
-  4. Check: frbctl info, and System Profiler > Graphics/Displays.
+  4. Check: frbctl report, and System Profiler > Graphics/Displays. A card that is not
+     one of the verified ones runs display-only: `sudo frbctl unlock` and a restart try
+     the rest. Please send `frbctl report --md` (or Firebrand Monitor's Copy Report) as a
+     GitHub issue either way: https://github.com/jbettcher-wg/firebrand/issues
 
 If the Mac does not come up:
   - over ssh: sudo ./uninstall.sh (in this folder) and restart; or

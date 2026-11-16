@@ -8,7 +8,7 @@
 #import "FMCardView.h"
 #include <CoreServices/CoreServices.h>	/* kAEOpenApplication, keyAELaunchedAsLogInItem */
 
-#define FM_VERSION	"1.1"
+#define FM_VERSION	"1.2"
 #define FM_NAME		@"Firebrand Monitor"
 #define U(s)		[NSString stringWithUTF8String:(s)]
 #define DOT		" \xc2\xb7 "
@@ -394,8 +394,14 @@ static NSMenuItem *add(NSMenu *m, NSString *title, SEL action, NSString *key, id
 			old++;
 		}
 	}
+	for (i = 0; i < ncards; i++)
+		if (frb_card_support(&cards[i]) == FRB_SUPPORT_UNTESTED || frb_card_support(&cards[i]) == FRB_SUPPORT_NOT_PORTED)
+			break;
 	if (!ncards)
 		[footLabel setStringValue:@"Looking for Firebrand cards every 5 seconds"];
+	else if (i < ncards)
+		/* an untested card: what to do about it, in the footer the user sees */
+		[footLabel setStringValue:@"Untested card: please send Copy Report as a GitHub issue"];
 	else if (old && !live)
 		[footLabel setStringValue:@"This Firebrand has no status interface: names and stage only"];
 	else

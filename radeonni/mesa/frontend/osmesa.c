@@ -71,6 +71,8 @@
 
 #include "state_tracker/st_context.h"
 #include "main/glthread.h"
+#include "util/rdn_hitch.h"
+#include "util/u_queue.h"
 #include "main/context.h"
 #include "main/mtypes.h"
 #include "main/texobj.h"
@@ -265,6 +267,11 @@ struct osmesa_context
    GLint *rects;
    /* The visual of the context has a back buffer (OSMesaDoubleBuffer). */
    bool double_buffer;
+   /* OSMesaSwapBuffersNotify: the swap queued last has run (and its caller been told). */
+   struct util_queue_fence swap_done;
+   bool swap_done_init;
+   void (*swap_shown)(void *);
+   void *swap_shown_arg;
    /* ... and its draw and read buffers have been set to it (the first time). */
    bool back_defaults;
    /* Copies to the screen that have been asked for and are waiting (OSMesaDeferPresent). */
@@ -2490,6 +2497,9 @@ OSMesaSurfaceReseed(OSMesaContext osmesa)
    struct pipe_resource *dst;
    struct pipe_box box;
 
+   /* Called between frames: a swap may still be running in glthread's thread. */
+   osmesa_sync(osmesa);
+   buffer = osmesa ? osmesa->current_buffer : NULL;
    if (!buffer || !buffer->store_res || !osmesa->st || !osmesa->st->pipe)
       return GL_FALSE;
    dst = buffer->textures[buffer->has_back ? ST_ATTACHMENT_BACK_LEFT
@@ -2587,6 +2597,75 @@ OSMesaSwapBuffersAsync(OSMesaContext osmesa)
       return;
    }
    OSMesaSwapBuffers(osmesa);
+}
+
+
+static void
+osmesa_swap_notify_callback(void *arg)
+{
+   OSMesaContext osmesa = (OSMesaContext)arg;
+
+   osmesa_swap_now(osmesa);
+   if (osmesa->swap_shown)
+      osmesa->swap_shown(osmesa->swap_shown_arg);
+   util_queue_fence_signal(&osmesa->swap_done);
+}
+
+/*
+ * A window's swap without the program waiting for its own frame. As
+ * OSMesaSwapBuffersAsync, the swap runs in glthread's thread after the
+ * frame's last call: the back buffer is copied to the surface and the copy
+ * is submitted to the GPU's ring; then shown(arg) is called there, which
+ * tells whoever reads the surface (the window server) that it has a new
+ * picture, so it never reads one whose copy is not yet ordered ahead of
+ * its own commands. The program goes on recording the next frame meanwhile
+ * and waits here, at its next swap, for this one to be over: it runs one
+ * frame ahead of the driver's threads at most, and a frame is on its way
+ * to the screen a frame's time after it was drawn at the latest, as
+ * before. Everything else that touches the context from the program's
+ * thread waits for glthread as it always did (osmesa_sync), the swap
+ * included.
+ *
+ * True: the swap is queued and shown() will be called. False: there is no
+ * glthread (or no back buffer); the swap is done, as OSMesaSwapBuffers
+ * does it, and the caller tells the reader itself.
+ */
+GLAPI GLboolean GLAPIENTRY
+OSMesaSwapBuffersNotify(OSMesaContext osmesa, void (*shown)(void *), void *arg)
+{
+   struct gl_context *ctx;
+   void (*flush)(void);
+
+   if (!osmesa || !osmesa->st)
+      return GL_FALSE;
+   ctx = osmesa->st->ctx;
+   flush = (void (*)(void))OSMesaGetProcAddress("glFlush");
+   if (flush && ctx->GLThread.enabled && OSMesaGetCurrentContext() == osmesa &&
+       osmesa->current_buffer && osmesa->current_buffer->has_back &&
+       osmesa->current_buffer->direct) {
+      if (!osmesa->swap_done_init) {
+         util_queue_fence_init(&osmesa->swap_done);
+         osmesa->swap_done_init = true;
+      }
+      /* The swap before this one: over before another is queued. */
+      {
+         double t0 = rdn_hitch_begin();
+
+         util_queue_fence_wait(&osmesa->swap_done);
+         rdn_hitch_end(t0, "swap-wait", "previous-frame", 0, 0);
+      }
+      if (_mesa_glthread_set_done_callback(ctx, osmesa_swap_notify_callback, osmesa)) {
+         osmesa->swap_shown = shown;
+         osmesa->swap_shown_arg = arg;
+         util_queue_fence_reset(&osmesa->swap_done);
+         /* The call is the batch's last, and the batch goes now. */
+         flush();
+         _mesa_glthread_flush_batch(ctx);
+         return GL_TRUE;
+      }
+   }
+   OSMesaSwapBuffers(osmesa);
+   return GL_FALSE;
 }
 
 

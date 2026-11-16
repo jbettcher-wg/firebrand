@@ -38,14 +38,17 @@ In this repository
 ------------------
 
 Linux amdgpu, powerplay and radeon (drivers/gpu/drm/amd, drivers/gpu/drm/radeon)
-    Ported file for file into amdgpu/ (frb_*.c: gmc_v8_0, gfx_v8_0, sdma_v3_0, uvd_v6_0, dce_v11_0,
-    atombios_*, smu7_* and polaris10_smumgr, process_pptables_v1_0, hwmgr, ...).
+    Ported file for file into amdgpu/ (frb_*.c: gmc_v6_0 to v9_0, gfx_v6_0 to v9_0, si_dma,
+    cik_sdma, sdma_v3_0 and v4_0, uvd_v3_1, v4_2, v6_0 and v7_0, dce_v6_0, v8_0, v11_0 and
+    DC's DCE 12, atombios_*, smu7_* and polaris10_smumgr, vega20 powerplay, psp_v11_0, si/ci
+    DPM from radeon, process_pptables_v1_0, hwmgr, ...).
     Licence: MIT. Copyright Advanced Micro Devices, Inc.; Red Hat Inc.; Jerome Glisse; and the
     other holders named in each file. LICENSES/MIT-amdgpu.txt.
 
 AMD register, AtomBIOS, powerplay and SDMA headers (amdgpu/include/, shared/atom/)
-    asic_reg/ (bif 5.0, dce 10.0 and 11.2, gfx 8.0, gmc 8.1, oss 3.0, smu 7.1.3, uvd 6.0),
-    pp/ (smu74, smu7, pptable v1.0), tonga_sdma_pkt_open.h, clearstate_vi.h, vid.h, atombios.h,
+    asic_reg/ (the register headers of the Southern Islands, Sea Islands, Polaris and Vega 20
+    blocks above), pp/ (smu74, smu7, smu11, pptable v1.0), the SDMA packet headers,
+    clearstate_si/ci/vi/gfx9.h, sid.h, cikd.h, vid.h, soc15d.h, atombios.h, atomfirmware.h,
     ObjectID.h, and the AtomBIOS interpreter (atom.c), unchanged or ported.
     Licence: MIT. Copyright Advanced Micro Devices, Inc. LICENSES/MIT-amdgpu.txt.
 
@@ -57,7 +60,7 @@ RadeonNI-OSX (https://github.com/kouta-kun/RadeonNI-OSX)
     Licence: MIT. Copyright (c) 2026 kouta-kun and Claude. radeonni/LICENSE.
 
 Mesa changes (radeonni/mesa/patches)
-    Patches to Mesa 26.2.4, among them radeonsi on a big-endian host (0030-0041).
+    Patches to Mesa 26.2.4, among them radeonsi on a big-endian host (0030-0047).
     Licence: that of the Mesa files they change, MIT. LICENSES/MIT-Mesa.txt.
 
 Built from, not in this repository
@@ -75,7 +78,8 @@ GCC 15.3 runtime (libgcc, libstdc++, libatomic)
     Linked statically into RadeonNIGLDriver.bundle by the cross compiler.
     Licence: GNU GPL 3 with the GCC Runtime Library Exception, which permits this.
 
-AMD GPU microcode (linux-firmware: polaris12_*.bin, polaris10_sdma*.bin, polaris10_uvd.bin)
+AMD GPU microcode (linux-firmware: the polaris12_*, verde_*, si58_mc, hawaii_* and vega20_*
+images that kext/Firebrand/firmware.list and firmware-vega20.list name)
     Downloaded and checksum-verified by scripts/fetch-firmware.sh; embedded in Firebrand.kext,
     with the licence in Firebrand.kext/Contents/Resources/LICENSE.amdgpu. Never committed here.
     Licence: AMD's microcode licence (binary redistribution). Copyright (C) Advanced Micro

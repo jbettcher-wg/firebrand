@@ -41,6 +41,18 @@ struct frb_card {
 	unsigned bus, dev, fn;		/* the PCI function the driver sits on */
 	unsigned vram_mb, visible_mb;	/* VRAM,totalMB / VRAM,visibleMB on the PCI device */
 	unsigned reg_link_status, reg_link_caps;	/* IOPCIFamily's IOPCIExpressLink*, set at enumeration; 0 none */
+	/*
+	 * The report on the PCI device itself (the driver's publishReport): there
+	 * even when no Firebrand service stayed on the card (detached: its start
+	 * failed, or a Vega 10/12 Firebrand only identifies).
+	 */
+	int detached;			/* no Firebrand service: service is the PCI device, no status client */
+	char support[16];		/* FirebrandSupport: "verified", "untested", "not ported", "" older driver */
+	char stage_cap[16];		/* FirebrandStageCap */
+	char failed_at[16];		/* FirebrandStageFailedAt */
+	char stage_error[200];		/* FirebrandStageError */
+	char vbios[112];		/* FirebrandVBIOS: part number, version, date */
+	int unlocked;			/* FirebrandUnlocked */
 	/* the card's HD Audio function (the same device, class 0x0403): 0 none */
 	unsigned audio_fn_vendor, audio_fn_device, audio_fn_fn;
 	char audio_fn_driver[48];	/* the class driving it ("HDAudioDevice"), "" none */
@@ -53,6 +65,12 @@ void frb_cards_close(struct frb_card *cards, int n);
 kern_return_t frb_card_refresh(struct frb_card *c);
 /* the field is there: the card answered the status call with that bit */
 int frb_card_has(const struct frb_card *c, uint32_t bit);
+/* FRB_SUPPORT_* (frb_user.h): verified, untested or not ported; -1 a driver too old to say */
+int frb_card_support(const struct frb_card *c);
+/* the unlock is on for the card (FirebrandUnlock / frbctl unlock) */
+int frb_card_unlocked(const struct frb_card *c);
+/* where untested cards' reports go */
+#define FRB_ISSUES_URL		"https://github.com/jbettcher-wg/firebrand/issues"
 
 /* words */
 const char *frb_card_name(const struct frb_card *c);		/* the row's board, else the ASIC, else the ids */

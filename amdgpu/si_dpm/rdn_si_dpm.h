@@ -66,7 +66,8 @@ enum rdn_si_power_state {
 	RDN_SI_STATE_BOOT,		/* ATOM_PPLIB_CLASSIFICATION_BOOT: the VBIOS's boot clocks */
 	RDN_SI_STATE_BATTERY,		/* UI_BATTERY, else the performance state */
 	RDN_SI_STATE_BALANCED,		/* UI_BALANCED, else the performance state */
-	RDN_SI_STATE_PERFORMANCE	/* UI_PERFORMANCE: every level, the SMC picks by load */
+	RDN_SI_STATE_PERFORMANCE,	/* UI_PERFORMANCE: every level, the SMC picks by load */
+	RDN_SI_STATE_UVD		/* POWER_STATE_TYPE_INTERNAL_UVD: the UVDSTATE class (its VCLK/DCLK), else performance */
 };
 
 /* radeon.h's enum radeon_dpm_forced_level */

@@ -196,9 +196,24 @@ int frb_si_dpm_hw_init(struct frb_device *adev);
 int frb_si_dpm_enabled(struct frb_device *adev);
 void frb_si_dpm_fini(struct frb_device *adev);
 void frb_si_dpm_compute_clocks(struct frb_device *adev, const struct amd_pp_display_configuration *cfg);
+/* amdgpu_dpm_enable_uvd on SI: the VBIOS's UVD state (its UPLL clocks, the engine and memory clocks held) or back */
+int frb_si_dpm_enable_uvd(struct frb_device *adev, int enable);
 int frb_si_dpm_force_performance_level(struct frb_device *adev, enum amd_dpm_forced_level level);
 uint32_t frb_si_dpm_get_sclk(struct frb_device *adev, int low);
 uint32_t frb_si_dpm_get_mclk(struct frb_device *adev, int low);
 int frb_si_dpm_get_status(struct frb_device *adev, struct frb_pm_status *st);
+
+/* CIK: radeon's ci_dpm through RadeonNI's verified port (frb_ci_dpm.c, si_dpm/rdn_ci_*) */
+int frb_ci_dpm_hw_init(struct frb_device *adev);
+int frb_ci_dpm_enabled(struct frb_device *adev);
+void frb_ci_dpm_fini(struct frb_device *adev);
+void frb_ci_dpm_compute_clocks(struct frb_device *adev, const struct amd_pp_display_configuration *cfg);
+int frb_ci_dpm_force_performance_level(struct frb_device *adev, enum amd_dpm_forced_level level);
+uint32_t frb_ci_dpm_get_sclk(struct frb_device *adev, int low);
+uint32_t frb_ci_dpm_get_mclk(struct frb_device *adev, int low);
+int frb_ci_dpm_get_status(struct frb_device *adev, struct frb_pm_status *st);
+int frb_ci_read_sensors(struct frb_device *adev, struct frb_pm_sensors *s);
+/* amdgpu_dpm_enable_uvd's CIK arm: uvd_v4_2 started and ci_dpm's UVD levels on, or off and stopped */
+int frb_ci_dpm_enable_uvd(struct frb_device *adev, int enable);
 
 #endif /* FRB_PM_H */

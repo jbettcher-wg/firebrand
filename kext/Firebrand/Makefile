@@ -11,15 +11,24 @@ BUILD    = build
 BUNDLE   = $(BUILD)/$(KEXT).kext
 FWDIR    = $(LIB)/firmware
 
-# BRINGUP=vega20: a bring-up build for the MI50 (Vega 20): its id 0x66a11002
-# joins the control personality's IOPCIMatch and the framebuffer's (the
-# DCE 12 path drives the desktop), and
-# firmware-vega20.list's microcode is embedded beside firmware.list's. Since
-# the MI50's row reached stage dce, such a build may be installed
-# (scripts/build-mac.sh builds it so unless FRB_BRINGUP is set empty).
+# IOPCIMatch: every device id of amdgpu/frb_drv.c's pciidlist (all of
+# amdgpu's discrete SI, CIK, Polaris and Vega ids), written into both
+# personalities by mk-pcimatch.pl, so the family table and the match cannot
+# drift. A card with a verified row runs to that row's stage; any other card
+# of a ported family is an untested card, display-only unless unlocked
+# (FirebrandUnlock, `sudo frbctl unlock`); Vega 10 and 12 are identified only.
+#
+# BRINGUP=vega20: the vega20 microcode (firmware-vega20.list) is embedded
+# beside firmware.list's. Every release build is one: without it a Vega 20
+# card stops at stage smu (no PSP images).
+# BRINGUP=hawaii is accepted and adds nothing.
+#
+# UNTESTED=0xDEVICE: a TEST build that ignores that device's verified rows,
+# so a verified card runs as an untested one (the untested-card policy's
+# test on hardware). Never installed for daily use.
 BRINGUP  ?=
+UNTESTED ?=
 FW_LISTS = firmware.list $(if $(filter vega20,$(BRINGUP)),firmware-vega20.list)
-BRINGUP_MATCH = $(if $(filter vega20,$(BRINGUP)),0x66a11002)
 
 # RadeonNI's user-client protocol (hw/rdn_user.h), which the accelerator
 # speaks unchanged: radeonni/hw/rdn_user.h in this repository.
@@ -28,7 +37,7 @@ RDN_HW   = $(LIB)/radeonni/hw
 # frb_build.h (optional): the git commit the build comes from, for FirebrandVersion
 BUILD_H  = $(if $(wildcard frb_build.h),-DFRB_HAVE_BUILD_H)
 
-CPPFLAGS = $(BUILD_H) -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
+CPPFLAGS = $(BUILD_H) $(if $(UNTESTED),-DFRB_FORCE_UNTESTED=$(UNTESTED)) -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
 	-nostdinc -Icompat -I$(KROOT)/PrivateHeaders -I$(KROOT)/Headers \
 	-I$(LIB)/shared -I$(LIB)/amdgpu -I$(RDN_HW)
 CFLAGS   = -arch ppc -Os -Wall -fno-builtin -fno-common -static \
@@ -46,15 +55,17 @@ LIB_SRCS = shared/atom/atom.c shared/frb_edid.c shared/frb_dmt.c shared/frb_mem.
 	amdgpu/frb_vi.c amdgpu/frb_gmc_v8_0.c amdgpu/frb_gart.c amdgpu/frb_ucode.c amdgpu/frb_smu7.c \
 	amdgpu/frb_atombios_conn.c amdgpu/frb_atombios_crtc.c amdgpu/frb_atombios_encoders.c \
 	amdgpu/frb_atombios_dp.c amdgpu/frb_atombios_i2c.c amdgpu/frb_dce_v11_0.c amdgpu/frb_dce_audio.c \
-	amdgpu/frb_display.c amdgpu/frb_si.c amdgpu/frb_gmc_v6_0.c amdgpu/frb_dce_v6_0.c amdgpu/frb_dce_v6_0_audio.c amdgpu/frb_pll.c \
+	amdgpu/frb_display.c amdgpu/frb_cik.c amdgpu/frb_gmc_v7_0.c amdgpu/frb_dce_v8_0.c amdgpu/frb_dce_v8_0_audio.c amdgpu/frb_si.c amdgpu/frb_gmc_v6_0.c amdgpu/frb_dce_v6_0.c amdgpu/frb_dce_v6_0_audio.c amdgpu/frb_pll.c \
 	amdgpu/frb_ring.c amdgpu/frb_engines.c amdgpu/frb_gfx_v8_0.c amdgpu/frb_gfx_v6_0.c amdgpu/frb_si_dma.c amdgpu/frb_sdma_v3_0.c \
+	amdgpu/frb_gfx_v7_0.c amdgpu/frb_cik_sdma.c \
 	amdgpu/frb_bo.c amdgpu/frb_rect.c amdgpu/frb_reset.c \
 	amdgpu/frb_amd_powerplay.c amdgpu/frb_hwmgr.c amdgpu/frb_hardwaremanager.c amdgpu/frb_pp_psm.c \
 	amdgpu/frb_smu_helper.c amdgpu/frb_ppatomctrl.c amdgpu/frb_process_pptables_v1_0.c \
 	amdgpu/frb_smu7_hwmgr.c amdgpu/frb_smu7_powertune.c amdgpu/frb_smu7_thermal.c amdgpu/frb_smu7_clockpowergating.c \
 	amdgpu/frb_polaris10_smumgr.c \
-	amdgpu/frb_uvd.c amdgpu/frb_uvd_v6_0.c amdgpu/frb_uvd_v7_0.c amdgpu/frb_uvd_v3_1.c amdgpu/frb_uvd_h264.c \
-	amdgpu/frb_si_dpm.c amdgpu/si_dpm/rdn_si_dpm.c amdgpu/si_dpm/rdn_ci_tables.c
+	amdgpu/frb_uvd.c amdgpu/frb_uvd_v6_0.c amdgpu/frb_uvd_v7_0.c amdgpu/frb_uvd_v3_1.c amdgpu/frb_uvd_v4_2.c amdgpu/frb_uvd_h264.c \
+	amdgpu/frb_si_dpm.c amdgpu/si_dpm/rdn_si_dpm.c amdgpu/si_dpm/rdn_ci_tables.c \
+	amdgpu/frb_ci_dpm.c amdgpu/si_dpm/rdn_ci_dpm.c amdgpu/si_dpm/rdn_ci_smu.c amdgpu/si_dpm/rdn_cik_smc.c
 LIB_OBJS = $(addprefix $(BUILD)/lib/,$(LIB_SRCS:.c=.o))
 OBJS     = $(BUILD)/Firebrand.o $(BUILD)/FirebrandCore.o $(BUILD)/FirebrandFramebuffer.o \
 	$(BUILD)/FirebrandAccel.o $(BUILD)/FirebrandAccel2D.o $(BUILD)/FirebrandSurface.o $(BUILD)/FirebrandVideo.o \
@@ -82,12 +93,12 @@ $(BUILD)/lib/%.o: $(LIB)/%.c $(LIB_HDRS)
 	gcc $(CPPFLAGS) $(LIBCFLAGS) -c -o $@ $<
 
 # Objects first: kld needs the symbols libkmodc++ defines for them.
-$(BUNDLE): $(OBJS) Info.plist $(FW_LISTS) embed-firmware.pl
+$(BUNDLE): $(OBJS) Info.plist $(FW_LISTS) embed-firmware.pl mk-pcimatch.pl $(LIB)/amdgpu/frb_drv.c
 	@mkdir -p $(BUNDLE)/Contents/MacOS
 	g++ -arch ppc -static -nostdlib -r $(OBJS) -lkmodc++ -lkmod -lcc_kext \
 		-o $(BUNDLE)/Contents/MacOS/$(KEXT)
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
-	$(if $(BRINGUP_MATCH),perl -0777 -pi -e 's{(<key>Firebrand</key>\s*<dict>.*?<key>IOPCIMatch</key>\s*<string>)([^<]*)}{$$1$$2 $(BRINGUP_MATCH)}s; s{(<key>FirebrandFramebuffer</key>\s*<dict>.*?<key>IOPCIMatch</key>\s*<string>)([^<]*)}{$$1$$2 $(BRINGUP_MATCH)}s' $(BUNDLE)/Contents/Info.plist)
+	perl mk-pcimatch.pl $(LIB)/amdgpu/frb_drv.c $(BUNDLE)/Contents/Info.plist
 	cat $(FW_LISTS) > $(BUILD)/firmware.all
 	perl embed-firmware.pl $(BUNDLE) $(BUILD)/firmware.all $(FWDIR)
 

@@ -216,6 +216,9 @@ static const u32 r600_dtc[R600_PM_NUMBER_OF_TC] = {
 /* ---- byte order ---- */
 
 /* The SMC's SRAM tables are big-endian (Linux's cpu_to_be16/32). */
+#ifndef RDN_BIG_ENDIAN
+#error "RDN_BIG_ENDIAN is not defined (rdn_card.h): the SMC tables would be byte-reversed on a big-endian host"
+#endif
 static inline u16 cpu_to_be16(u16 v)
 {
 #if RDN_BIG_ENDIAN
@@ -1259,13 +1262,17 @@ static void ni_update_requested_ps(struct rdn_si_dpm *rdev,
 
 /*
  * ni_set_uvd_clock_before/after_set_eng_clock(): Linux calls
- * radeon_set_uvd_clocks() (si_set_uvd_clocks) here when the state's UVD
- * clocks differ. UVD on Southern Islands is not brought up in this driver
- * yet, so the request is logged and the clocks are left alone.
+ * radeon_set_uvd_clocks() (amdgpu_asic_set_uvd_clocks: si_set_uvd_clocks)
+ * here when the state's UVD clocks differ: the UPLL, which the driver and
+ * not the SMC programs, at the UVD state's VCLK/DCLK, or in bypass for a
+ * state without them. Firebrand: frb_si.c's port of si_set_uvd_clocks.
  */
 static void radeon_set_uvd_clocks(struct rdn_si_dpm *rdev, u32 vclk, u32 dclk)
 {
-	SI_DEBUG(rdev, "UVD clocks %u/%u requested; not driven", (unsigned)vclk, (unsigned)dclk);
+	int r = frb_si_set_uvd_clocks(rdev->card->adev, vclk, dclk);
+
+	SI_INFO(rdev, "UVD clocks: VCLK %u, DCLK %u kHz%s (%d)", (unsigned)vclk * 10, (unsigned)dclk * 10,
+		vclk && dclk ? "" : " (bypass)", r);
 }
 
 static void ni_set_uvd_clock_before_set_eng_clock(struct rdn_si_dpm *rdev,
@@ -9062,6 +9069,12 @@ static struct si_rps *si_pick_power_state(struct rdn_si_dpm *rdev, enum rdn_si_p
 
 	if (state == RDN_SI_STATE_BOOT)
 		return rdev->boot_ps;
+	/* amdgpu_dpm_pick_power_state's POWER_STATE_TYPE_INTERNAL_UVD: the UVD state, else (Firebrand) performance */
+	if (state == RDN_SI_STATE_UVD) {
+		if (rdev->uvd_ps)
+			return rdev->uvd_ps;
+		state = RDN_SI_STATE_PERFORMANCE;
+	}
 	/* check if the vblank period is too short to adjust the mclk */
 	if (single_display && ni_dpm_vblank_too_short(rdev))
 		single_display = false;

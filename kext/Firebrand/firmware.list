@@ -38,3 +38,24 @@ verde_me.bin
 verde_ce.bin
 verde_rlc.bin
 verde_uvd.bin
+# Sea Islands, the FirePro W8100 (Hawaii): gmc_v7_0's MC image; the SMC image
+# stage smu checks and CI DPM loads (hawaii_k_smc.bin is for rev 0x80 parts
+# only, which no row names). The amdgpu and radeon files are the same bytes
+# (RadeonNI loads radeon/hawaii_mc.bin and hawaii_smc.bin on this card).
+hawaii_mc.bin
+hawaii_smc.bin
+# gfx_v7_0: the CP's three engines and the RLC, by amdgpu's names (headered).
+# amdgpu's hawaii_pfp/me/ce are newer than radeon's (different bytes; RadeonNI
+# loads radeon's, and its CP measurements on this card were made with them);
+# hawaii_rlc.bin is the same file in both. hawaii_mec.bin stays out: no compute
+# rings, the MEC is left halted. cik_sdma: both engines' images (linux-firmware's
+# links to bonaire_sdma.bin / bonaire_sdma1.bin, the same bytes as radeon's).
+hawaii_pfp.bin
+hawaii_me.bin
+hawaii_ce.bin
+hawaii_rlc.bin
+hawaii_sdma.bin
+hawaii_sdma1.bin
+# uvd_v4_2: the VCPU image (amdgpu_uvd.c FIRMWARE_HAWAII; radeon and RadeonNI
+# load bonaire_uvd.bin on Hawaii, the same family 1.64)
+hawaii_uvd.bin

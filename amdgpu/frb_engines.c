@@ -2,7 +2,9 @@
  * The engines by number, for the control client (frbctl test), and their
  * teardown in amdgpu_device_ip_fini_early's reverse order (UVD, SDMA, GFX).
  * A SOC15 card's GFX and SDMA are gfx_v9_0 / sdma_v4_0 (frb_gfx_v9_0.c,
- * frb_sdma_v4_0.c) behind the same engine and test numbers.
+ * frb_sdma_v4_0.c) behind the same engine and test numbers, a CIK card's
+ * gfx_v7_0 / cik_sdma (frb_gfx_v7_0.c, frb_cik_sdma.c), an SI card's
+ * gfx_v6_0 / si_dma.
  *
  * And the family dispatch the accelerator (kext/Firebrand/FirebrandAccel*.cpp,
  * FirebrandVideo.cpp) goes through for every engine call: the GFX ring, the
@@ -27,6 +29,8 @@ struct frb_ring *frb_gfx_ring(struct frb_device *adev)
 {
 	if (frb_is_soc15(adev))
 		return frb_gfx_v9_0_ring(adev);
+	if (frb_is_cik(adev))
+		return frb_gfx_v7_0_ring(adev);
 	return frb_is_si(adev) ? frb_gfx_v6_0_ring(adev) : frb_gfx_v8_0_ring(adev);
 }
 
@@ -34,6 +38,8 @@ struct frb_ring *frb_sdma_ring(struct frb_device *adev, int instance)
 {
 	if (frb_is_soc15(adev))
 		return frb_sdma_v4_0_ring(adev, instance);
+	if (frb_is_cik(adev))
+		return frb_cik_sdma_ring(adev, instance);
 	return frb_is_si(adev) ? frb_si_dma_ring(adev, instance) : frb_sdma_v3_0_ring(adev, instance);
 }
 
@@ -41,6 +47,8 @@ void frb_sdma_pad_ib(struct frb_ring *ring, struct frb_ib *ib)
 {
 	if (frb_is_soc15(ring->adev))
 		frb_sdma_v4_0_pad_ib(ring, ib);
+	else if (frb_is_cik(ring->adev))
+		frb_cik_sdma_pad_ib(ring, ib);
 	else if (frb_is_si(ring->adev))
 		frb_si_dma_pad_ib(ring, ib);
 	else
@@ -52,6 +60,8 @@ int frb_sdma_copy_buffer(struct frb_device *adev, int instance, uint64_t src_off
 {
 	if (frb_is_soc15(adev))
 		return frb_sdma_v4_0_copy_buffer(adev, instance, src_offset, dst_offset, byte_count);
+	if (frb_is_cik(adev))
+		return frb_cik_sdma_copy_buffer(adev, instance, src_offset, dst_offset, byte_count);
 	if (frb_is_si(adev))
 		return frb_si_dma_copy_buffer(adev, instance, src_offset, dst_offset, byte_count);
 	return frb_sdma_v3_0_copy_buffer(adev, instance, src_offset, dst_offset, byte_count);
@@ -62,6 +72,8 @@ int frb_sdma_fill_buffer(struct frb_device *adev, int instance, uint32_t src_dat
 {
 	if (frb_is_soc15(adev))
 		return frb_sdma_v4_0_fill_buffer(adev, instance, src_data, dst_addr, byte_count);
+	if (frb_is_cik(adev))
+		return frb_cik_sdma_fill_buffer(adev, instance, src_data, dst_addr, byte_count);
 	if (frb_is_si(adev))
 		return frb_si_dma_fill_buffer(adev, instance, src_data, dst_addr, byte_count);
 	return frb_sdma_v3_0_fill_buffer(adev, instance, src_data, dst_addr, byte_count);
@@ -71,6 +83,8 @@ int frb_gfx_get_info(struct frb_device *adev, struct frb_gfx_info *info)
 {
 	if (frb_is_soc15(adev))
 		return frb_gfx_v9_0_get_info(adev, info);
+	if (frb_is_cik(adev))
+		return frb_gfx_v7_0_get_info(adev, info);
 	return frb_is_si(adev) ? frb_gfx_v6_0_get_info(adev, info) : frb_gfx_v8_0_get_info(adev, info);
 }
 
@@ -144,10 +158,12 @@ uint32_t frb_get_xclk(struct frb_device *adev)
 {
 	if (frb_is_soc15(adev))
 		return frb_soc15_get_xclk(adev);
+	if (frb_is_cik(adev))
+		return frb_cik_get_xclk(adev);
 	return frb_is_si(adev) ? frb_si_get_xclk(adev) : frb_vi_get_xclk(adev);
 }
 
-/* gfx_8_0_d.h's offsets (the header cannot sit beside gc_9_0_offset.h: the same names) */
+/* gfx_8_0_d.h's offsets (the header cannot sit beside gc_9_0_offset.h: the same names); gfx_7_0_d.h's are the same */
 #define VI_mmGRBM_STATUS	0x2004
 #define VI_mmCP_STALLED_STAT1	0x219d
 #define VI_mmCP_STAT		0x21a0
@@ -272,8 +288,13 @@ static int gtt_test(struct frb_device *adev, int instance)
 	if (r)
 		return r;
 
-	/* 3: a fill into GTT (CONST_FILL repeats the low byte on SDMA 3 and 4, the whole dword on SI's DMA) */
-	r = frb_sdma_fill_buffer(adev, instance, frb_is_si(adev) ? 0x5a5a5a5au : 0x5a, gtt_gpu, GTT_TEST_BYTES);
+	/*
+	 * 3: a fill into GTT (CONST_FILL repeats the low byte on SDMA 3 and 4,
+	 * the whole dword on SI's DMA; CIK's is not measured: 0x5a5a5a5a is the
+	 * same either way)
+	 */
+	r = frb_sdma_fill_buffer(adev, instance, frb_is_si(adev) || frb_is_cik(adev) ? 0x5a5a5a5au : 0x5a, gtt_gpu,
+				 GTT_TEST_BYTES);
 	if (!r)
 		r = gtt_check(adev, "fill into GTT", 1, 0, 0, 1, 0x5a5a5a5au);
 	return r;
@@ -337,6 +358,16 @@ int frb_engine_test(struct frb_device *adev, int engine, int test)
 		default:		return -ENOSYS;
 		}
 	}
+	if (frb_is_cik(adev)) {
+		/* gfx_v7_0, cik_sdma, uvd_v4_2 */
+		switch (engine) {
+		case FRB_ENGINE_GFX:	return frb_gfx_v7_0_test(adev, test);
+		case FRB_ENGINE_SDMA0:	return frb_cik_sdma_test(adev, 0, test);
+		case FRB_ENGINE_SDMA1:	return frb_cik_sdma_test(adev, 1, test);
+		case FRB_ENGINE_UVD:	return frb_uvd_v4_2_test(adev, test);
+		default:		return -EINVAL;
+		}
+	}
 	if (frb_is_si(adev)) {
 		switch (engine) {
 		case FRB_ENGINE_GFX:	return frb_gfx_v6_0_test(adev, test);
@@ -381,6 +412,29 @@ void frb_engines_fini(struct frb_device *adev)
 		frb_gfx_v9_0_fini(adev);
 		gtt_test_free(adev);
 		frb_psp_hw_fini(adev);
+		return;
+	}
+	if (frb_is_cik(adev)) {
+		/*
+		 * amdgpu_device_fini_hw: the blocks ungated first (reverse IP
+		 * order: cik_sdma, gfx_v7_0, gmc_v7_0), then hw_fini in
+		 * cik_set_ip_blocks' reverse order: uvd_v4_2 (UVD DPM off, the VCPU
+		 * stopped), cik_sdma, gfx_v7_0, (dce:
+		 * the kext's frb_display_fini), DPM (pp_smu's hw_fini:
+		 * ci_dpm_disable, the SMC in reset). The GTT test buffer goes once
+		 * SDMA is halted.
+		 */
+		frb_uvd_v4_2_fini(adev);
+		if (adev->cg_on) {
+			frb_cik_sdma_set_clockgating_state(adev, 0);
+			frb_gfx_v7_0_set_clockgating_state(adev, 0);
+			frb_gmc_v7_0_set_clockgating_state(adev, 0);
+			adev->cg_on = 0;
+		}
+		frb_cik_sdma_fini(adev);
+		frb_gfx_v7_0_fini(adev);
+		gtt_test_free(adev);
+		frb_pm_fini(adev);
 		return;
 	}
 	if (frb_is_si(adev)) {

@@ -171,8 +171,8 @@ int frb_device_gpu_recover(struct frb_device *adev, uint32_t force, struct frb_r
 	memset(rep, 0, sizeof(*rep));
 	if (adev->stage_done < FRB_STAGE_GFX)
 		return -ENODEV;
-	/* SI: gfx_v6_0 and si_dma's soft reset are not ported (VI registers below) */
-	if (frb_is_si(adev))
+	/* SI, CIK: gfx_v6_0/si_dma's and gfx_v7_0/cik_sdma's soft reset are not ported (VI registers below) */
+	if (frb_is_si(adev) || frb_is_cik(adev))
 		return -ENOSYS;
 	snapshot(adev, rep);
 	frb_info(adev, "recover: GRBM_STATUS %08x GRBM_STATUS2 %08x SRBM_STATUS %08x SRBM_STATUS2 %08x "

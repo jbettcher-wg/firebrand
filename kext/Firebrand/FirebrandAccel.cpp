@@ -112,7 +112,7 @@ bool FirebrandAccel::setUp(IOService *owner, FirebrandCore *core, IOFramebuffer 
 	fScanoutEnd = scanoutEnd;
 
 	core->lock();
-	/* gfx_v8_0's ring on Polaris, gfx_v6_0's on SI, gfx_v9_0's on Vega 20 (frb_engines.c's family dispatch) */
+	/* gfx_v8_0's ring on Polaris, gfx_v6_0's on SI, gfx_v7_0's on CIK, gfx_v9_0's on Vega 20 (frb_engines.c's family dispatch) */
 	ring = frb_gfx_ring(adev);
 	if (adev->stage_done < FRB_STAGE_SDMA)
 		why = "the stages did not reach sdma";
@@ -169,10 +169,10 @@ bool FirebrandAccel::setUp(IOService *owner, FirebrandCore *core, IOFramebuffer 
 		int arg = 1;
 
 		fVideoLock = IOLockAlloc();
-		/* 'rdnv' only where this driver has the UVD block (uvd_v6_0; SI's uvd_v3_1 is not ported) */
+		/* 'rdnv' only where this driver has the UVD block (uvd_v3_1, uvd_v6_0, uvd_v7_0) */
 		fVideoOffered = fVideoLock && frb_has_uvd(adev) && owner->getProperty("FirebrandVideo") != kOSBooleanFalse &&
 			!(PE_parse_boot_arg("frb_video", &arg) && !arg);
-		/* the decoder is uvd_v6_0's on Polaris and uvd_v7_0's on Vega 20; no 'rdnv' on a family without one */
+		/* the decoder is uvd_v3_1's on SI, uvd_v6_0's on Polaris, uvd_v7_0's on Vega 20; none elsewhere */
 		if (fVideoOffered && !frb_has_uvd(adev)) {
 			fVideoOffered = false;
 			frb_info(adev, "accel: video not offered: this family's UVD is not ported");
@@ -412,7 +412,9 @@ void FirebrandAccel::publish(IOPCIDevice *provider)
 					 (unsigned)(uvd->fw_version >> 30) & 0x3, (unsigned)(uvd->fw_version >> 24) & 0x3f,
 					 (unsigned)(uvd->fw_version >> 8) & 0xff, (unsigned)uvd->fw_version & 0xff);
 			else
-				snprintf(fw, sizeof(fw), "polaris12_uvd.bin %u.%u family %u (embedded)",
+				/* polaris12_uvd.bin / verde_uvd.bin: major.minor and family */
+				snprintf(fw, sizeof(fw), "%s %u.%u family %u (embedded)",
+					 uvd->fw_name ? uvd->fw_name : "uvd",
 					 (unsigned)(uvd->fw_version >> 24) & 0xff, (unsigned)(uvd->fw_version >> 16) & 0xff,
 					 (unsigned)(uvd->fw_version >> 8) & 0xff);
 			d = OSData::withBytes(fw, strlen(fw));
@@ -1040,7 +1042,10 @@ IOReturn FirebrandAccel::gfxInfo(struct rdn_user_gfx_info *info)
 	info->chip_external_rev = adev->external_rev_id;
 	info->chip_rev = adev->rev_id;
 	info->pci_rev = adev->revision;
-	info->gfx_ip_version = gfx.gfx_level >= 9 ? (9u << 16) | (4u << 8) : (8u << 16);	/* GC 9.4.0; VI 8.0 */
+	/* GC 9.4.0; CIK 7.3 (Hawaii, gfx_v7_3_ip_block) or 7.2 (Bonaire); VI 8.0 (and SI, whose get_info has no level) */
+	info->gfx_ip_version = gfx.gfx_level >= 9 ? (9u << 16) | (4u << 8) :
+			       gfx.gfx_level == 7 ? (7u << 16) | ((adev->asic_type == CHIP_HAWAII ? 3u : 2u) << 8) :
+			       (8u << 16);
 	info->me_fw_version = gfx.me_fw_version;
 	info->me_fw_feature = gfx.me_fw_feature;
 	info->pfp_fw_version = gfx.pfp_fw_version;
@@ -1084,6 +1089,7 @@ IOReturn FirebrandAccel::vramInfo64(struct rdn_user_vram_info64 *info)
 	/*
 	 * GFX8's CP has no working fetch swap: command buffers are little-endian (frb_gfx_v8_0.c ib probe).
 	 * GFX9 runs them so too: the IB packet's swap bits stay 0 (frb_gfx_v9_0.c, docs/byte-order.md).
+	 * SI measured the same (frb_gfx_v6_0.c ib probe); CIK takes the rule (frb_gfx_v7_0.c, not yet measured).
 	 */
 	info->flags = (fStatus ? RDN_VRAM_INFO64_STATUS : 0) | RDN_VRAM_INFO64_LE_IBS;
 	info->total_vram_hi = (UInt32)(adev->gmc.real_vram_size >> 32);

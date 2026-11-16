@@ -76,6 +76,8 @@ public:
 	IOPCIDevice *device(void) { return fDevice; }
 	int firmware(const char *name, const uint8_t **data, uint32_t *size);
 	void logLine(const char *line);
+	/* an error line from the library (os_log): kept for the failed stage's text in the report */
+	void errorLine(const char *line);
 
 	void lock(void) { if (fLock) IOLockLock(fLock); }
 	void unlock(void) { if (fLock) IOLockUnlock(fLock); }
@@ -104,6 +106,8 @@ public:
 	IOReturn ucRegWrite(UInt32 reg, UInt32 value);
 	IOReturn ucSmcRead(UInt32 addr, UInt32 *value);
 	IOReturn ucRunStage(UInt32 stage, SInt32 *result);
+	/* frbctl unlock / lock on a loaded driver: an untested card past display-only (or back); out: the stage cap */
+	IOReturn ucUnlock(UInt32 on, UInt32 *cap);
 	IOReturn ucVramRead(UInt32 offset, UInt32 *value);
 	IOReturn ucTrace(UInt32 on, UInt32 *entries);
 	IOReturn ucDisplayInfo(struct frb_user_display *out);
@@ -218,6 +222,13 @@ private:
 	UInt32 configuredStage(void);
 	void publishState(void);
 	void publishMemory(void);
+	/*
+	 * What a report needs, on the PCI device itself (FirebrandSupport,
+	 * FirebrandStageDone/Cap/FailedAt/Error, FirebrandVBIOS, ...): it stays
+	 * there when the driver does not, so frbctl report and Firebrand
+	 * Monitor can describe a card whose start failed.
+	 */
+	void publishReport(void);
 	/* the PCIe link the card reaches the host through (FRB_ST_SLOT_LINK), found at start */
 	void findSlotPort(void);
 	void sampleSensorsLocked(void);
@@ -245,7 +256,12 @@ private:
 	UInt32 fBiosSize;
 	bool fAllowRegWrite;
 	bool fBringUp;
+	bool fUnlock;		/* FirebrandUnlock / frb_unlock: an untested card past display-only */
 	bool fAdopt;
+	/* the library's error lines: a ring of the last few, and how many came (runStages keeps a failed stage's) */
+	char fErrLines[4][160];
+	UInt32 fErrCount;
+	char fStageError[200];
 	bool fDisplayAuto;
 	bool fBusMaster;		/* set at the first GTT object, cleared at stop */
 	uint16_t *fLutSaved;		/* frbctl lut linear: the ramp it replaced (3 x 256), until restore */

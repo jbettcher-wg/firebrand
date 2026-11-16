@@ -26,9 +26,10 @@
 # IT INSTALLS NOTHING. To install: sudo build/dist/Firebrand/install.sh (README.md).
 #
 # FRB_JOBS (default 2) sets make's parallelism for the driver. FRB_BRINGUP (default vega20)
-# is the kext Makefile's BRINGUP: vega20 adds the Instinct MI50 (1002:66a1) to the cards the
-# driver matches and embeds its microcode (kext/Firebrand/firmware-vega20.list); FRB_BRINGUP=
-# (empty) builds for the SI and Polaris cards alone.
+# is the kext Makefile's BRINGUP: vega20 embeds the Vega 20 microcode
+# (kext/Firebrand/firmware-vega20.list); FRB_BRINGUP= (empty) leaves it out, and a Vega 20
+# card then stops before its display comes up. The driver matches the same cards either way
+# (every SI, CIK, Polaris and Vega id; kext/Firebrand/mk-pcimatch.pl).
 #
 # Copyright (c) 2026 Jordan Bettcher
 # SPDX-License-Identifier: MIT

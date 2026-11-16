@@ -48,10 +48,19 @@ void frb_vram_mgr_fini(struct frb_vram_mgr *m)
 int frb_vram_mgr_alloc(struct frb_vram_mgr *m, uint64_t size, uint64_t align, uint32_t where,
 		       uint64_t *offset, uint64_t *size_out)
 {
-	struct frb_mem *heap;
-	uint64_t lo, hi, off = 0;
+	return frb_vram_mgr_alloc_windowed(m, size, align, where, 0, 0, 0, 0, offset, size_out);
+}
 
-	if (!m->ready || !size || size > (1ULL << 40) || (align & (align - 1)))
+int frb_vram_mgr_alloc_windowed(struct frb_vram_mgr *m, uint64_t size, uint64_t align, uint32_t where,
+				uint64_t gpu_base, uint64_t window, uint64_t lo_limit, uint64_t hi_limit,
+				uint64_t *offset, uint64_t *size_out)
+{
+	struct frb_mem *heap;
+	uint64_t lo, hi, at, end, off = 0;
+	int found = 0;
+
+	if (!m->ready || !size || size > (1ULL << 40) || (align & (align - 1)) || (window & (window - 1)) ||
+	    (window && size > window))
 		return -EINVAL;
 	if (align < FRB_VRAM_MIN_ALIGN)
 		align = FRB_VRAM_MIN_ALIGN;
@@ -67,7 +76,25 @@ int frb_vram_mgr_alloc(struct frb_vram_mgr *m, uint64_t size, uint64_t align, ui
 	}
 	if ((where & FRB_VRAM_BELOW_4G) && hi > FOUR_GB)
 		hi = FOUR_GB;
-	if (hi <= lo || frb_mem_alloc_range(heap, size, align, lo, hi, &off))
+	if (hi_limit) {
+		if (lo < lo_limit)
+			lo = lo_limit;
+		if (hi > hi_limit)
+			hi = hi_limit;
+	}
+	/* window by window (one pass over [lo, hi) without one) */
+	for (at = lo; at < hi && !found; at = end) {
+		end = hi;
+		if (window) {
+			uint64_t next = ((gpu_base + at) | (window - 1)) + 1 - gpu_base;
+
+			if (next < end)
+				end = next;
+		}
+		if (end - at >= size && !frb_mem_alloc_range(heap, size, align, at, end, &off))
+			found = 1;
+	}
+	if (!found)
 		return -ENOMEM;
 	if (where & FRB_VRAM_INVISIBLE)
 		m->invis_used += size;

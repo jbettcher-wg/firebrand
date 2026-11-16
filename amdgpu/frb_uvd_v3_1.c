@@ -20,15 +20,22 @@
  *   first 256 MB: UVD 3.1 addresses 32 bits plus a 4-bit (ADDR_EXT) and an
  *   8-bit (EXT40) segment, so everything it fetches shares one segment, as
  *   amdgpu_uvd_force_into_uvd_segment arranges for the msg bo.
- * - CLOCKS. Without DPM (SI's DPM is off by default, frb_si_dpm.c) amdgpu
- *   calls amdgpu_asic_set_uvd_clocks(53300, 40000) before fw_validate and in
- *   begin_use, (0, 0) in the idle work: frb_si_set_uvd_clocks.
+ * - CLOCKS. As amdgpu: with SI DPM (on by default) amdgpu_dpm_enable_uvd's SI
+ *   arm before fw_validate and in begin_use, the VBIOS's UVD power state
+ *   (frb_si_dpm_enable_uvd: its VCLK/DCLK through the UPLL, the engine and
+ *   memory clocks held), and the performance state again in the idle work;
+ *   without DPM amdgpu_asic_set_uvd_clocks(53300, 40000) and (0, 0):
+ *   frb_si_set_uvd_clocks.
+ * - THE DECODE CLIENT (kext/Firebrand/FirebrandVideo.cpp): UVD 3.1 takes
+ *   28-bit addresses in the 256 MB segment UVD_LMI_ADDR_EXT names per
+ *   client; every buffer a decode names sits in the VCPU bo's segment, as
+ *   Linux places them (amdgpu_uvd_force_into_uvd_segment).
  * - BYTE ORDER. Ring and IBs little-endian, UVD_LMI_SWAP_CNTL 0 (amdgpu's
  *   __BIG_ENDIAN arm is 0xa with host-order rings); `swapped` takes amdgpu's
  *   arm (FRB_TEST_SWAP_PROBE runs both), as on UVD 6.
  * - NO INTERRUPTS: fences are polled.
  *
- * NOT YET RUN ON THE CARD.
+ * On the R7 450 since 2026-11-15 (docs/si-bring-up.md, "UVD 3.1").
  *
  * Copyright 2020 Advanced Micro Devices, Inc.
  * Copyright (c) 2026 Jordan Bettcher

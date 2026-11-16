@@ -38,12 +38,16 @@ diff --git a/src/gallium/drivers/radeonsi/gfx/si_shader_binary.c b/src/gallium/d
 diff --git a/src/gallium/drivers/radeonsi/si_descriptors.c b/src/gallium/drivers/radeonsi/si_descriptors.c
 --- a/src/gallium/drivers/radeonsi/si_descriptors.c
 +++ b/src/gallium/drivers/radeonsi/si_descriptors.c
-@@ -119,6 +119,17 @@
+@@ -119,6 +119,21 @@
     buffer_offset -= first_slot_offset;
     desc->gpu_address = desc->buffer->gpu_address + buffer_offset;
  
 +   /* osx-gpu: RDN_DESC_DUMP=1 prints every uploaded descriptor list, host-order words. */
-+   if (getenv("RDN_DESC_DUMP")) {
++   static int rdn_desc_dump = -1;   /* read once: this runs at every draw */
++
++   if (rdn_desc_dump < 0)
++      rdn_desc_dump = getenv("RDN_DESC_DUMP") != NULL;
++   if (rdn_desc_dump) {
 +      const uint32_t *w = (const uint32_t *)((char *)desc->list + first_slot_offset);
 +      unsigned n = upload_size / 4, per = desc->element_dw_size;
 +

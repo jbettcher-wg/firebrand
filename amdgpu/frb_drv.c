@@ -1,22 +1,29 @@
 /*
- * The family table: amdgpu_drv.c's pciidlist for the Polaris and Vega 20
- * parts, and the rows for the cards this driver has actually met.
+ * The family table: amdgpu_drv.c's pciidlist for the SI, CIK, Polaris and
+ * Vega parts, and the rows for the cards this driver has actually met.
  *
  * Two levels, on purpose:
- * - frb_asic_type_of() is Linux's table: device id -> CHIP_POLARIS1x. It is
- *   what the survey reports and what decides firmware names, and it never
- *   by itself lets the driver write a register.
- * - frb_asic_lookup() finds a CARD row (device, revision, subsystem). Only a
- *   row may raise the bring-up past the survey, and only up to its
- *   max_stage: the highest stage verified on that card against its Linux
- *   reference capture. A Polaris with no row is surveyed and left alone.
+ * - frb_asic_type_of() is Linux's table: device id -> CHIP_*. It is what
+ *   the survey reports and what decides firmware names.
+ * - frb_asic_lookup() finds a CARD row (device, revision, subsystem): a card
+ *   verified on hardware, up to its max_stage, the highest stage verified on
+ *   that card.
+ * A card of a ported family with no row of its own is an UNTESTED card
+ * (frb_asic_untested_row): it runs display-only (stage dce) unless unlocked
+ * (frb_stage_cap; `sudo frbctl unlock`), and its report goes to a GitHub
+ * issue. Vega 10 and Vega 12 are recognised but not ported (frb_asic_ported):
+ * their VBIOS is read for the report, their registers are never touched.
  *
  * Copyright (c) 2026 Jordan Bettcher
  * SPDX-License-Identifier: MIT
  */
 #include "frb_device.h"
 
-/* drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c, pciidlist: the SI, Polaris and Vega 20 rows */
+/*
+ * drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c (Linux 7.1), pciidlist: every
+ * discrete SI, CIK, Polaris and Vega row. The kext's IOPCIMatch is made from
+ * this table (kext/Firebrand/Makefile), so every card here matches.
+ */
 static const struct { uint16_t device; enum amd_asic_type type; } pciidlist[] = {
 	/* Tahiti */
 	{ 0x6780, CHIP_TAHITI }, { 0x6784, CHIP_TAHITI }, { 0x6788, CHIP_TAHITI },
@@ -48,6 +55,18 @@ static const struct { uint16_t device; enum amd_asic_type type; } pciidlist[] = 
 	/* Hainan */
 	{ 0x6660, CHIP_HAINAN }, { 0x6663, CHIP_HAINAN }, { 0x6664, CHIP_HAINAN },
 	{ 0x6665, CHIP_HAINAN }, { 0x6667, CHIP_HAINAN }, { 0x666F, CHIP_HAINAN },
+	/*
+	 * Bonaire, Hawaii: the CIK discrete parts (Kaveri, Kabini and Mullins are
+	 * APUs, which no board here can hold). RadeonNI matches the Hawaii ids.
+	 */
+	{ 0x6640, CHIP_BONAIRE }, { 0x6641, CHIP_BONAIRE }, { 0x6646, CHIP_BONAIRE },
+	{ 0x6647, CHIP_BONAIRE }, { 0x6649, CHIP_BONAIRE }, { 0x6650, CHIP_BONAIRE },
+	{ 0x6651, CHIP_BONAIRE }, { 0x6658, CHIP_BONAIRE }, { 0x665C, CHIP_BONAIRE },
+	{ 0x665D, CHIP_BONAIRE }, { 0x665F, CHIP_BONAIRE },
+	{ 0x67A0, CHIP_HAWAII }, { 0x67A1, CHIP_HAWAII }, { 0x67A2, CHIP_HAWAII },
+	{ 0x67A8, CHIP_HAWAII }, { 0x67A9, CHIP_HAWAII }, { 0x67AA, CHIP_HAWAII },
+	{ 0x67B0, CHIP_HAWAII }, { 0x67B1, CHIP_HAWAII }, { 0x67B8, CHIP_HAWAII },
+	{ 0x67B9, CHIP_HAWAII }, { 0x67BA, CHIP_HAWAII }, { 0x67BE, CHIP_HAWAII },
 	/* Polaris11 */
 	{ 0x67E0, CHIP_POLARIS11 }, { 0x67E3, CHIP_POLARIS11 }, { 0x67E8, CHIP_POLARIS11 },
 	{ 0x67EB, CHIP_POLARIS11 }, { 0x67EF, CHIP_POLARIS11 }, { 0x67FF, CHIP_POLARIS11 },
@@ -64,6 +83,15 @@ static const struct { uint16_t device; enum amd_asic_type type; } pciidlist[] = 
 	{ 0x6997, CHIP_POLARIS12 }, { 0x699F, CHIP_POLARIS12 },
 	/* VegaM */
 	{ 0x694C, CHIP_VEGAM }, { 0x694E, CHIP_VEGAM }, { 0x694F, CHIP_VEGAM },
+	/* Vega 10 (recognised only: frb_asic_ported) */
+	{ 0x6860, CHIP_VEGA10 }, { 0x6861, CHIP_VEGA10 }, { 0x6862, CHIP_VEGA10 },
+	{ 0x6863, CHIP_VEGA10 }, { 0x6864, CHIP_VEGA10 }, { 0x6867, CHIP_VEGA10 },
+	{ 0x6868, CHIP_VEGA10 }, { 0x6869, CHIP_VEGA10 }, { 0x686A, CHIP_VEGA10 },
+	{ 0x686B, CHIP_VEGA10 }, { 0x686C, CHIP_VEGA10 }, { 0x686D, CHIP_VEGA10 },
+	{ 0x686E, CHIP_VEGA10 }, { 0x686F, CHIP_VEGA10 }, { 0x687F, CHIP_VEGA10 },
+	/* Vega 12 (recognised only) */
+	{ 0x69A0, CHIP_VEGA12 }, { 0x69A1, CHIP_VEGA12 }, { 0x69A2, CHIP_VEGA12 },
+	{ 0x69A3, CHIP_VEGA12 }, { 0x69AF, CHIP_VEGA12 },
 	/* Vega 20 */
 	{ 0x66A0, CHIP_VEGA20 }, { 0x66A1, CHIP_VEGA20 }, { 0x66A2, CHIP_VEGA20 },
 	{ 0x66A3, CHIP_VEGA20 }, { 0x66A4, CHIP_VEGA20 }, { 0x66A7, CHIP_VEGA20 },
@@ -102,7 +130,37 @@ static const struct { uint16_t device; enum amd_asic_type type; } pciidlist[] = 
  * dce the same day with the LG on DP connector 0: EDID and DPCD over AUX,
  * 3840x2160@60 trained at HBR2 x4, the scanout read back equal to the host
  * model, the sink CRC, the 64x64 hardware cursor seen right
- * (docs/si-bring-up.md).
+ * (docs/si-bring-up.md). Stages gfx and sdma (gfx v6, si_dma) the same day:
+ * ring, IB, copy and fill tests on both DMA engines, the accelerator's 2D
+ * tests, Quartz Extreme, Core Image and GL 3.3/4.5 through the GL bundle,
+ * clock gating, and si_dpm (the SMC's tables equal to Linux radeon's, the
+ * levels 300/150 .. 925/1125 MHz switching forced and by load).
+ * Stage uvd (UVD 3.1) 2026-11-15: the firmware validated, the VCPU up, ring
+ * and IB tests, and through 'rdnv' (the legacy H.264 messages, every
+ * buffer in the VCPU bo's 256 MB segment) the 12 H.264 vectors equal
+ * ffmpeg's md5 without DPM and with it (si_dpm's UVD state, its UPLL
+ * clocks); FrostByte playback (docs/si-bring-up.md, "UVD 3.1").
+ */
+/*
+ * W8100 (under Firebrand since 2026-11-15; under RadeonNI before):
+ * Dell's FirePro W8100, Hawaii GL40 A0, 67a1 rev 00, subsystem 1028:030c,
+ * 8 GB 512-bit GDDR5, four DP 1.2 (VBIOS C67502, 113-C6750200-100). No
+ * amdgpu capture: the references are RadeonNI's measured CIK bring-up on
+ * this card (RadeonNI's hw/rdn_si.c, rdn_cik_smc.c, rdn_ci_dpm.c) and
+ * Linux radeon's DPM register and SMU-table snapshots of it (2026-11-04). Stages post (cold
+ * ASIC_Init), gmc (hawaii_mc.bin trained as RadeonNI from cold, all 8 GB
+ * at 0xF4_0000_0000, GART) and smu verified 2026-11-15, every
+ * value equal to RadeonNI's log on this card; CI DPM right after stage smu,
+ * the SMC's tables equal to Linux radeon's and the levels 300/150 ..
+ * 824/1250 MHz switching as Linux's do (docs/cik-bring-up.md). Stages dce
+ * (DCE 8), gfx (gfx v7) and sdma (cik_sdma) the same evening: the four DP
+ * paths as RadeonNI logged them, the LG at 4K60 HBR2 x4 and the desktop at
+ * 2560x1440, the ring/IB/copy/fill/GTT tests, the accelerator, Quartz
+ * Extreme, Core Image and GL 4.5 through the shared bundle; the picture and
+ * the cursor checked by eye and DP audio heard. Stage uvd (uvd v4.2) the same
+ * night: the VCPU up with CI DPM's UVD levels, the ring, IB and idle tests,
+ * and through 'rdnv' the 12 H.264 vectors equal ffmpeg's md5 (5.4 ms a 1080p
+ * picture in the decoder).
  */
 /*
  * MI50: checked against a Linux amdgpu register capture (2026-11-13).
@@ -136,7 +194,9 @@ static const struct { uint16_t device; enum amd_asic_type type; } pciidlist[] = 
  */
 static const struct frb_asic_row rows[] = {
 	{ 0x682B, 0x1028, 0x1004, 0x87, CHIP_VERDE, "VERDE", "verde",
-	  "AMD Radeon R7 450 (Cape Verde, 4 GB 128-bit GDDR5, DP/DP/DVI-I)", FRB_STAGE_DCE },
+	  "AMD Radeon R7 450 (Cape Verde, 4 GB 128-bit GDDR5, DP/DP/DVI-I)", FRB_STAGE_UVD },
+	{ 0x67A1, 0x1028, 0x030C, 0x00, CHIP_HAWAII, "HAWAII", "hawaii",
+	  "AMD FirePro W8100 (Hawaii, 8 GB 512-bit GDDR5, 4x DP)", FRB_STAGE_UVD },
 	{ 0x699F, 0x1002, 0xEA73, 0x81, CHIP_POLARIS12, "POLARIS12", "polaris12",
 	  "AMD Embedded Radeon E9173 (Lexa XL, 2 GB 64-bit GDDR5, 3x DP)", FRB_STAGE_UVD },
 	{ 0x699F, 0x1002, 0x0B04, 0xC7, CHIP_POLARIS12, "POLARIS12", "polaris12",
@@ -156,6 +216,88 @@ enum amd_asic_type frb_asic_type_of(uint16_t device)
 	return CHIP_UNKNOWN_FRB;
 }
 
+/* amdgpu_drv.c asic_type_quirks: Polaris 10 and 11 parts with the same device id */
+static const struct { uint16_t device; uint8_t revision; enum amd_asic_type type; } asic_type_quirks[] = {
+	{ 0x67FF, 0xE3, CHIP_POLARIS10 },
+	{ 0x67FF, 0xE7, CHIP_POLARIS10 },
+	{ 0x67FF, 0xF3, CHIP_POLARIS10 },
+	{ 0x67FF, 0xF7, CHIP_POLARIS10 },
+};
+
+enum amd_asic_type frb_asic_type_of_rev(uint16_t device, uint8_t revision)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(asic_type_quirks); i++)
+		if (asic_type_quirks[i].device == device && asic_type_quirks[i].revision == revision)
+			return asic_type_quirks[i].type;
+	return frb_asic_type_of(device);
+}
+
+int frb_asic_ported(enum amd_asic_type t)
+{
+	switch (t) {
+	case CHIP_VEGA10:
+	case CHIP_VEGA12:
+	case CHIP_UNKNOWN_FRB:
+		return 0;
+	default:
+		return frb_asic_funcs_of(t) != 0;
+	}
+}
+
+/* the linux-firmware prefix and the words for an untested card of each chip */
+static const struct { enum amd_asic_type type; const char *fw_prefix, *board; } untested_names[] = {
+	{ CHIP_TAHITI,		"tahiti",	"AMD Tahiti GPU (Southern Islands, untested card)" },
+	{ CHIP_PITCAIRN,	"pitcairn",	"AMD Pitcairn GPU (Southern Islands, untested card)" },
+	{ CHIP_VERDE,		"verde",	"AMD Cape Verde GPU (Southern Islands, untested card)" },
+	{ CHIP_OLAND,		"oland",	"AMD Oland GPU (Southern Islands, untested card)" },
+	{ CHIP_HAINAN,		"hainan",	"AMD Hainan GPU (Southern Islands, untested card)" },
+	{ CHIP_BONAIRE,		"bonaire",	"AMD Bonaire GPU (Sea Islands, untested card)" },
+	{ CHIP_HAWAII,		"hawaii",	"AMD Hawaii GPU (Sea Islands, untested card)" },
+	{ CHIP_POLARIS10,	"polaris10",	"AMD Polaris 10 GPU (untested card)" },
+	{ CHIP_POLARIS11,	"polaris11",	"AMD Polaris 11 GPU (untested card)" },
+	{ CHIP_POLARIS12,	"polaris12",	"AMD Polaris 12 GPU (untested card)" },
+	{ CHIP_VEGAM,		"vegam",	"AMD Vega M GPU (untested card)" },
+	{ CHIP_VEGA10,		"vega10",	"AMD Vega 10 GPU (not ported yet)" },
+	{ CHIP_VEGA12,		"vega12",	"AMD Vega 12 GPU (not ported yet)" },
+	{ CHIP_VEGA20,		"vega20",	"AMD Vega 20 GPU (untested card)" },
+};
+
+void frb_asic_untested_row(struct frb_device *adev)
+{
+	struct frb_asic_row *r = &adev->untested_row;
+	unsigned int i;
+
+	r->device = adev->device;
+	r->subsys_vendor = adev->subsys_vendor;
+	r->subsys_device = adev->subsys_device;
+	r->revision = adev->revision;
+	r->asic_type = adev->asic_type;
+	r->asic_name = frb_asic_name(adev->asic_type);
+	r->fw_prefix = "unknown";
+	r->board = "AMD GPU (untested card)";
+	for (i = 0; i < ARRAY_SIZE(untested_names); i++)
+		if (untested_names[i].type == adev->asic_type) {
+			r->fw_prefix = untested_names[i].fw_prefix;
+			r->board = untested_names[i].board;
+		}
+	/* a chip Firebrand only recognises runs nothing (the kext does not even map its registers) */
+	r->max_stage = frb_asic_ported(adev->asic_type) ? FRB_UNTESTED_STAGE : FRB_STAGE_SURVEY;
+	r->quirks = 0;
+	r->untested = 1;
+	adev->row = r;
+}
+
+enum frb_stage frb_stage_cap(const struct frb_device *adev)
+{
+	if (!adev->row)
+		return FRB_STAGE_SURVEY;
+	if (adev->row->untested && adev->unlocked && frb_asic_ported(adev->asic_type))
+		return FRB_UNLOCKED_STAGE;
+	return (enum frb_stage)adev->row->max_stage;
+}
+
 const char *frb_asic_name(enum amd_asic_type t)
 {
 	switch (t) {
@@ -164,6 +306,8 @@ const char *frb_asic_name(enum amd_asic_type t)
 	case CHIP_VERDE:	return "VERDE";
 	case CHIP_OLAND:	return "OLAND";
 	case CHIP_HAINAN:	return "HAINAN";
+	case CHIP_BONAIRE:	return "BONAIRE";
+	case CHIP_HAWAII:	return "HAWAII";
 	case CHIP_POLARIS10:	return "POLARIS10";
 	case CHIP_POLARIS11:	return "POLARIS11";
 	case CHIP_POLARIS12:	return "POLARIS12";
@@ -180,6 +324,11 @@ const struct frb_asic_row *frb_asic_lookup(uint16_t device, uint8_t revision,
 {
 	unsigned int i;
 
+#ifdef FRB_FORCE_UNTESTED
+	/* a test build (kext Makefile UNTESTED=0xDEVICE): that card's verified rows are ignored */
+	if (device == FRB_FORCE_UNTESTED)
+		return 0;
+#endif
 	for (i = 0; i < ARRAY_SIZE(rows); i++) {
 		const struct frb_asic_row *r = &rows[i];
 
@@ -194,7 +343,7 @@ const struct frb_asic_row *frb_asic_lookup(uint16_t device, uint8_t revision,
 	return 0;
 }
 
-/* si_set_ip_blocks / vi_set_ip_blocks / soc15_set_ip_blocks: the family's table */
+/* si_set_ip_blocks / cik_set_ip_blocks / vi_set_ip_blocks / soc15_set_ip_blocks: the family's table */
 const struct frb_asic_funcs *frb_asic_funcs_of(enum amd_asic_type t)
 {
 	switch (t) {
@@ -204,6 +353,9 @@ const struct frb_asic_funcs *frb_asic_funcs_of(enum amd_asic_type t)
 	case CHIP_OLAND:
 	case CHIP_HAINAN:
 		return &frb_si_asic_funcs;
+	case CHIP_BONAIRE:
+	case CHIP_HAWAII:
+		return &frb_cik_asic_funcs;
 	case CHIP_POLARIS10:
 	case CHIP_POLARIS11:
 	case CHIP_POLARIS12:

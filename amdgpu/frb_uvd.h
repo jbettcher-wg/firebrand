@@ -81,6 +81,7 @@ struct frb_uvd {
 	int touched;			/* hw_init wrote the block: hw_fini must stop it */
 	uint32_t ib_tests;		/* IB tests run (the msg handle cycles) */
 	uint32_t keyselect;		/* uvd_v3_1: the firmware validation key (UVD_FW_START) */
+	const char *fw_name;		/* the image's file name (amdgpu_uvd_sw_init's fw_name) */
 };
 
 /* amdgpu_uvd.c */
@@ -109,6 +110,12 @@ struct frb_ring *frb_uvd_ring(struct frb_device *adev);
  * adev->reg_offset[UVD_HWIP][me][1] from Vega 10 on.
  */
 uint32_t frb_uvd_reg_base(struct frb_device *adev, int me);
+/* uvd_v4_2 (CIK): the stage, the tests, hw_fini, set_power/clockgating_state (frb_uvd_v4_2.c); one instance */
+int frb_uvd_v4_2_init(struct frb_device *adev);
+int frb_uvd_v4_2_test(struct frb_device *adev, int test);
+void frb_uvd_v4_2_fini(struct frb_device *adev);
+int frb_uvd_v4_2_set_powergating_state(struct frb_device *adev, int gate);
+int frb_uvd_v4_2_set_clockgating_state(struct frb_device *adev, int gate);
 /* uvd_v3_1 (SI): the stage, the tests, hw_fini (frb_uvd_v3_1.c); one instance, inst[0] */
 int frb_uvd_v3_1_init(struct frb_device *adev);
 int frb_uvd_v3_1_test(struct frb_device *adev, int test);

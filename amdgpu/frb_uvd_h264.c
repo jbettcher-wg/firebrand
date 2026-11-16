@@ -4,7 +4,10 @@
  * client library accepts is one this accepts; the message and IB are Mesa
  * 26.2.4's ac_uvd_dec.c for Polaris and Vega (uvd_build_create_cmd,
  * uvd_build_decode_cmd, build_avc_msg, ac_uvd_dec_dpb_size,
- * calc_ctx_size_avc) at struct ruvd_msg's byte offsets.
+ * calc_ctx_size_avc) at struct ruvd_msg's byte offsets; before Tonga
+ * (hw->legacy, SI) the same file's arm for those families, which is what
+ * RadeonNI's hw/rdn_uvd_h264.c sent Turks' UVD 3.0 (tests/frb_uvd_msg.c
+ * holds the two side by side).
  *
  * One deliberate difference from Mesa 26: decoded_pic_idx is the picture's
  * frame_num, as Mesa's radeonsi radeon_uvd.c had it through the years it
@@ -30,7 +33,7 @@ enum {
 	/* body.decode */
 	D_STREAM_TYPE = 16, D_DECODE_FLAGS = 20, D_WIDTH = 24, D_HEIGHT = 28,
 	D_DPB_SIZE = 36, D_DPB_RESERVED = 44, D_DB_PITCH = 52, D_BSD_SIZE = 88,
-	D_DT_PITCH = 112, D_DT_FIELD_MODE = 124, D_DT_LUMA_TOP = 128, D_DT_CHROMA_TOP = 136,
+	D_DT_PITCH = 112, D_DT_FIELD_MODE = 124, D_DT_LUMA_TOP = 128, D_DT_CHROMA_TOP = 136, D_DT_CHROMA_BOTTOM = 140,
 	D_DT_WA_CHROMA_TOP = 152, D_CODEC = 224, D_EXTENSION_SUPPORT = 3296,
 	/* struct ruvd_h264, from D_CODEC */
 	H_PROFILE = 0, H_LEVEL = 4, H_SPS_FLAGS = 8, H_PPS_FLAGS = 12, H_CHROMA_FORMAT = 16,
@@ -167,6 +170,10 @@ int frb_uvd_h264_valid_picture(const struct rdn_uvd_h264_config *c, const struct
  * references, the most the session can hold), the session context, and
  * a linear target. Mesa's DPB alignment is 16 before Vega and 32 from
  * Vega 10 on (ac_uvd_dec_dpb_alignment), applied to the 16-aligned size.
+ * Legacy (family < POLARIS10 in ac_uvd_dec_dpb_size; get_session_size
+ * gives no session or context buffer there): the DPB also holds 17
+ * macroblock contexts, align(mbs x 192, 64) each, and the IT surface,
+ * align(mbs x 32, 64).
  */
 int frb_uvd_h264_layout_init(const struct frb_uvd_h264_hw *hw, const struct rdn_uvd_h264_config *c,
 			     struct frb_uvd_h264_layout *out)
@@ -174,7 +181,8 @@ int frb_uvd_h264_layout_init(const struct frb_uvd_h264_hw *hw, const struct rdn_
 	struct frb_uvd_h264_layout l;
 	uint64_t image, width_in_mb, height_in_mb, dpb, ctx, pitch, target, packed;
 
-	if (!out || !hw || (hw->dpb_alignment != 16 && hw->dpb_alignment != 32) || !valid_config(c))
+	if (!out || !hw || (hw->dpb_alignment != 16 && hw->dpb_alignment != 32) || hw->legacy > 1 ||
+	    (hw->legacy && hw->dpb_alignment != 16) || !valid_config(c))
 		return -1;
 	memset(&l, 0, sizeof(l));
 	l.hw = *hw;
@@ -185,7 +193,13 @@ int frb_uvd_h264_layout_init(const struct frb_uvd_h264_hw *hw, const struct rdn_
 	width_in_mb = align_up(c->coded_width, 16) / 16;
 	height_in_mb = align_up(align_up(c->coded_height, 16) / 16, 2);
 	dpb = image * FRB_UVD_H264_MAX_REFS;
-	ctx = FRB_UVD_H264_MAX_REFS * align_up(width_in_mb * height_in_mb * 192, 256);
+	if (hw->legacy) {
+		dpb += FRB_UVD_H264_MAX_REFS * align_up(width_in_mb * height_in_mb * 192, 64);
+		dpb += align_up(width_in_mb * height_in_mb * 32, 64);
+		ctx = 0;
+	} else {
+		ctx = FRB_UVD_H264_MAX_REFS * align_up(width_in_mb * height_in_mb * 192, 256);
+	}
 	pitch = align_up(c->coded_width, 256);
 	target = pitch * c->coded_height * 3 / 2;
 	packed = (uint64_t)c->coded_width * c->coded_height * 3 / 2;
@@ -198,7 +212,7 @@ int frb_uvd_h264_layout_init(const struct frb_uvd_h264_hw *hw, const struct rdn_
 	l.image_bytes = (uint32_t)image;
 	l.dpb_bytes = (uint32_t)dpb;
 	l.ctx_bytes = (uint32_t)ctx;
-	l.session_bytes = FRB_UVD_H264_SESSION_BYTES;
+	l.session_bytes = hw->legacy ? 0 : FRB_UVD_H264_SESSION_BYTES;
 	l.target_pitch = (uint32_t)pitch;
 	l.target_rows = c->coded_height;
 	l.chroma_offset = (uint32_t)(pitch * c->coded_height);
@@ -236,7 +250,7 @@ int frb_uvd_h264_pack_create(const struct rdn_uvd_h264_config *c, const struct f
 	    l->height != c->coded_height)
 		return -1;
 	message_init(out, RDN_UVD_H264_MSG_CREATE, handle);
-	put_le32(out + C_STREAM_TYPE, FRB_UVD_CODEC_H264_PERF);
+	put_le32(out + C_STREAM_TYPE, l->hw.legacy ? FRB_UVD_CODEC_H264 : FRB_UVD_CODEC_H264_PERF);
 	put_le32(out + C_WIDTH, c->coded_width);
 	put_le32(out + C_HEIGHT, c->coded_height);
 	put_le32(out + C_DPB_SIZE, l->dpb_bytes);
@@ -266,21 +280,31 @@ int frb_uvd_h264_pack_decode(const struct rdn_uvd_h264_config *c, const struct r
 		return -1;
 	message_init(out, RDN_UVD_H264_MSG_DECODE, handle);
 	put_le32(out + MSG_FEEDBACK_NUMBER, feedback);
-	put_le32(out + D_STREAM_TYPE, FRB_UVD_CODEC_H264_PERF);
+	put_le32(out + D_STREAM_TYPE, l->hw.legacy ? FRB_UVD_CODEC_H264 : FRB_UVD_CODEC_H264_PERF);
 	put_le32(out + D_DECODE_FLAGS, 1);
 	put_le32(out + D_WIDTH, c->coded_width);
 	put_le32(out + D_HEIGHT, c->coded_height);
 	put_le32(out + D_BSD_SIZE, padded);
 	put_le32(out + D_DPB_SIZE, l->dpb_bytes);
-	put_le32(out + D_DPB_RESERVED, l->ctx_bytes);
+	put_le32(out + D_DPB_RESERVED, l->ctx_bytes);	/* dec->hw_ctx_size: 0 before Polaris */
 	put_le32(out + D_DB_PITCH, l->db_pitch);
 	out[D_EXTENSION_SUPPORT] = 1;
 	put_le32(out + D_DT_PITCH, l->target_pitch);
 	put_le32(out + D_DT_FIELD_MODE, 0);
 	put_le32(out + D_DT_LUMA_TOP, 0);
 	put_le32(out + D_DT_CHROMA_TOP, l->chroma_offset);
-	/* family >= CHIP_STONEY */
-	put_le32(out + D_DT_WA_CHROMA_TOP, l->target_pitch / 2);
+	if (!l->hw.legacy) {
+		/* family >= CHIP_STONEY */
+		put_le32(out + D_DT_WA_CHROMA_TOP, l->target_pitch / 2);
+	} else {
+		/*
+		 * A frame's bottom offsets are its top ones, as radeonsi's
+		 * ruvd_set_dt_surfaces (the code that drove SI) and RadeonNI's
+		 * packer on Turks set them; Mesa 26 leaves them 0. The luma's
+		 * is 0 either way.
+		 */
+		put_le32(out + D_DT_CHROMA_BOTTOM, l->chroma_offset);
+	}
 	/* GFX9: dt_wa_chroma_bottom_offset is the target's swizzle mode; linear (ADDR_SW_LINEAR) is 0, as stored */
 
 	h = out + D_CODEC;
@@ -345,8 +369,20 @@ uint32_t frb_uvd_h264_build_ib(uint32_t type, const struct frb_uvd_h264_hw *hw,
 
 	if (!hw || !b || !b->msg || (b->msg & 63) || type > RDN_UVD_H264_MSG_DESTROY)
 		return 0;
-	if (type == RDN_UVD_H264_MSG_DESTROY) {
+	if (type == RDN_UVD_H264_MSG_DESTROY || (type == RDN_UVD_H264_MSG_CREATE && hw->legacy)) {
+		/* before Polaris no session context (dec->sw_ctx_size 0): create is the msg alone */
 		send_cmd(out, &n, FRB_UVD_CMD_MSG_BUFFER, b->msg);
+	} else if (hw->legacy) {
+		/* uvd_build_decode_cmd with no session, context or IT scaling buffer (stream type H264) */
+		if (!b->dpb || !b->feedback || !b->bitstream || !b->target)
+			return 0;
+		send_cmd(out, &n, FRB_UVD_CMD_MSG_BUFFER, b->msg);
+		send_cmd(out, &n, FRB_UVD_CMD_DPB_BUFFER, b->dpb);
+		send_cmd(out, &n, FRB_UVD_CMD_FEEDBACK_BUFFER, b->feedback);
+		send_cmd(out, &n, FRB_UVD_CMD_BITSTREAM_BUFFER, b->bitstream);
+		send_cmd(out, &n, FRB_UVD_CMD_DECODING_TARGET, b->target);
+		out[n++] = RUVD_PKT0(hw, FRB_UVD_H264_ENGINE_CNTL);
+		out[n++] = 1;
 	} else if (type == RDN_UVD_H264_MSG_CREATE) {
 		if (!b->session)
 			return 0;

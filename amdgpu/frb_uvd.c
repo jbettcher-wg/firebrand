@@ -15,7 +15,9 @@
  *   amdgpu allocates the VCPU bo top-down in VRAM (0xF4_7F80_0000 on the
  *   E9173; 0x83_FE80_0000 and 0x83_FE40_0000 on the MI50). UVD 6 and 7
  *   address 64 bits (address_64_bit), so neither needs the 256 MB segment
- *   older UVD did. The IB test's IB comes out of frb_ring.c's VRAM IB pool
+ *   older UVD did; SI's 3.1 and CIK's 4.2 do, and the CPU window is their
+ *   VCPU bo's segment (frb_gmc_v6_0.c's and frb_gmc_v7_0.c's layouts), where
+ *   the sessions put everything a decode names (FirebrandVideo.cpp). The IB test's IB comes out of frb_ring.c's VRAM IB pool
  *   (amdgpu: the direct pool, GTT).
  * - FENCES are the ring's writeback slot (frb_ring_init), polled; amdgpu
  *   puts UVD's fence word behind the firmware in the VCPU bo
@@ -38,8 +40,13 @@
  *   feature on at begin_use, off in the idle work: frb_vega20_hwmgr.c);
  *   without it nothing at all, as amdgpu's arm there is three no-ops
  *   (soc15_set_uvd_clocks is commented out, uvd_v7_0 has no power gating
- *   and its clock gating state function is empty). Either way the VCPUs
- *   stay up between uses: only Polaris stops its VCPU in the idle work.
+ *   and its clock gating state function is empty). SI: with DPM,
+ *   amdgpu_dpm_enable_uvd's legacy arm, the VBIOS's UVD power state (its
+ *   VCLK/DCLK on the UPLL, si_set_uvd_clocks, the engine and memory clocks
+ *   held) at begin_use and the performance state in the idle work
+ *   (frb_si_dpm_enable_uvd); without it si_set_uvd_clocks(533, 400 MHz) and
+ *   bypass. Either way the VCPUs stay up between uses: only Polaris stops
+ *   its VCPU in the idle work.
  * - MEMORY. The VCPU bo is written through BAR0 with little-endian words
  *   (memcpy_toio of the file's bytes); the messages are little-endian
  *   words (cpu_to_le32), whatever the ring's own byte order.
@@ -137,6 +144,8 @@ void frb_uvd_ib_pad(struct frb_device *adev, struct frb_ib *ib)
 		frb_uvd_ib_write(adev, ib, 0);
 	}
 }
+#define FIRMWARE_BONAIRE	"bonaire_uvd.bin"	/* amdgpu_uvd.c; radeon loads bonaire_uvd.bin for Hawaii too */
+#define FIRMWARE_HAWAII		"hawaii_uvd.bin"
 #define FIRMWARE_TAHITI		"tahiti_uvd.bin"
 #define FIRMWARE_VERDE		"verde_uvd.bin"
 #define FIRMWARE_PITCAIRN	"pitcairn_uvd.bin"
@@ -163,6 +172,12 @@ int frb_uvd_sw_init(struct frb_device *adev)
 	case CHIP_PITCAIRN:
 		fw_name = FIRMWARE_PITCAIRN;
 		break;
+	case CHIP_BONAIRE:
+		fw_name = FIRMWARE_BONAIRE;
+		break;
+	case CHIP_HAWAII:
+		fw_name = FIRMWARE_HAWAII;
+		break;
 	case CHIP_POLARIS12:
 		fw_name = FIRMWARE_POLARIS12;
 		break;
@@ -170,7 +185,7 @@ int frb_uvd_sw_init(struct frb_device *adev)
 		fw_name = FIRMWARE_VEGA20;
 		break;
 	default:
-		frb_err(adev, "amdgpu_uvd: only Polaris 12, Vega 20 and SI are wired up");
+		frb_err(adev, "amdgpu_uvd: only Polaris 12, Vega 20, SI and CIK are wired up");
 		return -EINVAL;
 	}
 	if (!uvd->num_uvd_inst)
@@ -178,6 +193,7 @@ int frb_uvd_sw_init(struct frb_device *adev)
 	/* adev->firmware.load_type: the PSP loads on SOC15 (stage smu did), the driver on VI */
 	uvd->psp_load = frb_is_soc15(adev);
 
+	uvd->fw_name = fw_name;
 	uvd->fw.data = 0;
 	uvd->fw.size = 0;
 	r = adev->os->firmware(adev->os->cookie, fw_name, &uvd->fw.data, &uvd->fw.size);
@@ -254,8 +270,8 @@ int frb_uvd_sw_init(struct frb_device *adev)
 		next += AMDGPU_GPU_PAGE_ALIGN(bo_size);
 	}
 
-	/* from uvd v5.0 HW addressing capacity increased to 64 bits (SI's 3.1: 32 + segments) */
-	uvd->address_64_bit = !frb_is_si(adev);
+	/* from uvd v5.0 HW addressing capacity increased to 64 bits (SI's 3.1, CIK's 4.2: 32 + segments) */
+	uvd->address_64_bit = !frb_is_si(adev) && !frb_is_cik(adev);
 
 	/*
 	 * amdgpu_uvd_create_msg_bo_helper(128 KB): without address_64_bit (SI)
@@ -469,6 +485,11 @@ int frb_uvd_idle_work_handler(struct frb_device *adev)
 	} else if (frb_is_si(adev)) {
 		/* amdgpu_asic_set_uvd_clocks(0, 0): the UPLL in bypass; uvd_v3_1's gating calls are empty */
 		frb_si_set_uvd_clocks(adev, 0, 0);
+	} else if (frb_is_cik(adev)) {
+		frb_cik_set_uvd_clocks(adev, 0, 0);
+		/* shutdown the UVD block (uvd_v4_2_set_powergating_state GATE: the VCPU stopped) */
+		frb_uvd_v4_2_set_powergating_state(adev, 1);
+		frb_uvd_v4_2_set_clockgating_state(adev, 1);
 	} else {
 		frb_vi_set_uvd_clocks(adev, 0, 0);
 		/* shutdown the UVD block */
@@ -511,6 +532,16 @@ void frb_uvd_ring_begin_use(struct frb_ring *ring)
 		r = frb_si_set_uvd_clocks(adev, 53300, 40000);
 		if (r)
 			frb_err(adev, "uvd: si_set_uvd_clocks(533, 400 MHz) failed (%d)", r);
+		return;
+	}
+	if (frb_is_cik(adev)) {
+		r = frb_cik_set_uvd_clocks(adev, 53300, 40000);
+		if (r)
+			frb_err(adev, "uvd: cik_set_uvd_clocks(533, 400 MHz) failed (%d)", r);
+		frb_uvd_v4_2_set_clockgating_state(adev, 0);
+		r = frb_uvd_v4_2_set_powergating_state(adev, 0);
+		if (r)
+			frb_err(adev, "uvd: uvd_v4_2_start failed (%d)", r);
 		return;
 	}
 	r = frb_vi_set_uvd_clocks(adev, 53300, 40000);
