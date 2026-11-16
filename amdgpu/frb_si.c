@@ -2,9 +2,10 @@
  * si.c: the SI common block, ported from Linux 7.0.2 (amdgpu): register
  * windows (SMC index/data 0, PCIE index 0xc), rev ids and the clock/power
  * gating flags (si_common_early_init), the golden registers, the PCI config
- * reset, and si_common_hw_init. Only Verde has its golden tables here: the
- * family table has a row for the R7 450 (Cape Verde) and no other SI card,
- * and a chip with no row never gets past the survey.
+ * reset, and si_common_hw_init. Every SI chip's golden tables are here
+ * (amdgpu's, tests/frb_golden_test.c); Verde's run on the verified R7 450,
+ * Tahiti's, Pitcairn's, Oland's and Hainan's only on untested cards and not
+ * yet on hardware.
  *
  * Where Firebrand differs from amdgpu:
  * - si_pcie_gen3_enable reads the link and changes nothing: the T4240's
@@ -60,6 +61,10 @@
 #include "include/si_enums.h"
 
 #define AMDGPU_ASIC_RESET_DATA	0x39d5e86b	/* amdgpu.h */
+/* uvd/uvd_4_0_d.h, which amdgpu's si.c includes (Tahiti's and Pitcairn's mgcg/cgcg tables name it) */
+#ifndef mmUVD_CGC_GATE
+#define mmUVD_CGC_GATE		0x3D2A
+#endif
 #define PCI_COMMAND		0x04
 #define PCI_COMMAND_MASTER	0x4
 
@@ -423,6 +428,589 @@ static void si_common_early_init(struct frb_device *adev)
 		 adev->external_rev_id, (unsigned long long)adev->cg_flags);
 }
 
+/*
+ * Tahiti, Pitcairn, Oland and Hainan: amdgpu's tables verbatim (si.c, Linux
+ * 7.1), for untested cards of those chips; not run on hardware.
+ * tests/frb_golden_test.c compares every table here with amdgpu's source,
+ * numerically through Linux's own register headers.
+ */
+static const uint32_t tahiti_golden_registers[] =
+{
+	mmAZALIA_SCLK_CONTROL, 0x00000030, 0x00000011,
+	mmCB_HW_CONTROL, 0x00010000, 0x00018208,
+	mmDB_DEBUG, 0xffffffff, 0x00000000,
+	mmDB_DEBUG2, 0xf00fffff, 0x00000400,
+	mmDB_DEBUG3, 0x0002021c, 0x00020200,
+	mmDCI_CLK_CNTL, 0x00000080, 0x00000000,
+	0x340c, 0x000000c0, 0x00800040,
+	0x360c, 0x000000c0, 0x00800040,
+	mmFBC_DEBUG_COMP, 0x000000f0, 0x00000070,
+	mmFBC_MISC, 0x00200000, 0x50100000,
+	mmDIG0_HDMI_CONTROL, 0x31000311, 0x00000011,
+	mmMC_ARB_WTM_CNTL_RD, 0x00000003, 0x000007ff,
+	mmMC_XPB_P2P_BAR_CFG, 0x000007ff, 0x00000000,
+	mmPA_CL_ENHANCE, 0xf000001f, 0x00000007,
+	mmPA_SC_FORCE_EOV_MAX_CNTS, 0xffffffff, 0x00ffffff,
+	mmPA_SC_LINE_STIPPLE_STATE, 0x0000ff0f, 0x00000000,
+	mmPA_SC_MODE_CNTL_1, 0x07ffffff, 0x4e000000,
+	mmPA_SC_RASTER_CONFIG, 0x3f3f3fff, 0x2a00126a,
+	0x000c, 0xffffffff, 0x0040,
+	0x000d, 0x00000040, 0x00004040,
+	mmSPI_CONFIG_CNTL, 0x07ffffff, 0x03000000,
+	mmSQ_DED_CNT, 0x01ff1f3f, 0x00000000,
+	mmSQ_SEC_CNT, 0x01ff1f3f, 0x00000000,
+	mmSX_DEBUG_1, 0x0000007f, 0x00000020,
+	mmTA_CNTL_AUX, 0x00010000, 0x00010000,
+	mmTCP_ADDR_CONFIG, 0x00000200, 0x000002fb,
+	mmTCP_CHAN_STEER_HI, 0xffffffff, 0x0000543b,
+	mmTCP_CHAN_STEER_LO, 0xffffffff, 0xa9210876,
+	mmVGT_FIFO_DEPTHS, 0xffffffff, 0x000fff40,
+	mmVGT_GS_VERTEX_REUSE, 0x0000001f, 0x00000010,
+	mmVM_CONTEXT0_CNTL, 0x20000000, 0x20fffed8,
+	mmVM_L2_CG, 0x000c0fc0, 0x000c0400,
+	mmVM_PRT_APERTURE0_LOW_ADDR, 0x0fffffff, 0xffffffff,
+	mmVM_PRT_APERTURE1_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+	mmVM_PRT_APERTURE2_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+	mmVM_PRT_APERTURE3_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+};
+
+static const uint32_t tahiti_golden_registers2[] =
+{
+	mmMCIF_MEM_CONTROL, 0x00000001, 0x00000001,
+};
+
+static const uint32_t tahiti_golden_rlc_registers[] =
+{
+	mmGB_ADDR_CONFIG, 0xffffffff, 0x12011003,
+	mmRLC_LB_PARAMS, 0xffffffff, 0x00601005,
+	0x311f, 0xffffffff, 0x10104040,
+	0x3122, 0xffffffff, 0x0100000a,
+	mmRLC_LB_CNTR_MAX, 0xffffffff, 0x00000800,
+	mmRLC_LB_CNTL, 0xffffffff, 0x800000f4,
+	mmUVD_CGC_GATE, 0x00000008, 0x00000000,
+};
+
+static const uint32_t tahiti_mgcg_cgcg_init[] =
+{
+	mmRLC_CGTT_MGCG_OVERRIDE, 0xffffffff, 0xfffffffc,
+	mmGRBM_GFX_INDEX, 0xffffffff, 0xe0000000,
+	mmCB_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_BCI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_CP_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_GDS_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_IA_CLK_CTRL, 0xffffffff, 0x06000100,
+	mmCGTT_PA_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_PC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_RLC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SPI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SQ_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SQG_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL0, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL1, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL2, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL3, 0xffffffff, 0x00000100,
+	mmCGTT_TCI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_TCP_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_VGT_CLK_CTRL, 0xffffffff, 0x06000100,
+	mmDB_CGTT_CLK_CTRL_0, 0xffffffff, 0x00000100,
+	mmTA_CGTT_CTRL, 0xffffffff, 0x00000100,
+	mmTCA_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmTCC_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmTD_CGTT_CTRL, 0xffffffff, 0x00000100,
+	mmGRBM_GFX_INDEX, 0xffffffff, 0xe0000000,
+	0x2458, 0xffffffff, 0x00010000,
+	0x2459, 0xffffffff, 0x00030002,
+	0x245a, 0xffffffff, 0x00040007,
+	0x245b, 0xffffffff, 0x00060005,
+	0x245c, 0xffffffff, 0x00090008,
+	0x245d, 0xffffffff, 0x00020001,
+	0x245e, 0xffffffff, 0x00040003,
+	0x245f, 0xffffffff, 0x00000007,
+	0x2460, 0xffffffff, 0x00060005,
+	0x2461, 0xffffffff, 0x00090008,
+	0x2462, 0xffffffff, 0x00030002,
+	0x2463, 0xffffffff, 0x00050004,
+	0x2464, 0xffffffff, 0x00000008,
+	0x2465, 0xffffffff, 0x00070006,
+	0x2466, 0xffffffff, 0x000a0009,
+	0x2467, 0xffffffff, 0x00040003,
+	0x2468, 0xffffffff, 0x00060005,
+	0x2469, 0xffffffff, 0x00000009,
+	0x246a, 0xffffffff, 0x00080007,
+	0x246b, 0xffffffff, 0x000b000a,
+	0x246c, 0xffffffff, 0x00050004,
+	0x246d, 0xffffffff, 0x00070006,
+	0x246e, 0xffffffff, 0x0008000b,
+	0x246f, 0xffffffff, 0x000a0009,
+	0x2470, 0xffffffff, 0x000d000c,
+	0x2471, 0xffffffff, 0x00060005,
+	0x2472, 0xffffffff, 0x00080007,
+	0x2473, 0xffffffff, 0x0000000b,
+	0x2474, 0xffffffff, 0x000a0009,
+	0x2475, 0xffffffff, 0x000d000c,
+	0x2476, 0xffffffff, 0x00070006,
+	0x2477, 0xffffffff, 0x00090008,
+	0x2478, 0xffffffff, 0x0000000c,
+	0x2479, 0xffffffff, 0x000b000a,
+	0x247a, 0xffffffff, 0x000e000d,
+	0x247b, 0xffffffff, 0x00080007,
+	0x247c, 0xffffffff, 0x000a0009,
+	0x247d, 0xffffffff, 0x0000000d,
+	0x247e, 0xffffffff, 0x000c000b,
+	0x247f, 0xffffffff, 0x000f000e,
+	0x2480, 0xffffffff, 0x00090008,
+	0x2481, 0xffffffff, 0x000b000a,
+	0x2482, 0xffffffff, 0x000c000f,
+	0x2483, 0xffffffff, 0x000e000d,
+	0x2484, 0xffffffff, 0x00110010,
+	0x2485, 0xffffffff, 0x000a0009,
+	0x2486, 0xffffffff, 0x000c000b,
+	0x2487, 0xffffffff, 0x0000000f,
+	0x2488, 0xffffffff, 0x000e000d,
+	0x2489, 0xffffffff, 0x00110010,
+	0x248a, 0xffffffff, 0x000b000a,
+	0x248b, 0xffffffff, 0x000d000c,
+	0x248c, 0xffffffff, 0x00000010,
+	0x248d, 0xffffffff, 0x000f000e,
+	0x248e, 0xffffffff, 0x00120011,
+	0x248f, 0xffffffff, 0x000c000b,
+	0x2490, 0xffffffff, 0x000e000d,
+	0x2491, 0xffffffff, 0x00000011,
+	0x2492, 0xffffffff, 0x0010000f,
+	0x2493, 0xffffffff, 0x00130012,
+	0x2494, 0xffffffff, 0x000d000c,
+	0x2495, 0xffffffff, 0x000f000e,
+	0x2496, 0xffffffff, 0x00100013,
+	0x2497, 0xffffffff, 0x00120011,
+	0x2498, 0xffffffff, 0x00150014,
+	0x2499, 0xffffffff, 0x000e000d,
+	0x249a, 0xffffffff, 0x0010000f,
+	0x249b, 0xffffffff, 0x00000013,
+	0x249c, 0xffffffff, 0x00120011,
+	0x249d, 0xffffffff, 0x00150014,
+	0x249e, 0xffffffff, 0x000f000e,
+	0x249f, 0xffffffff, 0x00110010,
+	0x24a0, 0xffffffff, 0x00000014,
+	0x24a1, 0xffffffff, 0x00130012,
+	0x24a2, 0xffffffff, 0x00160015,
+	0x24a3, 0xffffffff, 0x0010000f,
+	0x24a4, 0xffffffff, 0x00120011,
+	0x24a5, 0xffffffff, 0x00000015,
+	0x24a6, 0xffffffff, 0x00140013,
+	0x24a7, 0xffffffff, 0x00170016,
+	mmCGTS_SM_CTRL_REG, 0xffffffff, 0x96940200,
+	mmCP_RB_WPTR_POLL_CNTL, 0xffffffff, 0x00900100,
+	mmRLC_GCPM_GENERAL_3, 0xffffffff, 0x00000080,
+	mmRLC_CGCG_CGLS_CTRL, 0xffffffff, 0x0020003f,
+	0x000c, 0xffffffff, 0x0000001c,
+	0x000d, 0x000f0000, 0x000f0000,
+	0x0583, 0xffffffff, 0x00000100,
+	mmXDMA_CLOCK_GATING_CNTL, 0xffffffff, 0x00000100,
+	mmXDMA_MEM_POWER_CNTL, 0x00000101, 0x00000000,
+	mmMC_MEM_POWER_LS, 0xffffffff, 0x00000104,
+	mmMC_CITF_MISC_WR_CG, 0x000c0000, 0x000c0000,
+	mmMC_CITF_MISC_RD_CG, 0x000c0000, 0x000c0000,
+	mmCGTT_DRM_CLK_CTRL0, 0xff000fff, 0x00000100,
+	0x157a, 0x00000001, 0x00000001,
+	mmHDP_MEM_POWER_LS, 0x00000001, 0x00000001,
+	mmHDP_XDP_CGTT_BLK_CTRL, 0xc0000fff, 0x00000104,
+	mmCP_MEM_SLP_CNTL, 0x00000001, 0x00000001,
+	0x3430, 0xfffffff0, 0x00000100,
+	0x3630, 0xfffffff0, 0x00000100,
+};
+
+static const uint32_t pitcairn_golden_registers[] =
+{
+	mmAZALIA_SCLK_CONTROL, 0x00000030, 0x00000011,
+	mmCB_HW_CONTROL, 0x00010000, 0x00018208,
+	mmDB_DEBUG, 0xffffffff, 0x00000000,
+	mmDB_DEBUG2, 0xf00fffff, 0x00000400,
+	mmDB_DEBUG3, 0x0002021c, 0x00020200,
+	mmDCI_CLK_CNTL, 0x00000080, 0x00000000,
+	0x340c, 0x000300c0, 0x00800040,
+	0x360c, 0x000300c0, 0x00800040,
+	mmFBC_DEBUG_COMP, 0x000000f0, 0x00000070,
+	mmFBC_MISC, 0x00200000, 0x50100000,
+	mmDIG0_HDMI_CONTROL, 0x31000311, 0x00000011,
+	mmMC_SEQ_PMG_PG_HWCNTL, 0x00073ffe, 0x000022a2,
+	mmMC_XPB_P2P_BAR_CFG, 0x000007ff, 0x00000000,
+	mmPA_CL_ENHANCE, 0xf000001f, 0x00000007,
+	mmPA_SC_FORCE_EOV_MAX_CNTS, 0xffffffff, 0x00ffffff,
+	mmPA_SC_LINE_STIPPLE_STATE, 0x0000ff0f, 0x00000000,
+	mmPA_SC_MODE_CNTL_1, 0x07ffffff, 0x4e000000,
+	mmPA_SC_RASTER_CONFIG, 0x3f3f3fff, 0x2a00126a,
+	0x000c, 0xffffffff, 0x0040,
+	0x000d, 0x00000040, 0x00004040,
+	mmSPI_CONFIG_CNTL, 0x07ffffff, 0x03000000,
+	mmSX_DEBUG_1, 0x0000007f, 0x00000020,
+	mmTA_CNTL_AUX, 0x00010000, 0x00010000,
+	mmTCP_ADDR_CONFIG, 0x000003ff, 0x000000f7,
+	mmTCP_CHAN_STEER_HI, 0xffffffff, 0x00000000,
+	mmTCP_CHAN_STEER_LO, 0xffffffff, 0x32761054,
+	mmVGT_GS_VERTEX_REUSE, 0x0000001f, 0x00000010,
+	mmVM_L2_CG, 0x000c0fc0, 0x000c0400,
+	mmVM_PRT_APERTURE0_LOW_ADDR, 0x0fffffff, 0xffffffff,
+	mmVM_PRT_APERTURE1_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+	mmVM_PRT_APERTURE2_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+	mmVM_PRT_APERTURE3_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+};
+
+static const uint32_t pitcairn_golden_rlc_registers[] =
+{
+	mmGB_ADDR_CONFIG, 0xffffffff, 0x12011003,
+	mmRLC_LB_PARAMS, 0xffffffff, 0x00601004,
+	0x311f, 0xffffffff, 0x10102020,
+	0x3122, 0xffffffff, 0x01000020,
+	mmRLC_LB_CNTR_MAX, 0xffffffff, 0x00000800,
+	mmRLC_LB_CNTL, 0xffffffff, 0x800000a4,
+};
+
+static const uint32_t pitcairn_mgcg_cgcg_init[] =
+{
+	mmRLC_CGTT_MGCG_OVERRIDE, 0xffffffff, 0xfffffffc,
+	mmGRBM_GFX_INDEX, 0xffffffff, 0xe0000000,
+	mmCB_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_BCI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_CP_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_GDS_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_IA_CLK_CTRL, 0xffffffff, 0x06000100,
+	mmCGTT_PA_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_PC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_RLC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SPI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SQ_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SQG_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL0, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL1, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL2, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL3, 0xffffffff, 0x00000100,
+	mmCGTT_TCI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_TCP_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_VGT_CLK_CTRL, 0xffffffff, 0x06000100,
+	mmDB_CGTT_CLK_CTRL_0, 0xffffffff, 0x00000100,
+	mmTA_CGTT_CTRL, 0xffffffff, 0x00000100,
+	mmTCA_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmTCC_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmTD_CGTT_CTRL, 0xffffffff, 0x00000100,
+	mmGRBM_GFX_INDEX, 0xffffffff, 0xe0000000,
+	0x2458, 0xffffffff, 0x00010000,
+	0x2459, 0xffffffff, 0x00030002,
+	0x245a, 0xffffffff, 0x00040007,
+	0x245b, 0xffffffff, 0x00060005,
+	0x245c, 0xffffffff, 0x00090008,
+	0x245d, 0xffffffff, 0x00020001,
+	0x245e, 0xffffffff, 0x00040003,
+	0x245f, 0xffffffff, 0x00000007,
+	0x2460, 0xffffffff, 0x00060005,
+	0x2461, 0xffffffff, 0x00090008,
+	0x2462, 0xffffffff, 0x00030002,
+	0x2463, 0xffffffff, 0x00050004,
+	0x2464, 0xffffffff, 0x00000008,
+	0x2465, 0xffffffff, 0x00070006,
+	0x2466, 0xffffffff, 0x000a0009,
+	0x2467, 0xffffffff, 0x00040003,
+	0x2468, 0xffffffff, 0x00060005,
+	0x2469, 0xffffffff, 0x00000009,
+	0x246a, 0xffffffff, 0x00080007,
+	0x246b, 0xffffffff, 0x000b000a,
+	0x246c, 0xffffffff, 0x00050004,
+	0x246d, 0xffffffff, 0x00070006,
+	0x246e, 0xffffffff, 0x0008000b,
+	0x246f, 0xffffffff, 0x000a0009,
+	0x2470, 0xffffffff, 0x000d000c,
+	0x2480, 0xffffffff, 0x00090008,
+	0x2481, 0xffffffff, 0x000b000a,
+	0x2482, 0xffffffff, 0x000c000f,
+	0x2483, 0xffffffff, 0x000e000d,
+	0x2484, 0xffffffff, 0x00110010,
+	0x2485, 0xffffffff, 0x000a0009,
+	0x2486, 0xffffffff, 0x000c000b,
+	0x2487, 0xffffffff, 0x0000000f,
+	0x2488, 0xffffffff, 0x000e000d,
+	0x2489, 0xffffffff, 0x00110010,
+	0x248a, 0xffffffff, 0x000b000a,
+	0x248b, 0xffffffff, 0x000d000c,
+	0x248c, 0xffffffff, 0x00000010,
+	0x248d, 0xffffffff, 0x000f000e,
+	0x248e, 0xffffffff, 0x00120011,
+	0x248f, 0xffffffff, 0x000c000b,
+	0x2490, 0xffffffff, 0x000e000d,
+	0x2491, 0xffffffff, 0x00000011,
+	0x2492, 0xffffffff, 0x0010000f,
+	0x2493, 0xffffffff, 0x00130012,
+	0x2494, 0xffffffff, 0x000d000c,
+	0x2495, 0xffffffff, 0x000f000e,
+	0x2496, 0xffffffff, 0x00100013,
+	0x2497, 0xffffffff, 0x00120011,
+	0x2498, 0xffffffff, 0x00150014,
+	mmCGTS_SM_CTRL_REG, 0xffffffff, 0x96940200,
+	mmCP_RB_WPTR_POLL_CNTL, 0xffffffff, 0x00900100,
+	mmRLC_GCPM_GENERAL_3, 0xffffffff, 0x00000080,
+	mmRLC_CGCG_CGLS_CTRL, 0xffffffff, 0x0020003f,
+	0x000c, 0xffffffff, 0x0000001c,
+	0x000d, 0x000f0000, 0x000f0000,
+	0x0583, 0xffffffff, 0x00000100,
+	mmXDMA_CLOCK_GATING_CNTL, 0xffffffff, 0x00000100,
+	mmXDMA_MEM_POWER_CNTL, 0x00000101, 0x00000000,
+	mmMC_MEM_POWER_LS, 0xffffffff, 0x00000104,
+	mmCGTT_DRM_CLK_CTRL0, 0xff000fff, 0x00000100,
+	0x157a, 0x00000001, 0x00000001,
+	mmHDP_MEM_POWER_LS, 0x00000001, 0x00000001,
+	mmHDP_XDP_CGTT_BLK_CTRL, 0xc0000fff, 0x00000104,
+	mmCP_MEM_SLP_CNTL, 0x00000001, 0x00000001,
+	0x3430, 0xfffffff0, 0x00000100,
+	0x3630, 0xfffffff0, 0x00000100,
+};
+
+static const uint32_t oland_golden_registers[] =
+{
+	mmAZALIA_SCLK_CONTROL, 0x00000030, 0x00000011,
+	mmCB_HW_CONTROL, 0x00010000, 0x00018208,
+	mmDB_DEBUG, 0xffffffff, 0x00000000,
+	mmDB_DEBUG2, 0xf00fffff, 0x00000400,
+	mmDB_DEBUG3, 0x0002021c, 0x00020200,
+	mmDCI_CLK_CNTL, 0x00000080, 0x00000000,
+	0x340c, 0x000300c0, 0x00800040,
+	0x360c, 0x000300c0, 0x00800040,
+	mmFBC_DEBUG_COMP, 0x000000f0, 0x00000070,
+	mmFBC_MISC, 0x00200000, 0x50100000,
+	mmDIG0_HDMI_CONTROL, 0x31000311, 0x00000011,
+	mmMC_SEQ_PMG_PG_HWCNTL, 0x00073ffe, 0x000022a2,
+	mmMC_XPB_P2P_BAR_CFG, 0x000007ff, 0x00000000,
+	mmPA_CL_ENHANCE, 0xf000001f, 0x00000007,
+	mmPA_SC_FORCE_EOV_MAX_CNTS, 0xffffffff, 0x00ffffff,
+	mmPA_SC_LINE_STIPPLE_STATE, 0x0000ff0f, 0x00000000,
+	mmPA_SC_MODE_CNTL_1, 0x07ffffff, 0x4e000000,
+	mmPA_SC_RASTER_CONFIG, 0x3f3f3fff, 0x00000082,
+	0x000c, 0xffffffff, 0x0040,
+	0x000d, 0x00000040, 0x00004040,
+	mmSPI_CONFIG_CNTL, 0x07ffffff, 0x03000000,
+	mmSX_DEBUG_1, 0x0000007f, 0x00000020,
+	mmTA_CNTL_AUX, 0x00010000, 0x00010000,
+	mmTCP_ADDR_CONFIG, 0x000003ff, 0x000000f3,
+	mmTCP_CHAN_STEER_HI, 0xffffffff, 0x00000000,
+	mmTCP_CHAN_STEER_LO, 0xffffffff, 0x00003210,
+	mmVGT_GS_VERTEX_REUSE, 0x0000001f, 0x00000010,
+	mmVM_L2_CG, 0x000c0fc0, 0x000c0400,
+	mmVM_PRT_APERTURE0_LOW_ADDR, 0x0fffffff, 0xffffffff,
+	mmVM_PRT_APERTURE1_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+	mmVM_PRT_APERTURE2_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+	mmVM_PRT_APERTURE3_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+
+};
+
+static const uint32_t oland_golden_rlc_registers[] =
+{
+	mmGB_ADDR_CONFIG, 0xffffffff, 0x02010002,
+	mmRLC_LB_PARAMS, 0xffffffff, 0x00601005,
+	0x311f, 0xffffffff, 0x10104040,
+	0x3122, 0xffffffff, 0x0100000a,
+	mmRLC_LB_CNTR_MAX, 0xffffffff, 0x00000800,
+	mmRLC_LB_CNTL, 0xffffffff, 0x800000f4,
+};
+
+static const uint32_t oland_mgcg_cgcg_init[] =
+{
+	mmRLC_CGTT_MGCG_OVERRIDE, 0xffffffff, 0xfffffffc,
+	mmGRBM_GFX_INDEX, 0xffffffff, 0xe0000000,
+	mmCB_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_BCI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_CP_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_GDS_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_IA_CLK_CTRL, 0xffffffff, 0x06000100,
+	mmCGTT_PA_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_PC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_RLC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SPI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SQ_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SQG_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL0, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL1, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL2, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL3, 0xffffffff, 0x00000100,
+	mmCGTT_TCI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_TCP_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_VGT_CLK_CTRL, 0xffffffff, 0x06000100,
+	mmDB_CGTT_CLK_CTRL_0, 0xffffffff, 0x00000100,
+	mmTA_CGTT_CTRL, 0xffffffff, 0x00000100,
+	mmTCA_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmTCC_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmTD_CGTT_CTRL, 0xffffffff, 0x00000100,
+	mmGRBM_GFX_INDEX, 0xffffffff, 0xe0000000,
+	0x2458, 0xffffffff, 0x00010000,
+	0x2459, 0xffffffff, 0x00030002,
+	0x245a, 0xffffffff, 0x00040007,
+	0x245b, 0xffffffff, 0x00060005,
+	0x245c, 0xffffffff, 0x00090008,
+	0x245d, 0xffffffff, 0x00020001,
+	0x245e, 0xffffffff, 0x00040003,
+	0x245f, 0xffffffff, 0x00000007,
+	0x2460, 0xffffffff, 0x00060005,
+	0x2461, 0xffffffff, 0x00090008,
+	0x2462, 0xffffffff, 0x00030002,
+	0x2463, 0xffffffff, 0x00050004,
+	0x2464, 0xffffffff, 0x00000008,
+	0x2465, 0xffffffff, 0x00070006,
+	0x2466, 0xffffffff, 0x000a0009,
+	0x2467, 0xffffffff, 0x00040003,
+	0x2468, 0xffffffff, 0x00060005,
+	0x2469, 0xffffffff, 0x00000009,
+	0x246a, 0xffffffff, 0x00080007,
+	0x246b, 0xffffffff, 0x000b000a,
+	0x246c, 0xffffffff, 0x00050004,
+	0x246d, 0xffffffff, 0x00070006,
+	0x246e, 0xffffffff, 0x0008000b,
+	0x246f, 0xffffffff, 0x000a0009,
+	0x2470, 0xffffffff, 0x000d000c,
+	0x2471, 0xffffffff, 0x00060005,
+	0x2472, 0xffffffff, 0x00080007,
+	0x2473, 0xffffffff, 0x0000000b,
+	0x2474, 0xffffffff, 0x000a0009,
+	0x2475, 0xffffffff, 0x000d000c,
+	mmCGTS_SM_CTRL_REG, 0xffffffff, 0x96940200,
+	mmCP_RB_WPTR_POLL_CNTL, 0xffffffff, 0x00900100,
+	mmRLC_GCPM_GENERAL_3, 0xffffffff, 0x00000080,
+	mmRLC_CGCG_CGLS_CTRL, 0xffffffff, 0x0020003f,
+	0x000c, 0xffffffff, 0x0000001c,
+	0x000d, 0x000f0000, 0x000f0000,
+	0x0583, 0xffffffff, 0x00000100,
+	mmXDMA_CLOCK_GATING_CNTL, 0xffffffff, 0x00000100,
+	mmXDMA_MEM_POWER_CNTL, 0x00000101, 0x00000000,
+	mmMC_MEM_POWER_LS, 0xffffffff, 0x00000104,
+	mmMC_CITF_MISC_WR_CG, 0x000c0000, 0x000c0000,
+	mmMC_CITF_MISC_RD_CG, 0x000c0000, 0x000c0000,
+	mmCGTT_DRM_CLK_CTRL0, 0xff000fff, 0x00000100,
+	0x157a, 0x00000001, 0x00000001,
+	mmHDP_MEM_POWER_LS, 0x00000001, 0x00000001,
+	mmHDP_XDP_CGTT_BLK_CTRL, 0xc0000fff, 0x00000104,
+	mmCP_MEM_SLP_CNTL, 0x00000001, 0x00000001,
+	0x3430, 0xfffffff0, 0x00000100,
+	0x3630, 0xfffffff0, 0x00000100,
+};
+
+static const uint32_t hainan_golden_registers[] =
+{
+	0x17bc, 0x00000030, 0x00000011,
+	mmCB_HW_CONTROL, 0x00010000, 0x00018208,
+	mmDB_DEBUG, 0xffffffff, 0x00000000,
+	mmDB_DEBUG2, 0xf00fffff, 0x00000400,
+	mmDB_DEBUG3, 0x0002021c, 0x00020200,
+	0x031e, 0x00000080, 0x00000000,
+	0x3430, 0xff000fff, 0x00000100,
+	0x340c, 0x000300c0, 0x00800040,
+	0x3630, 0xff000fff, 0x00000100,
+	0x360c, 0x000300c0, 0x00800040,
+	0x16ec, 0x000000f0, 0x00000070,
+	0x16f0, 0x00200000, 0x50100000,
+	0x1c0c, 0x31000311, 0x00000011,
+	mmMC_SEQ_PMG_PG_HWCNTL, 0x00073ffe, 0x000022a2,
+	mmMC_XPB_P2P_BAR_CFG, 0x000007ff, 0x00000000,
+	mmPA_CL_ENHANCE, 0xf000001f, 0x00000007,
+	mmPA_SC_FORCE_EOV_MAX_CNTS, 0xffffffff, 0x00ffffff,
+	mmPA_SC_LINE_STIPPLE_STATE, 0x0000ff0f, 0x00000000,
+	mmPA_SC_MODE_CNTL_1, 0x07ffffff, 0x4e000000,
+	mmPA_SC_RASTER_CONFIG, 0x3f3f3fff, 0x00000000,
+	0x000c, 0xffffffff, 0x0040,
+	0x000d, 0x00000040, 0x00004040,
+	mmSPI_CONFIG_CNTL, 0x03e00000, 0x03600000,
+	mmSX_DEBUG_1, 0x0000007f, 0x00000020,
+	mmTA_CNTL_AUX, 0x00010000, 0x00010000,
+	mmTCP_ADDR_CONFIG, 0x000003ff, 0x000000f1,
+	mmTCP_CHAN_STEER_HI, 0xffffffff, 0x00000000,
+	mmTCP_CHAN_STEER_LO, 0xffffffff, 0x00003210,
+	mmVGT_GS_VERTEX_REUSE, 0x0000001f, 0x00000010,
+	mmVM_L2_CG, 0x000c0fc0, 0x000c0400,
+	mmVM_PRT_APERTURE0_LOW_ADDR, 0x0fffffff, 0xffffffff,
+	mmVM_PRT_APERTURE1_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+	mmVM_PRT_APERTURE2_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+	mmVM_PRT_APERTURE3_LOW_ADDR, 0x0fffffff, 0x0fffffff,
+};
+
+static const uint32_t hainan_golden_registers2[] =
+{
+	mmGB_ADDR_CONFIG, 0xffffffff, 0x2011003,
+};
+
+static const uint32_t hainan_mgcg_cgcg_init[] =
+{
+	mmRLC_CGTT_MGCG_OVERRIDE, 0xffffffff, 0xfffffffc,
+	mmGRBM_GFX_INDEX, 0xffffffff, 0xe0000000,
+	mmCB_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_BCI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_CP_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_GDS_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_IA_CLK_CTRL, 0xffffffff, 0x06000100,
+	mmCGTT_PA_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_PC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_RLC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SC_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SPI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SQ_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SQG_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL0, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL1, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL2, 0xffffffff, 0x00000100,
+	mmCGTT_SX_CLK_CTRL3, 0xffffffff, 0x00000100,
+	mmCGTT_TCI_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_TCP_CLK_CTRL, 0xffffffff, 0x00000100,
+	mmCGTT_VGT_CLK_CTRL, 0xffffffff, 0x06000100,
+	mmDB_CGTT_CLK_CTRL_0, 0xffffffff, 0x00000100,
+	mmTA_CGTT_CTRL, 0xffffffff, 0x00000100,
+	mmTCA_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmTCC_CGTT_SCLK_CTRL, 0xffffffff, 0x00000100,
+	mmTD_CGTT_CTRL, 0xffffffff, 0x00000100,
+	mmGRBM_GFX_INDEX, 0xffffffff, 0xe0000000,
+	0x2458, 0xffffffff, 0x00010000,
+	0x2459, 0xffffffff, 0x00030002,
+	0x245a, 0xffffffff, 0x00040007,
+	0x245b, 0xffffffff, 0x00060005,
+	0x245c, 0xffffffff, 0x00090008,
+	0x245d, 0xffffffff, 0x00020001,
+	0x245e, 0xffffffff, 0x00040003,
+	0x245f, 0xffffffff, 0x00000007,
+	0x2460, 0xffffffff, 0x00060005,
+	0x2461, 0xffffffff, 0x00090008,
+	0x2462, 0xffffffff, 0x00030002,
+	0x2463, 0xffffffff, 0x00050004,
+	0x2464, 0xffffffff, 0x00000008,
+	0x2465, 0xffffffff, 0x00070006,
+	0x2466, 0xffffffff, 0x000a0009,
+	0x2467, 0xffffffff, 0x00040003,
+	0x2468, 0xffffffff, 0x00060005,
+	0x2469, 0xffffffff, 0x00000009,
+	0x246a, 0xffffffff, 0x00080007,
+	0x246b, 0xffffffff, 0x000b000a,
+	0x246c, 0xffffffff, 0x00050004,
+	0x246d, 0xffffffff, 0x00070006,
+	0x246e, 0xffffffff, 0x0008000b,
+	0x246f, 0xffffffff, 0x000a0009,
+	0x2470, 0xffffffff, 0x000d000c,
+	0x2471, 0xffffffff, 0x00060005,
+	0x2472, 0xffffffff, 0x00080007,
+	0x2473, 0xffffffff, 0x0000000b,
+	0x2474, 0xffffffff, 0x000a0009,
+	0x2475, 0xffffffff, 0x000d000c,
+	mmCGTS_SM_CTRL_REG, 0xffffffff, 0x96940200,
+	mmCP_RB_WPTR_POLL_CNTL, 0xffffffff, 0x00900100,
+	mmRLC_GCPM_GENERAL_3, 0xffffffff, 0x00000080,
+	mmRLC_CGCG_CGLS_CTRL, 0xffffffff, 0x0020003f,
+	0x000c, 0xffffffff, 0x0000001c,
+	0x000d, 0x000f0000, 0x000f0000,
+	0x0583, 0xffffffff, 0x00000100,
+	0x0409, 0xffffffff, 0x00000100,
+	mmMC_MEM_POWER_LS, 0xffffffff, 0x00000104,
+	mmMC_CITF_MISC_WR_CG, 0x000c0000, 0x000c0000,
+	mmMC_CITF_MISC_RD_CG, 0x000c0000, 0x000c0000,
+	mmHDP_MEM_POWER_LS, 0x00000001, 0x00000001,
+	mmHDP_XDP_CGTT_BLK_CTRL, 0xc0000fff, 0x00000104,
+	mmCP_MEM_SLP_CNTL, 0x00000001, 0x00000001,
+	0x3430, 0xfffffff0, 0x00000100,
+	0x3630, 0xfffffff0, 0x00000100,
+};
+
 /* --- si_init_golden_registers ---------------------------------------------- */
 
 /*
@@ -461,8 +1049,48 @@ static int si_init_golden_registers(struct frb_device *adev)
 			 c, (uint32_t)ARRAY_SIZE(verde_mgcg_cgcg_init) / 3,
 			 d, (uint32_t)ARRAY_SIZE(verde_pg_init) / 3);
 		return 0;
+	case CHIP_TAHITI:
+		/* amdgpu's order: golden, rlc, mgcg/cgcg, golden2 */
+		a = si_program_and_count(adev, tahiti_golden_registers, ARRAY_SIZE(tahiti_golden_registers));
+		b = si_program_and_count(adev, tahiti_golden_rlc_registers, ARRAY_SIZE(tahiti_golden_rlc_registers));
+		c = si_program_and_count(adev, tahiti_mgcg_cgcg_init, ARRAY_SIZE(tahiti_mgcg_cgcg_init));
+		d = si_program_and_count(adev, tahiti_golden_registers2, ARRAY_SIZE(tahiti_golden_registers2));
+		frb_info(adev, "si: Tahiti golden registers %u of %u, rlc %u of %u, mgcg/cgcg %u of %u, golden2 %u of %u "
+			 "read back as written", a, (uint32_t)ARRAY_SIZE(tahiti_golden_registers) / 3,
+			 b, (uint32_t)ARRAY_SIZE(tahiti_golden_rlc_registers) / 3,
+			 c, (uint32_t)ARRAY_SIZE(tahiti_mgcg_cgcg_init) / 3,
+			 d, (uint32_t)ARRAY_SIZE(tahiti_golden_registers2) / 3);
+		return 0;
+	case CHIP_PITCAIRN:
+		a = si_program_and_count(adev, pitcairn_golden_registers, ARRAY_SIZE(pitcairn_golden_registers));
+		b = si_program_and_count(adev, pitcairn_golden_rlc_registers, ARRAY_SIZE(pitcairn_golden_rlc_registers));
+		c = si_program_and_count(adev, pitcairn_mgcg_cgcg_init, ARRAY_SIZE(pitcairn_mgcg_cgcg_init));
+		frb_info(adev, "si: Pitcairn golden registers %u of %u, rlc %u of %u, mgcg/cgcg %u of %u "
+			 "read back as written", a, (uint32_t)ARRAY_SIZE(pitcairn_golden_registers) / 3,
+			 b, (uint32_t)ARRAY_SIZE(pitcairn_golden_rlc_registers) / 3,
+			 c, (uint32_t)ARRAY_SIZE(pitcairn_mgcg_cgcg_init) / 3);
+		return 0;
+	case CHIP_OLAND:
+		a = si_program_and_count(adev, oland_golden_registers, ARRAY_SIZE(oland_golden_registers));
+		b = si_program_and_count(adev, oland_golden_rlc_registers, ARRAY_SIZE(oland_golden_rlc_registers));
+		c = si_program_and_count(adev, oland_mgcg_cgcg_init, ARRAY_SIZE(oland_mgcg_cgcg_init));
+		frb_info(adev, "si: Oland golden registers %u of %u, rlc %u of %u, mgcg/cgcg %u of %u "
+			 "read back as written", a, (uint32_t)ARRAY_SIZE(oland_golden_registers) / 3,
+			 b, (uint32_t)ARRAY_SIZE(oland_golden_rlc_registers) / 3,
+			 c, (uint32_t)ARRAY_SIZE(oland_mgcg_cgcg_init) / 3);
+		return 0;
+	case CHIP_HAINAN:
+		/* amdgpu's order: golden, golden2, mgcg/cgcg */
+		a = si_program_and_count(adev, hainan_golden_registers, ARRAY_SIZE(hainan_golden_registers));
+		b = si_program_and_count(adev, hainan_golden_registers2, ARRAY_SIZE(hainan_golden_registers2));
+		c = si_program_and_count(adev, hainan_mgcg_cgcg_init, ARRAY_SIZE(hainan_mgcg_cgcg_init));
+		frb_info(adev, "si: Hainan golden registers %u of %u, golden2 %u of %u, mgcg/cgcg %u of %u "
+			 "read back as written", a, (uint32_t)ARRAY_SIZE(hainan_golden_registers) / 3,
+			 b, (uint32_t)ARRAY_SIZE(hainan_golden_registers2) / 3,
+			 c, (uint32_t)ARRAY_SIZE(hainan_mgcg_cgcg_init) / 3);
+		return 0;
 	default:
-		frb_err(adev, "si: no golden registers for this chip here (only Verde has a row)");
+		frb_err(adev, "si: no golden registers for this chip");
 		return -ENODEV;
 	}
 }
@@ -618,7 +1246,9 @@ static int si_asic_reset(struct frb_device *adev)
 
 /* --- gfx_v6_0_constants_init's address configuration ------------------------ */
 
-#define VERDE_GB_ADDR_CONFIG_GOLDEN	0x12010002	/* gfx_v6_0.c */
+#define TAHITI_GB_ADDR_CONFIG_GOLDEN	0x12011003	/* gfx_v6_0.c */
+#define VERDE_GB_ADDR_CONFIG_GOLDEN	0x12010002
+#define HAINAN_GB_ADDR_CONFIG_GOLDEN	0x02010001
 
 /*
  * How addresses interleave across pipes, banks and rows: GB_ADDR_CONFIG for
@@ -633,14 +1263,29 @@ static int si_asic_reset(struct frb_device *adev)
  */
 int frb_si_gfx_addr_config(struct frb_device *adev)
 {
-	uint32_t gb_addr_config, mc_arb_ramcfg, tmp, row_kb, before[4];
+	uint32_t gb_addr_config, mc_arb_ramcfg, tmp, row_kb, before[4], max_se;
 
+	/* gfx_v6_0_constants_init: the golden value and max_shader_engines (2 on Tahiti and Pitcairn) */
 	switch (adev->asic_type) {
 	case CHIP_VERDE:
 		gb_addr_config = VERDE_GB_ADDR_CONFIG_GOLDEN;
+		max_se = 1;
+		break;
+	case CHIP_TAHITI:
+	case CHIP_PITCAIRN:
+		gb_addr_config = TAHITI_GB_ADDR_CONFIG_GOLDEN;
+		max_se = 2;
+		break;
+	case CHIP_OLAND:
+		gb_addr_config = VERDE_GB_ADDR_CONFIG_GOLDEN;
+		max_se = 1;
+		break;
+	case CHIP_HAINAN:
+		gb_addr_config = HAINAN_GB_ADDR_CONFIG_GOLDEN;
+		max_se = 1;
 		break;
 	default:
-		frb_err(adev, "si: no address configuration for this chip here (only Verde has a row)");
+		frb_err(adev, "si: no address configuration for this chip");
 		return -ENODEV;
 	}
 	before[0] = RREG32(mmGB_ADDR_CONFIG);
@@ -666,8 +1311,10 @@ int frb_si_gfx_addr_config(struct frb_device *adev)
 		gb_addr_config |= 2 << GB_ADDR_CONFIG__ROW_SIZE__SHIFT;
 		break;
 	}
-	/* max_shader_engines 1 on Verde: NUM_SHADER_ENGINES stays 0 */
+	/* max_shader_engines 1 on Verde, Oland and Hainan: NUM_SHADER_ENGINES stays 0 */
 	gb_addr_config &= ~GB_ADDR_CONFIG__NUM_SHADER_ENGINES_MASK;
+	if (max_se == 2)
+		gb_addr_config |= 1 << GB_ADDR_CONFIG__NUM_SHADER_ENGINES__SHIFT;
 
 	WREG32(mmGB_ADDR_CONFIG, gb_addr_config);
 	WREG32(mmDMIF_ADDR_CONFIG, gb_addr_config);

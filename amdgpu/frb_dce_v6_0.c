@@ -204,6 +204,10 @@ static int dce_v6_0_hw_init(struct frb_device *adev, struct frb_display *d)
 		d->num_hpd = 2;
 		d->num_dig = 2;
 		break;
+	case CHIP_HAINAN:
+		/* si_set_ip_blocks adds no display block on Hainan: nothing here to touch */
+		frb_err(adev, "dce: Hainan has no display engine");
+		return -ENODEV;
 	default:
 		return -EINVAL;
 	}

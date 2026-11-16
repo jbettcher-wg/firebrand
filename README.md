@@ -33,7 +33,7 @@ ones marked *this release* ran the driver and OpenGL bundle in this repository a
 
 | Family | Verified card | Verified on hardware | Last run |
 |---|---|---|---|
-| **Southern Islands** (GCN 1) | Radeon R7 450 | The display over DisplayPort (up to 3840x2160 at 60 Hz), 2D, Quartz Extreme, Core Image, OpenGL 4.5, power management, DisplayPort audio, H.264 decoding (UVD 3.1, 12 test streams bit-exact) | 2026-11-15, with the driver of that day. Since then the driver changed outside Southern Islands (Sea Islands, the untested-card policy) and in how it names microcode files (the same files for this card), checked by the host tests; the card was not fitted for this release's run. |
+| **Southern Islands** (GCN 1) | Radeon R7 450 | The display over DisplayPort (up to 3840x2160 at 60 Hz), 2D, Quartz Extreme, Core Image, OpenGL 4.5, power management, DisplayPort audio, H.264 decoding (UVD 3.1, 12 test streams bit-exact) | 2026-11-15, with the driver of that day. Since then the driver changed outside Southern Islands (Sea Islands, the untested-card policy) and, within it, only for the other chips: Cape Verde's tables and microcode files are the same, checked by the host tests. The card was not fitted for this release's run. |
 | **Sea Islands** (GCN 2) | FirePro W8100 | The display over DisplayPort (the desktop at 2560x1440, a 3840x2160 at 60 Hz link), 2D, Quartz Extreme, Core Image, OpenGL 4.5, power management (clocks follow the load, fan control), DisplayPort audio, H.264 decoding (UVD 4.2, 12 streams bit-exact) | 2026-11-15, *this release* |
 | **Polaris** (GCN 4) | Radeon RX 550 | 2D, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 6.3, 12 streams bit-exact), power management (214-1183 MHz under load) | 2026-11-15, *this release*, without a monitor. The display over DisplayPort at up to 3840x2160 at 60 Hz, hot-plug and DisplayPort audio: 2026-11-14. |
 | | Embedded Radeon E9173 | The display over its three DisplayPort outputs, 2D, Quartz Extreme, Core Image, OpenGL 3.3, H.264 decoding (UVD 6.3), power management, DisplayPort audio | 2026-11-14 |
@@ -70,13 +70,13 @@ which those families start before the display (as on their verified cards); Sout
 and Polaris cards stay at their boot clocks.
 
 Today a picture comes up on cards with the same chip as a verified card (Cape Verde, Hawaii,
-Polaris 12 and Vega 20). Polaris 10 and 11 (the RX 460 to 580 generation and its Pro and
-embedded relatives) and the kicker revisions of Polaris 12 and Hawaii have their microcode
-carried and their display path complete, but have not been run on hardware: no card of these
-chips has been tried yet. Unlocked, Polaris 10 and 11 stop at the graphics stage, which is
-ported for Polaris 12 only. Tahiti, Pitcairn, Oland and Bonaire have their microcode carried
-too, but stop before the display until their golden register tables are ported. Hainan has no
-display engine, and Vega M is only ever part of Intel's Kaby Lake G packages.
+Polaris 12 and Vega 20). Tahiti, Pitcairn and Oland (Southern Islands), Bonaire (Sea Islands),
+Polaris 10 and 11 (the RX 460 to 580 generation and its Pro and embedded relatives) and the
+kicker revisions of Polaris 12 and Hawaii have their microcode carried and their display path
+complete, ported from amdgpu, but have not been run on hardware: no card of these chips has
+been tried yet. Unlocked, Polaris 10 and 11 stop at the graphics stage, which is ported for
+Polaris 12 only. Hainan has no display engine, and Vega M is only ever part of Intel's Kaby
+Lake G packages.
 
 Vega 10 and Vega 12 (RX Vega 56 and 64, Vega Frontier Edition, Radeon Pro Vega) are only
 identified: Firebrand has no port for them yet and writes nothing to the card.
@@ -367,8 +367,6 @@ font installed.
 
 - **Reports from untested cards:** each card that works gets its own verified row, and with
   it the full driver by default.
-- **The display path for Tahiti, Pitcairn, Oland and Bonaire** (their golden register tables),
-  so those untested cards show a picture too; their microcode is already carried.
 - **Installer:** a flat `.pkg` with checks before it installs anything, an uninstaller, and
   RadeonNI handled where it is installed.
 - **Power Mac G5:** the DMA side is done (addresses through IOKit, so the DART translates them);
@@ -376,7 +374,8 @@ font installed.
   screen from power-on.
 - **Video:** more than one picture in flight, for 1080p60; video encoding (VCE).
 - **Vega 10 and Vega 12:** their own register bases, PSP and power management, beside Vega 20's.
-- **More Polaris cards:** the RX 570 (Polaris 10) and other makers' boards.
+- **More Polaris cards:** acceleration for Polaris 10 and 11 (their display path is done), first
+  on an RX 570; other makers' boards.
 - **Vulkan:** Mesa's RADV on a new Firebrand kernel interface (per-program GPU address spaces,
   command submission with buffer lists, sync objects), with a Vulkan loader and window-system
   integration for Leopard; then Zink, OpenGL 4.6 over Vulkan.
