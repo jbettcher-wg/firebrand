@@ -5,10 +5,10 @@
 Firebrand is a graphics driver for AMD Radeon cards on Mac OS X 10.5 Leopard on PowerPC.
 It brings four generations of GCN cards to Leopard: Southern Islands (GCN 1), Sea Islands
 (GCN 2), Polaris (GCN 4) and Vega 20 (GCN 5); [Status](#status) says what has been verified
-on each. On a verified card: the desktop over DisplayPort at up to 3840x2160 at 60 Hz, Quartz
-Extreme and Core Image on the GPU, OpenGL through Mesa's radeonsi driver (up to OpenGL 4.6),
-hardware H.264 decoding, DisplayPort audio and power management. Every other card of these
-families loads too, display-only until you unlock it
+on each. On a verified card: the desktop over DisplayPort at up to 3840x2160 at 60 Hz or over
+HDMI, Quartz Extreme and Core Image on the GPU, OpenGL through Mesa's radeonsi driver (up to
+OpenGL 4.6), hardware H.264 decoding, DisplayPort audio and power management. Every other
+card of these families loads too, display-only until you unlock it
 ([Your card isn't listed as verified?](#your-card-isnt-listed-as-verified)).
 
 [![Mac OS X 10.5.8 on a 24-thread NXP T4240 with an AMD Instinct MI50 under Firebrand, with Firebrand Monitor on the right](art/desktop-mi50.jpg)](art/desktop-mi50.jpg)
@@ -40,10 +40,12 @@ ones marked *this release* ran the driver and OpenGL bundle in this repository a
 | **Southern Islands** (GCN 1) | Radeon R7 450 | The display over DisplayPort (up to 3840x2160 at 60 Hz), 2D, Quartz Extreme, Core Image, OpenGL 4.5, power management, DisplayPort audio, H.264 decoding (UVD 3.1, 12 test streams bit-exact) | 2026-11-15, with the driver of that day. Since then the driver changed outside Southern Islands (Sea Islands, the untested-card policy) and, within it, only for the other chips: Cape Verde's tables and microcode files are the same, checked by the host tests. The card was not fitted for this release's run. |
 | **Sea Islands** (GCN 2) | FirePro W8100 | The display over DisplayPort (the desktop at 2560x1440, a 3840x2160 at 60 Hz link), 2D, Quartz Extreme, Core Image, OpenGL 4.5, power management (clocks follow the load, fan control), DisplayPort audio, H.264 decoding (UVD 4.2, 12 streams bit-exact) | 2026-11-15, *this release* |
 | **Polaris** (GCN 4) | Radeon RX 550 | 2D, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 6.3, 12 streams bit-exact), power management (214-1183 MHz under load) | 2026-11-15, *this release*, without a monitor. The display over DisplayPort at up to 3840x2160 at 60 Hz, hot-plug and DisplayPort audio: 2026-11-14. |
+| | Radeon RX 570 | The display over HDMI (2560x1440 at 60 Hz, modes from the monitor's EDID and its CEA extension), 2D, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 6.3, 12 streams bit-exact, about 92 pictures/s at 1080p), power management (clocks follow the load: 1244 MHz engine and 1750 MHz memory clock under load, 300 and 300 MHz idle) | 2026-11-19, *this release* |
 | | Embedded Radeon E9173 | The display over its three DisplayPort outputs, 2D, Quartz Extreme, Core Image, OpenGL 3.3, H.264 decoding (UVD 6.3), power management, DisplayPort audio | 2026-11-14 |
 | **Vega 20** (GCN 5) | Instinct MI50 | The display over DisplayPort, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 7), power management and clock gating, DisplayPort audio | 2026-11-15, with the driver of that afternoon; its Vega 20 code is unchanged since and passes the register-trace replays against Linux on both byte orders. The DMA engine occasionally stalls on its first frame after a start; the driver detects that and recovers it by itself (about 35 ms). |
 
-Not yet, on any family: HDMI and DVI on a monitor (implemented, not tried), video encoding
+Not yet, on any family: DVI on a monitor (implemented, not tried; HDMI is verified on the RX
+570 only), HDMI audio, video encoding
 (VCE), 1080p60 decoding in real time (1080p30 and 720p60 play without dropped frames),
 interrupts (the driver polls), compute queues.
 
@@ -57,6 +59,7 @@ bring-up goes):
 | AMD Radeon R7 450 (Dell, 4 GB, DP + DP + DVI) | Cape Verde (Southern Islands) | `1002:682b` rev `87`, subsystem `1028:1004` |
 | AMD FirePro W8100 (Dell, 8 GB, 4x DP) | Hawaii (Sea Islands) | `1002:67a1` rev `00`, subsystem `1028:030c` |
 | AMD Radeon RX 550 (4 GB, DP + HDMI + DVI) | Polaris 12 | `1002:699f` rev `c7`, subsystem `1002:0b04` |
+| Sapphire Radeon RX 570 (8 GB, 2x DP + 2x HDMI + DVI) | Polaris 20 (Polaris 10 to amdgpu) | `1002:67df` rev `ef`, subsystem `1da2:e366` |
 | AMD Embedded Radeon E9173 (2 GB, 3x DP) | Polaris 12 | `1002:699f` rev `81`, subsystem `1002:ea73` |
 | AMD Instinct MI50 (16 GB HBM2, mini-DP, Radeon Pro VII firmware) | Vega 20 | `1002:66a1` rev `06`, subsystem `1002:081e` |
 
@@ -117,8 +120,11 @@ says otherwise.
   60 Hz, with modes from the monitor's EDID. A monitor can be plugged into any port at any
   time (hot-plug). Hardware cursor, display sleep, 32, 16 and 8 bits per pixel. With no monitor
   the framebuffer still runs (headless). There is a boot screen with the Firebrand logo.
-  HDMI and DVI are implemented but have not been tried on a monitor yet.
-- **Quartz Extreme and Core Image** on the GPU.
+  HDMI works (RX 570: 2560x1440 at 60 Hz, modes from the EDID's CEA extension block too);
+  DVI is implemented but has not been tried on a monitor yet.
+- **Quartz Extreme and Core Image** on the GPU, at any monitor resolution. (Until 2026-11-19
+  a monitor of 2560x1440 or less got the window server compositing on the CPU: it counts the
+  driver's video memory range, which held only the screen, against a 16 MB minimum.)
 - **OpenGL** through Mesa's radeonsi driver (`RadeonNIGLDriver.bundle`), for 32- and 64-bit
   programs: OpenGL 2.1 for ordinary programs (Leopard's OpenGL framework stops at 2.1),
   OpenGL 3.3 core profile for programs that choose its renderer (ID `0x00021a01`), and through
@@ -144,7 +150,7 @@ unloading the driver after the window server has opened it (restart instead).
 
 - Mac OS X **10.5.8** on PowerPC, with a PCI Express slot. See the status note above for which
   machines that currently means.
-- A supported card and a DisplayPort monitor.
+- A supported card and a DisplayPort or HDMI monitor.
 - To build: a Linux or macOS machine for the OpenGL bundle and the firmware, and Xcode 3.1
   on the Mac for the kexts (see [Building](#building)).
 
@@ -179,13 +185,21 @@ and `frbctl` into `/usr/local/bin`. Each kext is checked with `kextload -nt` (wh
 nothing) before anything is replaced. An OpenGL bundle or 2D plug-in from another driver
 (RadeonNI uses the same names) is saved first and put back by the uninstaller.
 
-Then shut down, put the AMD card in, connect a **DisplayPort** monitor and start the Mac.
+Then shut down, put the AMD card in, connect a **DisplayPort** or **HDMI** monitor and start
+the Mac.
 There is **no picture until the driver starts**: PC graphics cards have no Open Firmware
 driver, so the grey boot screen does not appear. Once Firebrand starts, its boot screen
 appears, then the login window.
 
 To check: `frbctl info` (the card, the bring-up stage, video memory) and System Profiler >
 Graphics/Displays ("Quartz Extreme: Supported", "Core Image: Hardware Accelerated").
+
+**System Profiler and cards over 2 GB.** Leopard's System Profiler cannot show more than
+2047 MB of video memory: it reads the size as a signed 32-bit number, whatever the driver
+publishes. `frbctl info` shows the real size, and `sudo ./patch-system-profiler-vram.sh` (in the
+same folder) makes System Profiler show it too, by teaching it to read the size in MB that
+Firebrand publishes beside the capped one. It only patches Apple's 10.5.8 file, refuses
+anything else, keeps the original, and `--restore` puts it back.
 
 **If the screen stays dark**
 
@@ -376,7 +390,7 @@ which do not cover all of them. The Mesa patches do the same for radeonsi.
 | `kexts/HDAudio/` | the HD Audio driver for the card's DisplayPort audio |
 | `radeonni/` | the userland: the OpenGL bundle and the Mesa patches, the 2D plug-in, the video library ([radeonni/README.md](radeonni/README.md)) |
 | `tools/` | `frbctl`; `frb_status.c`, the status reading `frbctl report` and Firebrand Monitor share; `FirebrandMonitor/`, the app; `mk-splash-logo.py`, which makes the boot logo header from `art/C-chip.svg` |
-| `scripts/` | `fetch-firmware.sh`, `build-mac.sh`, `build-remote.sh`, `install.sh`, `uninstall.sh` |
+| `scripts/` | `fetch-firmware.sh`, `build-mac.sh`, `build-remote.sh`, `install.sh`, `uninstall.sh`, `patch-system-profiler-vram.sh` |
 | `art/` | the logo |
 
 The boot logo header (`shared/frb_splash_logo.h`) is committed, so a build needs no image
@@ -395,8 +409,8 @@ font installed.
   screen from power-on.
 - **Video:** more than one picture in flight, for 1080p60; video encoding (VCE).
 - **Vega 10 and Vega 12:** their own register bases, PSP and power management, beside Vega 20's.
-- **More Polaris cards:** acceleration for Polaris 10 and 11 (their display path is done), first
-  on an RX 570; other makers' boards.
+- **More Polaris cards:** acceleration for Polaris 11 (its display path is done; Polaris 10
+  runs fully on an RX 570); other makers' boards.
 - **Vulkan:** Mesa's RADV on a new Firebrand kernel interface (per-program GPU address spaces,
   command submission with buffer lists, sync objects), with a Vulkan loader and window-system
   integration for Leopard; then Zink, OpenGL 4.6 over Vulkan.

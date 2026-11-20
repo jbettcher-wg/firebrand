@@ -34,8 +34,16 @@
 #define EDID_BLOCK		128
 
 /* amdgpu_atombios_i2c_process_i2c_ch */
+/*
+ * read_reg: where a read starts. ProcessI2cChannelTransaction's read sends
+ * ucRegIndex to the slave before reading (amdgpu always passes 0), so a
+ * separate one-byte offset write before it is overridden: the second EDID
+ * block came back as the first on an RX 570's HDMI port (
+ * 2026-11-19), 256 bytes that were block 0 twice. A read now carries its
+ * own start offset.
+ */
 static int process_i2c_ch(struct frb_device *adev, struct frb_connector *conn, uint8_t slave_addr,
-			  uint8_t flags, uint8_t *buf, uint8_t num)
+			  uint8_t flags, uint8_t *buf, uint8_t num, uint8_t read_reg)
 {
 	int index = GetIndexIntoMasterTable(COMMAND, ProcessI2cChannelTransaction);
 	struct frb_ps ps;
@@ -62,6 +70,7 @@ static int process_i2c_ch(struct frb_device *adev, struct frb_connector *conn, u
 	} else {
 		if (!adev->atom->scratch || adev->atom->scratch_size_bytes < num)
 			return -EIO;
+		frb_ps_u8(&ps, OFS(PROCESS_I2C_CHANNEL_TRANSACTION_PARAMETERS, ucRegIndex), read_reg);
 	}
 	frb_ps_u8(&ps, OFS(PROCESS_I2C_CHANNEL_TRANSACTION_PARAMETERS, ucFlag), flags);
 	frb_ps_u8(&ps, OFS(PROCESS_I2C_CHANNEL_TRANSACTION_PARAMETERS, ucI2CSpeed), TARGET_HW_I2C_CLOCK);
@@ -89,7 +98,7 @@ int frb_ddc_probe(struct frb_device *adev, struct frb_connector *conn)
 
 	if (!conn->i2c_id)
 		return 0;
-	return process_i2c_ch(adev, conn, DDC_ADDR, HW_I2C_WRITE, &offset, 1) == 0;
+	return process_i2c_ch(adev, conn, DDC_ADDR, HW_I2C_WRITE, &offset, 1, 0) == 0;
 }
 
 /* drm_get_edid over amdgpu_atombios_i2c_xfer: blocks 0 and 1 */
@@ -102,9 +111,10 @@ int frb_ddc_read_edid(struct frb_device *adev, struct frb_connector *conn)
 	for (block = 0; block < nblocks && block < 2; block++) {
 		uint8_t offset = (uint8_t)(block * EDID_BLOCK);
 
-		if (process_i2c_ch(adev, conn, DDC_ADDR, HW_I2C_WRITE, &offset, 1))
+		if (process_i2c_ch(adev, conn, DDC_ADDR, HW_I2C_WRITE, &offset, 1, 0))
 			return -EIO;
-		if (process_i2c_ch(adev, conn, DDC_ADDR, HW_I2C_READ, conn->edid + block * EDID_BLOCK, EDID_BLOCK))
+		if (process_i2c_ch(adev, conn, DDC_ADDR, HW_I2C_READ, conn->edid + block * EDID_BLOCK, EDID_BLOCK,
+				   offset))
 			return -EIO;
 		for (sum = 0, off = 0; off < EDID_BLOCK; off++)
 			sum += conn->edid[block * EDID_BLOCK + off];
@@ -121,7 +131,9 @@ int frb_ddc_read_edid(struct frb_device *adev, struct frb_connector *conn)
 			}
 			nblocks = 1 + conn->edid[126];
 			if (nblocks > 2)
-				frb_info(adev, "display: EDID has %d extensions; reading the first", nblocks - 1);
+				frb_info(adev, "display: EDID has %d extensions; reading the first (the rest are past "
+					 "byte 255, behind the E-DDC segment pointer an ATOM transaction cannot set)",
+					 nblocks - 1);
 		}
 		conn->edid_len = (block + 1) * EDID_BLOCK;
 	}

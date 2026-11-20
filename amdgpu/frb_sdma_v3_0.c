@@ -114,6 +114,20 @@ static const uint32_t sdma_offsets[SDMA_MAX_INSTANCE] =
 	SDMA1_REGISTER_OFFSET
 };
 
+static const uint32_t golden_settings_polaris10_a11[] =
+{
+	mmSDMA0_CHICKEN_BITS, 0xfc910007, 0x00810007,
+	mmSDMA0_CLK_CTRL, 0xff000fff, 0x00000000,
+	mmSDMA0_GFX_IB_CNTL, 0x800f0111, 0x00000100,
+	mmSDMA0_RLC0_IB_CNTL, 0x800f0111, 0x00000100,
+	mmSDMA0_RLC1_IB_CNTL, 0x800f0111, 0x00000100,
+	mmSDMA1_CHICKEN_BITS, 0xfc910007, 0x00810007,
+	mmSDMA1_CLK_CTRL, 0xff000fff, 0x00000000,
+	mmSDMA1_GFX_IB_CNTL, 0x800f0111, 0x00000100,
+	mmSDMA1_RLC0_IB_CNTL, 0x800f0111, 0x00000100,
+	mmSDMA1_RLC1_IB_CNTL, 0x800f0111, 0x00000100,
+};
+
 static const uint32_t golden_settings_polaris11_a11[] =
 {
 	mmSDMA0_CHICKEN_BITS, 0xfc910007, 0x00810007,
@@ -166,13 +180,18 @@ static void vi_srbm_select(struct frb_device *adev,
  */
 static uint32_t sdma_v3_0_gb_addr_config(struct frb_device *adev)
 {
-	(void)adev;
-	return POLARIS11_GB_ADDR_CONFIG_GOLDEN;
+	/* Polaris 10 is Tonga's value (0x22011003): the same bits 6:4 */
+	return adev->asic_type == CHIP_POLARIS10 ? 0x22011003 : POLARIS11_GB_ADDR_CONFIG_GOLDEN;
 }
 
 static void sdma_v3_0_init_golden_registers(struct frb_device *adev)
 {
 	switch (adev->asic_type) {
+	case CHIP_POLARIS10:
+		frb_device_program_register_sequence(adev,
+						     golden_settings_polaris10_a11,
+						     ARRAY_SIZE(golden_settings_polaris10_a11));
+		break;
 	case CHIP_POLARIS11:
 	case CHIP_POLARIS12:
 	case CHIP_VEGAM:
@@ -203,8 +222,11 @@ static int sdma_v3_0_init_microcode(struct frb_device *adev, struct frb_sdma *sd
 	case CHIP_POLARIS12:
 		chip_name = "polaris12";
 		break;
+	case CHIP_POLARIS10:
+		chip_name = "polaris10";
+		break;
 	default:
-		frb_err(adev, "sdma: only Polaris 12 is wired up");
+		frb_err(adev, "sdma: only Polaris 12 and Polaris 10 are wired up");
 		return -ENODEV;
 	}
 

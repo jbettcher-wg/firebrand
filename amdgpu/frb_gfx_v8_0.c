@@ -92,6 +92,13 @@
 #include "include/asic_reg/dce/dce_10_0_d.h"
 
 #define POLARIS11_GB_ADDR_CONFIG_GOLDEN 0x22011002
+#define TONGA_GB_ADDR_CONFIG_GOLDEN 0x22011003	/* Polaris 10's too (gfx_v8_0.c) */
+/* smu_7_1_3_d.h / _sh_mask.h: the ACLK divider Polaris 10's golden setup writes */
+#ifndef ixCG_ACLK_CNTL
+#define ixCG_ACLK_CNTL				0xc05000dc
+#define CG_ACLK_CNTL__ACLK_DIVIDER_MASK		0x7f
+#define CG_ACLK_CNTL__ACLK_DIVIDER__SHIFT	0x0
+#endif
 
 #define ARRAY_MODE(x)					((x) << GB_TILE_MODE0__ARRAY_MODE__SHIFT)
 #define PIPE_CONFIG(x)					((x) << GB_TILE_MODE0__PIPE_CONFIG__SHIFT)
@@ -253,6 +260,39 @@ static const struct amdgpu_gds_reg_offset amdgpu_gds_reg_offset[] =
 	{mmGDS_VMID15_BASE, mmGDS_VMID15_SIZE, mmGDS_GWS_VMID15, mmGDS_OA_VMID15}
 };
 
+static const uint32_t golden_settings_polaris10_a11[] =
+{
+	mmATC_MISC_CG, 0x000c0fc0, 0x000c0200,
+	mmCB_HW_CONTROL, 0x0001f3cf, 0x00007208,
+	mmCB_HW_CONTROL_2, 0x0f000000, 0x0f000000,
+	mmCB_HW_CONTROL_3, 0x000001ff, 0x00000040,
+	mmDB_DEBUG2, 0xf00fffff, 0x00000400,
+	mmPA_SC_ENHANCE, 0xffffffff, 0x20000001,
+	mmPA_SC_LINE_STIPPLE_STATE, 0x0000ff0f, 0x00000000,
+	mmPA_SC_RASTER_CONFIG, 0x3f3fffff, 0x16000012,
+	mmPA_SC_RASTER_CONFIG_1, 0x0000003f, 0x0000002a,
+	mmRLC_CGCG_CGLS_CTRL, 0x00000003, 0x0001003c,
+	mmRLC_CGCG_CGLS_CTRL_3D, 0xffffffff, 0x0001003c,
+	mmSQ_CONFIG, 0x07f80000, 0x07180000,
+	mmTA_CNTL_AUX, 0x000f000f, 0x000b0000,
+	mmTCC_CTRL, 0x00100000, 0xf31fff7f,
+	mmTCP_ADDR_CONFIG, 0x000003ff, 0x000000f7,
+	mmTCP_CHAN_STEER_HI, 0xffffffff, 0x00000000,
+	mmVGT_RESET_DEBUG, 0x00000004, 0x00000004,
+};
+
+static const uint32_t polaris10_golden_common_all[] =
+{
+	mmGRBM_GFX_INDEX, 0xffffffff, 0xe0000000,
+	mmPA_SC_RASTER_CONFIG, 0xffffffff, 0x16000012,
+	mmPA_SC_RASTER_CONFIG_1, 0xffffffff, 0x0000002A,
+	mmGB_ADDR_CONFIG, 0xffffffff, 0x22011003,
+	mmSPI_RESOURCE_RESERVE_CU_0, 0xffffffff, 0x00000800,
+	mmSPI_RESOURCE_RESERVE_CU_1, 0xffffffff, 0x00000800,
+	mmSPI_RESOURCE_RESERVE_EN_CU_0, 0xffffffff, 0x00FF7FBF,
+	mmSPI_RESOURCE_RESERVE_EN_CU_1, 0xffffffff, 0x00FF7FAF,
+};
+
 static const uint32_t golden_settings_polaris11_a11[] =
 {
 	mmCB_HW_CONTROL, 0x0000f3cf, 0x00007208,
@@ -362,6 +402,28 @@ static int amdgpu_atombios_get_gfx_info(struct frb_device *adev)
 static void gfx_v8_0_init_golden_registers(struct frb_device *adev)
 {
 	switch (adev->asic_type) {
+	case CHIP_POLARIS10:
+		frb_device_program_register_sequence(adev,
+						     golden_settings_polaris10_a11,
+						     ARRAY_SIZE(golden_settings_polaris10_a11));
+		frb_device_program_register_sequence(adev,
+						     polaris10_golden_common_all,
+						     ARRAY_SIZE(polaris10_golden_common_all));
+		{
+			uint32_t data = RREG32_SMC(ixCG_ACLK_CNTL);
+
+			data &= ~CG_ACLK_CNTL__ACLK_DIVIDER_MASK;
+			data |= 0x18 << CG_ACLK_CNTL__ACLK_DIVIDER__SHIFT;
+			WREG32_SMC(ixCG_ACLK_CNTL, data);
+		}
+		/*
+		 * amdgpu also writes two bytes over the ATOM I2C channel for
+		 * three rev 0xc7 boards (subsystems 1002:0b37, 1043:04a8,
+		 * 1680:9480); not carried, so such a card says so.
+		 */
+		if (adev->device == 0x67DF && adev->revision == 0xc7)
+			frb_info(adev, "gfx: a rev c7 Polaris 10: amdgpu's I2C fix for three boards is not carried");
+		break;
 	case CHIP_POLARIS11:
 	case CHIP_POLARIS12:
 		frb_device_program_register_sequence(adev,
@@ -483,8 +545,8 @@ static int gfx_v8_0_init_microcode(struct frb_device *adev)
 	uint32_t i, fmt_off, list_off, bytes;
 	int err;
 
-	if (adev->asic_type != CHIP_POLARIS12)
-		return -EINVAL;	/* chip_name: only polaris12 is carried */
+	if (adev->asic_type != CHIP_POLARIS12 && adev->asic_type != CHIP_POLARIS10)
+		return -EINVAL;	/* chip_name: polaris12 and polaris10 are carried */
 	frb_fw_name(name, sizeof(name), adev->row ? adev->row->fw_prefix : "polaris12", "_rlc.bin");
 	err = adev->os->firmware(adev->os->cookie, name, &fw.data, &fw.size);
 	if (err) {
@@ -642,6 +704,20 @@ static int gfx_v8_0_gpu_early_init(struct frb_device *adev)
 	int ret;
 
 	switch (adev->asic_type) {
+	case CHIP_POLARIS10:
+		ret = amdgpu_atombios_get_gfx_info(adev);
+		if (ret)
+			return ret;
+		cfg->max_gprs = 256;
+		cfg->max_gs_threads = 32;
+		cfg->max_hw_contexts = 8;
+
+		cfg->sc_prim_fifo_size_frontend = 0x20;
+		cfg->sc_prim_fifo_size_backend = 0x100;
+		cfg->sc_hiz_tile_fifo_size = 0x30;
+		cfg->sc_earlyz_tile_fifo_size = 0x130;
+		gb_addr_config = TONGA_GB_ADDR_CONFIG_GOLDEN;
+		break;
 	case CHIP_POLARIS11:
 	case CHIP_POLARIS12:
 		ret = amdgpu_atombios_get_gfx_info(adev);
@@ -957,6 +1033,209 @@ static void gfx_v8_0_tiling_mode_table_init(struct frb_device *adev)
 				WREG32(mmGB_MACROTILE_MODE0 + reg_offset, mod2array[reg_offset]);
 
 		break;
+	case CHIP_POLARIS10:
+		modearray[0] = (ARRAY_MODE(ARRAY_2D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				TILE_SPLIT(ADDR_SURF_TILE_SPLIT_64B) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DEPTH_MICRO_TILING));
+		modearray[1] = (ARRAY_MODE(ARRAY_2D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				TILE_SPLIT(ADDR_SURF_TILE_SPLIT_128B) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DEPTH_MICRO_TILING));
+		modearray[2] = (ARRAY_MODE(ARRAY_2D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				TILE_SPLIT(ADDR_SURF_TILE_SPLIT_256B) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DEPTH_MICRO_TILING));
+		modearray[3] = (ARRAY_MODE(ARRAY_2D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				TILE_SPLIT(ADDR_SURF_TILE_SPLIT_512B) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DEPTH_MICRO_TILING));
+		modearray[4] = (ARRAY_MODE(ARRAY_2D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				TILE_SPLIT(ADDR_SURF_TILE_SPLIT_2KB) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DEPTH_MICRO_TILING));
+		modearray[5] = (ARRAY_MODE(ARRAY_1D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				TILE_SPLIT(ADDR_SURF_TILE_SPLIT_2KB) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DEPTH_MICRO_TILING));
+		modearray[6] = (ARRAY_MODE(ARRAY_PRT_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				TILE_SPLIT(ADDR_SURF_TILE_SPLIT_2KB) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DEPTH_MICRO_TILING));
+		modearray[7] = (ARRAY_MODE(ARRAY_PRT_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P4_16x16) |
+				TILE_SPLIT(ADDR_SURF_TILE_SPLIT_2KB) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DEPTH_MICRO_TILING));
+		modearray[8] = (ARRAY_MODE(ARRAY_LINEAR_ALIGNED) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16));
+		modearray[9] = (ARRAY_MODE(ARRAY_1D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DISPLAY_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_2));
+		modearray[10] = (ARRAY_MODE(ARRAY_2D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DISPLAY_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_2));
+		modearray[11] = (ARRAY_MODE(ARRAY_PRT_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DISPLAY_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_8));
+		modearray[12] = (ARRAY_MODE(ARRAY_PRT_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P4_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_DISPLAY_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_8));
+		modearray[13] = (ARRAY_MODE(ARRAY_1D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THIN_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_2));
+		modearray[14] = (ARRAY_MODE(ARRAY_2D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THIN_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_2));
+		modearray[15] = (ARRAY_MODE(ARRAY_3D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THIN_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_2));
+		modearray[16] = (ARRAY_MODE(ARRAY_PRT_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THIN_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_8));
+		modearray[17] = (ARRAY_MODE(ARRAY_PRT_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P4_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THIN_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_8));
+		modearray[18] = (ARRAY_MODE(ARRAY_1D_TILED_THICK) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THIN_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_1));
+		modearray[19] = (ARRAY_MODE(ARRAY_1D_TILED_THICK) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THICK_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_1));
+		modearray[20] = (ARRAY_MODE(ARRAY_2D_TILED_THICK) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THICK_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_1));
+		modearray[21] = (ARRAY_MODE(ARRAY_3D_TILED_THICK) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THICK_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_1));
+		modearray[22] = (ARRAY_MODE(ARRAY_PRT_TILED_THICK) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THICK_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_1));
+		modearray[23] = (ARRAY_MODE(ARRAY_PRT_TILED_THICK) |
+				PIPE_CONFIG(ADDR_SURF_P4_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THICK_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_1));
+		modearray[24] = (ARRAY_MODE(ARRAY_2D_TILED_THICK) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THIN_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_1));
+		modearray[25] = (ARRAY_MODE(ARRAY_2D_TILED_XTHICK) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THICK_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_1));
+		modearray[26] = (ARRAY_MODE(ARRAY_3D_TILED_XTHICK) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_THICK_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_1));
+		modearray[27] = (ARRAY_MODE(ARRAY_1D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_ROTATED_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_2));
+		modearray[28] = (ARRAY_MODE(ARRAY_2D_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_ROTATED_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_2));
+		modearray[29] = (ARRAY_MODE(ARRAY_PRT_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P8_32x32_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_ROTATED_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_8));
+		modearray[30] = (ARRAY_MODE(ARRAY_PRT_TILED_THIN1) |
+				PIPE_CONFIG(ADDR_SURF_P4_16x16) |
+				MICRO_TILE_MODE_NEW(ADDR_SURF_ROTATED_MICRO_TILING) |
+				SAMPLE_SPLIT(ADDR_SURF_SAMPLE_SPLIT_8));
+
+		mod2array[0] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_4) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_4) |
+				NUM_BANKS(ADDR_SURF_16_BANK));
+
+		mod2array[1] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_4) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_4) |
+				NUM_BANKS(ADDR_SURF_16_BANK));
+
+		mod2array[2] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_4) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_4) |
+				NUM_BANKS(ADDR_SURF_16_BANK));
+
+		mod2array[3] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_4) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_4) |
+				NUM_BANKS(ADDR_SURF_16_BANK));
+
+		mod2array[4] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_2) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_2) |
+				NUM_BANKS(ADDR_SURF_16_BANK));
+
+		mod2array[5] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_1) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_1) |
+				NUM_BANKS(ADDR_SURF_16_BANK));
+
+		mod2array[6] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_1) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_1) |
+				NUM_BANKS(ADDR_SURF_16_BANK));
+
+		mod2array[8] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_8) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_4) |
+				NUM_BANKS(ADDR_SURF_16_BANK));
+
+		mod2array[9] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_4) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_4) |
+				NUM_BANKS(ADDR_SURF_16_BANK));
+
+		mod2array[10] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_2) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_2) |
+				NUM_BANKS(ADDR_SURF_16_BANK));
+
+		mod2array[11] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_1) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_2) |
+				NUM_BANKS(ADDR_SURF_16_BANK));
+
+		mod2array[12] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_1) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_1) |
+				NUM_BANKS(ADDR_SURF_8_BANK));
+
+		mod2array[13] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_1) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_1) |
+				NUM_BANKS(ADDR_SURF_4_BANK));
+
+		mod2array[14] = (BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_1) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_1) |
+				NUM_BANKS(ADDR_SURF_4_BANK));
+
+		for (reg_offset = 0; reg_offset < num_tile_mode_states; reg_offset++)
+			WREG32(mmGB_TILE_MODE0 + reg_offset, modearray[reg_offset]);
+
+		for (reg_offset = 0; reg_offset < num_secondary_tile_mode_states; reg_offset++)
+			if (reg_offset != 7)
+				WREG32(mmGB_MACROTILE_MODE0 + reg_offset, mod2array[reg_offset]);
+
+		break;
+
 	default:
 		break;	/* the other VI arms are not carried */
 	}
@@ -1006,6 +1285,12 @@ static void
 gfx_v8_0_raster_config(struct frb_device *adev, uint32_t *rconf, uint32_t *rconf1)
 {
 	switch (adev->asic_type) {
+	case CHIP_POLARIS10:
+		*rconf |= RB_MAP_PKR0(2) | RB_XSEL2(1) | SE_MAP(2) |
+			  SE_XSEL(1) | SE_YSEL(1);
+		*rconf1 |= SE_PAIR_MAP(2) | SE_PAIR_XSEL(2) |
+			   SE_PAIR_YSEL(2);
+		break;
 	case CHIP_POLARIS11:
 	case CHIP_POLARIS12:
 		*rconf |= RB_MAP_PKR0(2) | RB_XSEL2(1) | SE_MAP(2) |
@@ -2373,8 +2658,8 @@ int frb_gfx_v8_0_init(struct frb_device *adev)
 	struct frb_gfx *g = adev->gfx;
 	int r;
 
-	if (adev->asic_type != CHIP_POLARIS12) {
-		frb_err(adev, "gfx: only the Polaris 12 paths of gfx_v8_0 are ported");
+	if (adev->asic_type != CHIP_POLARIS12 && adev->asic_type != CHIP_POLARIS10) {
+		frb_err(adev, "gfx: only the Polaris 12 and Polaris 10 paths of gfx_v8_0 are ported");
 		return -ENODEV;
 	}
 	if (!adev->aper || !adev->layout.objects_size) {
@@ -2699,6 +2984,21 @@ int frb_gfx_v8_0_get_info(struct frb_device *adev, struct frb_gfx_info *info)
 	info->mc_arb_ramcfg = g->config.mc_arb_ramcfg;
 	info->max_hw_contexts = g->config.max_hw_contexts;
 	info->ce_ram_size = g->ce_ram_size;
+	/*
+	 * What gfx_v8_0_get_cu_info and GFX_Info measured, as gfx_v9_0's
+	 * get_info passes them: the GL winsys took Polaris 10's full 36 CUs
+	 * from its own table while the RX 570 has 32 (8 per engine), and
+	 * GFX_INFO said 0 TCCs and 0 VGPRs.
+	 */
+	{
+		int se, sh;
+
+		for (se = 0; se < 4; se++)
+			for (sh = 0; sh < 4; sh++)
+				info->cu_bitmap[se][sh] = g->cu_info.bitmap[se][sh];
+	}
+	info->num_tcc_blocks = g->config.max_texture_channel_caches;
+	info->max_gprs = g->config.max_gprs;
 	return 0;
 }
 

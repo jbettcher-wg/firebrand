@@ -192,6 +192,23 @@ static const struct { uint16_t device; enum amd_asic_type type; } pciidlist[] = 
  * placement), the LMI swap probe passes both ways, and through 'rdnv' the 12
  * H.264 vectors equal ffmpeg's md5 (docs/vega20-bring-up.md, "Stage uvd").
  */
+/*
+ * RX 570: Polaris 20 (CHIP_POLARIS10 to amdgpu), 67df rev ef, subsystem
+ * 1da2:e366, 8 GB 256-bit GDDR5, DP/DP/HDMI/HDMI/DVI-D, VBIOS
+ * 113-2E366DU-S5U 015.050.002.001. First run as an untested card on
+ * 2026-11-19 with an HDMI monitor. No Linux capture: the references are
+ * Linux amdgpu's Polaris 10 arms, ported for this card into
+ * gfx_v8_0 (golden registers, Tonga's GB_ADDR_CONFIG, the 8-pipe tiling
+ * table, the 4-SE raster config), sdma_v3_0 and smu7_powertune (the Polaris
+ * 10 DIDT/GC CAC tables). Verified on the card: post, gmc, smu, dce (HDMI
+ * over DDC with the CEA extension, 2560x1440@60 at boot), gfx (4 SE, 32
+ * CUs, 8 RBs; ring test), sdma (both engines' ring and IB tests), DPM (8
+ * SCLK levels to 1244 MHz, 3 MCLK to 1750 MHz, idling at 300/300), uvd (ring
+ * and IB tests; FrostByte decoding H.264 through 'rdnv'), the accelerator
+ * (frb_acceltest, frb_screentest), GL 3.3 core / 4.6 compatibility through
+ * the shared bundle (begl33test 30/30, 5/5, 45/45), Core Image and Quartz
+ * Extreme in hardware.
+ */
 static const struct frb_asic_row rows[] = {
 	{ 0x682B, 0x1028, 0x1004, 0x87, CHIP_VERDE, "VERDE", "verde",
 	  "AMD Radeon R7 450 (Cape Verde, 4 GB 128-bit GDDR5, DP/DP/DVI-I)", FRB_STAGE_UVD },
@@ -201,6 +218,8 @@ static const struct frb_asic_row rows[] = {
 	  "AMD Embedded Radeon E9173 (Lexa XL, 2 GB 64-bit GDDR5, 3x DP)", FRB_STAGE_UVD },
 	{ 0x699F, 0x1002, 0x0B04, 0xC7, CHIP_POLARIS12, "POLARIS12", "polaris12",
 	  "Radeon RX 550 (Lexa, 4 GB 128-bit GDDR5, DP/HDMI/DVI)", FRB_STAGE_UVD },
+	{ 0x67DF, 0x1DA2, 0xE366, 0xEF, CHIP_POLARIS10, "POLARIS10", "polaris10",
+	  "Radeon RX 570 (Polaris 20, 8 GB 256-bit GDDR5, DP/DP/HDMI/HDMI/DVI)", FRB_STAGE_UVD },
 	{ 0x66A1, 0x1002, 0x081E, 0x06, CHIP_VEGA20, "VEGA20", "vega20",
 	  "AMD Instinct MI50 (Vega 20, 16 GB HBM2, Radeon Pro VII VBIOS, passive)", FRB_STAGE_UVD,
 	  FRB_QUIRK_AUDIO_FN_STRAP },

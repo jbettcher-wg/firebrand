@@ -635,9 +635,28 @@ IODeviceMemory *FirebrandFramebuffer::getApertureRange(IOPixelAperture aperture)
 							    fSurfaceBytes);
 }
 
+/*
+ * With the accelerator, all of BAR0 is video memory the system can count on,
+ * as RadeonNI's getVRAMRange has it: CoreGraphics takes this range's length
+ * as the display's VRAM (updateGLVRAMFlag) and below GLCompositorMinimumVRAM,
+ * 16 MB, refuses the GL compositor for the display, so the desktop is
+ * composited on the CPU into a write-locked surface. Read live with gdb on
+ * an RX 570 over HDMI (2026-11-19): 14745600 bytes, which is 2560x1440x4,
+ * the surface of the biggest settable mode, and device flag 0x02000000 clear.
+ * The W8100 and RX 550 got Quartz Extreme only because their 4K monitors made
+ * the surface 33 MB; any monitor up to 1440p never could. Without the
+ * accelerator only the screen's surfaces are ours.
+ */
 IODeviceMemory *FirebrandFramebuffer::getVRAMRange(void)
 {
-	return getApertureRange(kIOFBSystemAperture);
+	IODeviceMemory *bar;
+
+	if (!fAccel)
+		return getApertureRange(kIOFBSystemAperture);
+	bar = fCore.aperture();
+	if (!bar)
+		return 0;
+	return FirebrandSubDeviceMemory::withDeviceSubRange(bar, 0, bar->getLength());
 }
 
 /* The card's memory as IOFBMemorySize (32-bit, so 2047 MB at most, as RadeonNI). */

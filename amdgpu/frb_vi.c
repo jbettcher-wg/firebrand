@@ -64,6 +64,9 @@ void frb_vi_common_early_init(struct frb_device *adev)
 		adev->external_rev_id = adev->rev_id + 0x5A;
 		break;
 	case CHIP_POLARIS10:
+		/* as for Polaris 12: only the flags a ported block reads (uvd_v6_0); Linux sets 19 */
+		adev->cg_flags = AMD_CG_SUPPORT_UVD_MGCG | AMD_CG_SUPPORT_VCE_MGCG;
+		adev->pg_flags = 0;
 		adev->external_rev_id = adev->rev_id + 0x50;
 		break;
 	case CHIP_POLARIS12:

@@ -831,10 +831,17 @@ int FirebrandCore::runStages(UInt32 stage)
  * The card's video memory as RadeonNI publishes it on the PCI device
  * (RadeonNI.cpp, KNOWN-ISSUES 16): what System Profiler and CGL's
  * kCGLRPVideoMemory read. The true size is CONFIG_MEMSIZE (MB); the CPU sees
- * only the 256 MB BAR0. System Profiler reads VRAM,totalsize as a SIGNED
- * 32-bit byte count, so 2 GB and up is capped at 2047 MB there (and in
- * ATY,memsize); VRAM,totalMB carries the whole count, VRAM,totalsize64 the
- * bytes. Host-order numbers, as RadeonNI's. Also the model name.
+ * only the 256 MB BAR0. 10.5.8's System Profiler cannot print more than
+ * 2047 MB from any of these: SPDisplaysReporter sends VRAM,totalsize
+ * -intValue, which SPSupport's NSData category answers with the FIRST FOUR
+ * BYTES as a signed int, then prints that >> 20 -- an 8-byte value prints its
+ * high word (8 GB -> 0 MB) and a 4-byte one past 0x7fffffff goes negative.
+ * So VRAM,totalsize (and ATY,memsize) stays a 4-byte count capped at
+ * 0x7ff00000 for any reader, and VRAM,totalMB carries the whole count in MB:
+ * scripts/patch-system-profiler-vram.sh makes the reporter print that when
+ * it is published (measured: an 8 GB card, 2047 MB -> 8192 MB).
+ * VRAM,totalsize64 holds the bytes. Host-order numbers, as RadeonNI's. Also
+ * the model name.
  */
 void FirebrandCore::publishMemory(void)
 {

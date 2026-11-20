@@ -2399,6 +2399,13 @@ static bool rdn_init_info_gcn(struct radeon_drm_winsys *ws)
       return false;
    }
    ws->gen = DRV_SI;
+   /*
+    * radeonsi's GL_RENDERER is "<marketing_name> (radeonsi, <chip>, ...)", and
+    * nothing here filled the name in, so on every GCN card the bridge
+    * context's renderer began with a blank (measured on an RX 570: " (radeonsi,
+    * polaris10, ACO, ...)"). The same form as the GFX9 path below.
+    */
+   snprintf(info->marketing_name, sizeof(info->marketing_name), "AMD Radeon (%04x)", dev->pci_device_id);
    info->has_dedicated_vram = true;
    for (ip = 0; ip < AMD_NUM_IP_TYPES; ip++)
       info->ip[ip].ib_alignment = 4096;
@@ -2481,6 +2488,31 @@ static bool rdn_init_info_gcn(struct radeon_drm_winsys *ws)
       /* Firebrand's always-on mask 001e001e on both Polaris 12 cards: CUs 1-4 of each engine */
       info->cu_mask[0][0] = 0x1e;
       info->cu_mask[1][0] = 0x1e;
+   }
+   /*
+    * What the card measured, over the table above, when the kext reports it
+    * (Firebrand's RDN_UC_GFX_INFO, gfx_vN_0_get_cu_info's active bitmaps):
+    * the table gives Polaris 10 its full 36 CUs, and the RX 570 has 32.
+    */
+   if (dev->has_gfx && dev->gfx.num_cu) {
+      unsigned se, sa, any = 0, most = 0, least = ~0u;
+
+      for (se = 0; se < info->max_se && se < 4; se++)
+         for (sa = 0; sa < info->max_sa_per_se && sa < 4; sa++)
+            any |= dev->gfx.cu_bitmap[se][sa];
+      if (any) {
+         info->num_cu = dev->gfx.num_cu;
+         for (se = 0; se < info->max_se && se < 4; se++)
+            for (sa = 0; sa < info->max_sa_per_se && sa < 4; sa++) {
+               unsigned n = util_bitcount(dev->gfx.cu_bitmap[se][sa]);
+
+               info->cu_mask[se][sa] = dev->gfx.cu_bitmap[se][sa];
+               most = MAX2(most, n);
+               least = MIN2(least, n);
+            }
+         info->max_good_cu_per_sa = most;
+         info->min_good_cu_per_sa = least;
+      }
    }
    switch (info->family) {
    case CHIP_HAWAII: info->max_tcc_blocks = 16; info->l2_cache_size = 16 * 64 * 1024; break;
