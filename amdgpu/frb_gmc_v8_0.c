@@ -416,8 +416,19 @@ static int gmc_v8_0_mc_init(struct frb_device *adev)
 	adev->gmc.aper_size = adev->aper_size;
 	adev->gmc.visible_vram_size = adev->gmc.aper_size;
 
-	/* set the gart size: POLARIS12, all engines support GPUVM */
-	adev->gmc.gart_size = 256ULL << 20;
+	/*
+	 * The gart size: amdgpu gives every Polaris 256 MB ("all engines
+	 * support GPUVM"), because under Linux a program's GTT memory goes
+	 * through its own VM, not VMID 0's GART. Firebrand has no per-program
+	 * VMs: with the accelerator, every GTT object of GL and the window
+	 * server's surfaces is bound in VMID 0's GART (FirebrandAccel::gartBind),
+	 * so 256 MB was the whole GTT pool -- a quarter of what the Sea and
+	 * Southern Islands cards get, whose amdgpu gart size is 1024 MB because
+	 * their UVD and VCE need the GART. With the accelerator (gart_legacy) it
+	 * is 1024 MB here too; without it, amdgpu's 256 MB, which the register
+	 * replay (tests/frb_replay.c) checks against the Linux capture.
+	 */
+	adev->gmc.gart_size = adev->gart_legacy ? 1024ULL << 20 : 256ULL << 20;
 
 	gmc_v8_0_vram_gtt_location(adev, &adev->gmc);
 	return 0;
@@ -444,7 +455,8 @@ static unsigned int gmc_v8_0_get_vbios_fb_size(struct frb_device *adev)
 
 /*
  * Firebrand's placement of amdgpu's VRAM kernel objects: the top 12 MB of
- * the CPU window, in amdgpu's top-down order (see the file header).
+ * the CPU window (14 MB with the accelerator's 1 GB GART table, below UVD),
+ * in amdgpu's top-down order (see the file header).
  */
 static int frb_gmc_layout(struct frb_device *adev)
 {
@@ -458,8 +470,13 @@ static int frb_gmc_layout(struct frb_device *adev)
 			(unsigned long long)(window >> 10));
 		return -ERANGE;
 	}
-	l->gart_table_size = 512u << 10;			/* 64K entries x 8 */
-	l->gart_table = (uint32_t)window - l->gart_table_size;
+	/*
+	 * amdgpu's 256 MB GART table (64K entries x 8) is the top 512 KB; the
+	 * accelerator's 1 GB one (2 MB) goes below UVD instead, so that every
+	 * other object stays where the SMU and UVD replays put it.
+	 */
+	l->gart_table_size = (uint32_t)(adev->gmc.gart_size / AMDGPU_GPU_PAGE_SIZE) * 8;
+	l->gart_table = (uint32_t)window - (512u << 10);
 	l->mem_scratch = l->gart_table - AMDGPU_GPU_PAGE_SIZE;
 	l->toc = l->mem_scratch - 3 * AMDGPU_GPU_PAGE_SIZE;
 	l->smu_buffer = (uint32_t)window - (2u << 20);		/* 200 pages, as smu7_init */
@@ -476,6 +493,10 @@ static int frb_gmc_layout(struct frb_device *adev)
 	l->uvd = (uint32_t)window - (12u << 20);
 	l->uvd_size = 4u << 20;
 	l->reserved_start = l->uvd;
+	if (l->gart_table_size > (512u << 10)) {
+		l->gart_table = l->uvd - l->gart_table_size;
+		l->reserved_start = l->gart_table;
+	}
 	if (l->smu_buffer + l->smu_buffer_size > l->toc) {
 		frb_err(adev, "gmc: layout overlap");
 		return -ERANGE;

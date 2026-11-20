@@ -39,7 +39,7 @@ ones marked *this release* ran the driver and OpenGL bundle in this repository a
 |---|---|---|---|
 | **Southern Islands** (GCN 1) | Radeon R7 450 | The display over DisplayPort (up to 3840x2160 at 60 Hz), 2D, Quartz Extreme, Core Image, OpenGL 4.5, power management, DisplayPort audio, H.264 decoding (UVD 3.1, 12 test streams bit-exact) | 2026-11-15, with the driver of that day. Since then the driver changed outside Southern Islands (Sea Islands, the untested-card policy) and, within it, only for the other chips: Cape Verde's tables and microcode files are the same, checked by the host tests. The card was not fitted for this release's run. |
 | **Sea Islands** (GCN 2) | FirePro W8100 | The display over DisplayPort (the desktop at 2560x1440, a 3840x2160 at 60 Hz link), 2D, Quartz Extreme, Core Image, OpenGL 4.5, power management (clocks follow the load, fan control), DisplayPort audio, H.264 decoding (UVD 4.2, 12 streams bit-exact) | 2026-11-15, *this release* |
-| **Polaris** (GCN 4) | Radeon RX 550 | 2D, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 6.3, 12 streams bit-exact), power management (214-1183 MHz under load) | 2026-11-15, *this release*, without a monitor. The display over DisplayPort at up to 3840x2160 at 60 Hz, hot-plug and DisplayPort audio: 2026-11-14. |
+| **Polaris** (GCN 4) | Radeon RX 550 | 2D, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 6.3, 12 streams bit-exact), power management (214-1183 MHz under load) | 2026-11-15, without a monitor, with the driver of that day; since then Polaris's GART is 1 GB with the accelerator (256 MB before), run on the RX 570. The display over DisplayPort at up to 3840x2160 at 60 Hz, hot-plug and DisplayPort audio: 2026-11-14. |
 | | Radeon RX 570 | The display over HDMI (2560x1440 at 60 Hz, modes from the monitor's EDID and its CEA extension), 2D, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 6.3, 12 streams bit-exact, about 92 pictures/s at 1080p), power management (clocks follow the load: 1244 MHz engine and 1750 MHz memory clock under load, 300 and 300 MHz idle) | 2026-11-19, *this release* |
 | | Embedded Radeon E9173 | The display over its three DisplayPort outputs, 2D, Quartz Extreme, Core Image, OpenGL 3.3, H.264 decoding (UVD 6.3), power management, DisplayPort audio | 2026-11-14 |
 | **Vega 20** (GCN 5) | Instinct MI50 | The display over DisplayPort, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 7), power management and clock gating, DisplayPort audio | 2026-11-15, with the driver of that afternoon; its Vega 20 code is unchanged since and passes the register-trace replays against Linux on both byte orders. The DMA engine occasionally stalls on its first frame after a start; the driver detects that and recovers it by itself (about 35 ms). |
@@ -194,12 +194,11 @@ appears, then the login window.
 To check: `frbctl info` (the card, the bring-up stage, video memory) and System Profiler >
 Graphics/Displays ("Quartz Extreme: Supported", "Core Image: Hardware Accelerated").
 
-**System Profiler and cards over 2 GB.** Leopard's System Profiler cannot show more than
-2047 MB of video memory: it reads the size as a signed 32-bit number, whatever the driver
-publishes. `frbctl info` shows the real size, and `sudo ./patch-system-profiler-vram.sh` (in the
-same folder) makes System Profiler show it too, by teaching it to read the size in MB that
-Firebrand publishes beside the capped one. It only patches Apple's 10.5.8 file, refuses
-anything else, keeps the original, and `--restore` puts it back.
+**If System Profiler shows 2047 MB** for a card with more memory (on the system the RX 570 was
+tested on, it read the size as a signed 32-bit number), `frbctl info` shows the real size, and
+`sudo ./patch-system-profiler-vram.sh` (in the same folder) makes System Profiler read the size
+in MB that Firebrand publishes beside the capped one. It only patches Apple's 10.5.8 file,
+refuses anything else, keeps the original, and `--restore` puts it back.
 
 **If the screen stays dark**
 

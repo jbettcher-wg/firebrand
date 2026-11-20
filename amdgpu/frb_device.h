@@ -331,7 +331,7 @@ struct frb_vram_layout {
 	uint32_t toc;			/* SMU_DRAMData_TOC (DRV_DRAM_ADDR) */
 	uint32_t mem_scratch;		/* amdgpu_device_mem_scratch_init's page */
 	uint32_t gart_table;		/* gmc_vX_0_gart_init's table */
-	uint32_t gart_table_size;	/* the room kept for it (512 KB VI, 2 MB SI's 1 GB GART) */
+	uint32_t gart_table_size;	/* the room kept for it (512 KB VI, 2 MB for a 1 GB GART: SI, CIK, VI with the accelerator) */
 	uint32_t objects;		/* rings, writeback, IB pool, CSB (frb_ring.c), until GTT */
 	uint32_t objects_size;
 	uint32_t uvd;			/* the UVD VCPU bo and the kernel's msg bo (frb_uvd.c) */
