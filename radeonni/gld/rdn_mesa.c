@@ -225,6 +225,7 @@ struct pbuffer {
 	/* OSMESA_STORE_* of the pixel format, from CGLCreatePBuffer's. */
 	uint32_t flags, bytes_per_pixel;
 	int cleared;
+	int zero_on_attach;	/* zeroed (on the GPU) before it is first drawn into */
 };
 static struct pbuffer pbuffers[MAX_PBUFFERS];
 /* The window server's records have the size in words 8 and 9, not 6 and 7. */
@@ -843,16 +844,18 @@ static struct pbuffer *pbuffer_for(const uint32_t *r)
 			return NULL;
 		}
 	}
+	/*
+	 * A pbuffer in the aperture was zeroed here with the CPU, row by row
+	 * through the PCIe BAR: 14 MB for a 2560x1440 one, for every pbuffer
+	 * Core Image makes, which is several a frame. Arabesque (a Quartz
+	 * Composer screen saver) sat at 63 % CPU and 15 frames a second on it
+	 * (RX 570, 2026-11-20: sampled, __bzero under pbuffer_for). Now the
+	 * GPU clears it when it is first attached (OSMesaClearStore) or first
+	 * used as a texture (ensure_pbuffer_cleared), as the hidden ones were.
+	 */
 	gpu = in_aperture ? rdn_target_vram_map(free_slot->offset) : NULL;
 	free_slot->cleared = 0;
-	if (gpu) {
-		uint32_t y;
-
-		for (y = 0; y < height; y++)
-			memset(gpu + (size_t)y * row_bytes, 0, (size_t)width * per_pixel);
-		__sync_synchronize();
-		free_slot->cleared = 1;
-	}
+	free_slot->zero_on_attach = gpu != NULL;
 	free_slot->key = r;
 	free_slot->id = r[2];
 	free_slot->row_bytes = row_bytes;
@@ -2960,6 +2963,10 @@ static void make_current_slow(void *rend)
 				c->gld_ctx);
 			return;
 		}
+		if (!p->cleared && p->zero_on_attach)
+			OSMesaClearStore(c->mesa, RDN_TARGET_VRAM_HANDLE, (GLsizei)p->row_bytes,
+					 p->offset, (GLsizei)p->width, (GLsizei)p->height,
+					 p->flags | OSMESA_STORE_BOTTOM_UP);
 		p->cleared = 1;
 		OSMesaReadbackRects(c->mesa, 0, NULL);
 		c->drawable = d;
@@ -3462,10 +3469,18 @@ void rdn_flush_surface(void *rend)
 			if (contexts[i].dbl)
 				return;	/* only a swap shows the back buffer */
 			if (contexts[i].swaps == 0 && contexts[i].bound) {
-				/* As for a swap: the picture is complete, then the window server knows. */
+				/*
+				 * As for a swap: the window server is told once the
+				 * picture's copy is on the ring -- from glthread's
+				 * thread when rdn_mesa_present queued the flush there
+				 * (OSMesaFlushNotify), else from here after it.
+				 */
+				contexts[i].swap_notifies = -1;
 				rdn_mesa_present(contexts[i].gld_ctx);
-				rdn_surface_flush(contexts[i].connection, contexts[i].window,
-						  contexts[i].surface);
+				if (contexts[i].swap_notifies <= 0)
+					rdn_surface_flush(contexts[i].connection, contexts[i].window,
+							  contexts[i].surface);
+				contexts[i].swap_notifies = 0;
 			}
 			return;
 		}
@@ -3776,7 +3791,24 @@ void rdn_mesa_present(void *gld_ctx)
 	 */
 	if (((c->type == DRAWABLE_SURFACE && c->stored && !surface_direct()) ||
 	     c->type == DRAWABLE_PBUFFER) && !swap_finish()) {
-		if (!c->dbl && mesa_flush)
+		if (!c->dbl && c->type == DRAWABLE_SURFACE && c->swap_notifies < 0 &&
+		    !rdn_window_server && !swap_sync()) {
+			/*
+			 * A single-buffered window (Flurry): glFlush copies the
+			 * front buffer to the surface in glthread's thread, so the
+			 * window server is told from there, after the copy is on
+			 * the ring. Told from here, it composited the surface
+			 * ahead of the copy whenever something lay over the
+			 * window (the screen saver's clock): the frame before or
+			 * this one at random, a stutter at a steady 30 fps.
+			 */
+			c->shown_connection = c->connection;
+			c->shown_window = c->window;
+			c->shown_surface = c->surface;
+			c->swap_notifies = OSMesaFlushNotify(c->mesa, surface_shown, c) != 0;
+			if (!c->swap_notifies && mesa_flush)
+				mesa_flush();
+		} else if (!c->dbl && mesa_flush)
 			mesa_flush();
 	} else if (c->type == DRAWABLE_SCREEN && !rdn_window_server &&
 		   mesa_flush && !swap_finish()) {

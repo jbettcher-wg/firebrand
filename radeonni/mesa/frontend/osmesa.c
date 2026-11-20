@@ -2034,6 +2034,46 @@ OSMesaTexStoreImage(OSMesaContext osmesa, GLenum target, GLuint handle,
 
 
 
+/*
+ * Clear a store (as OSMesaTexStoreImage names one) to zero on the GPU, in
+ * this context's command stream, without touching any GL state: what the
+ * bundle did before with a CPU memset through the PCIe aperture, at 14 MB a
+ * 2560x1440 pbuffer -- Core Image makes new pbuffers every frame, and a
+ * Quartz Composer screen saver (Arabesque, RX 570, 2026-11-20) spent 63 %
+ * of a core on it and drew 15 frames a second. No wait: the clear is
+ * ordered ahead of everything this context does next.
+ */
+GLAPI GLboolean GLAPIENTRY
+OSMesaClearStore(OSMesaContext osmesa, GLuint handle, GLsizei stride,
+                 GLuint offset, GLsizei width, GLsizei height, GLuint flags)
+{
+   static const uint32_t zero[4];
+   struct pipe_context *pipe;
+   struct pipe_resource *res;
+   struct pipe_box box;
+   enum pipe_format format;
+
+   osmesa_sync(osmesa);
+   if (!osmesa || !osmesa->st || OSMesaGetCurrentContext() != osmesa ||
+       width <= 0 || height <= 0)
+      return GL_FALSE;
+   pipe = osmesa->st->pipe;
+   if (!pipe || !pipe->clear_texture)
+      return GL_FALSE;
+   format = osmesa_store_format(osmesa, flags);
+   if (format == PIPE_FORMAT_NONE)
+      return GL_FALSE;
+   res = osmesa_cached_import_store(pipe->screen, PIPE_TEXTURE_2D, format, handle,
+                                    stride, offset, width, height);
+   if (!res)
+      return GL_FALSE;
+   u_box_2d(0, 0, width, height, &box);
+   pipe->clear_texture(pipe, res, 0, &box, zero);
+   pipe_resource_reference(&res, NULL);
+   return GL_TRUE;
+}
+
+
 GLAPI int GLAPIENTRY
 OSMesaCanPackNV12(OSMesaContext osmesa)
 {
@@ -2666,6 +2706,67 @@ OSMesaSwapBuffersNotify(OSMesaContext osmesa, void (*shown)(void *), void *arg)
    }
    OSMesaSwapBuffers(osmesa);
    return GL_FALSE;
+}
+
+
+static void
+osmesa_flush_notify_callback(void *arg)
+{
+   OSMesaContext osmesa = (OSMesaContext)arg;
+
+   if (osmesa->swap_shown)
+      osmesa->swap_shown(osmesa->swap_shown_arg);
+   util_queue_fence_signal(&osmesa->swap_done);
+}
+
+/*
+ * A single-buffered window's glFlush, with the reader told as
+ * OSMesaSwapBuffersNotify tells it: glFlush is the batch's last call, and
+ * in glthread's thread it draws the front buffer into the surface
+ * (st_manager_flush_frontbuffer -> osmesa_present_direct) and submits that
+ * copy to the GPU's ring; shown(arg) runs there after it. Told from the
+ * program's thread instead, as soon as glFlush was only queued, the window
+ * server could composite the surface before the copy was on the ring and
+ * show the frame before -- measured on an RX 570, 2026-11-20: Flurry with
+ * the screen saver's clock over it, so composited, gave steady 33.3 ms
+ * frames and a stuttering screen; without the clock (the driver's own
+ * flush, no compositing) it was smooth.
+ *
+ * True: queued, and shown() will be called. False: no glthread; nothing
+ * was done, and the caller flushes and tells the reader itself.
+ */
+GLAPI GLboolean GLAPIENTRY
+OSMesaFlushNotify(OSMesaContext osmesa, void (*shown)(void *), void *arg)
+{
+   struct gl_context *ctx;
+   void (*flush)(void);
+
+   if (!osmesa || !osmesa->st)
+      return GL_FALSE;
+   ctx = osmesa->st->ctx;
+   flush = (void (*)(void))OSMesaGetProcAddress("glFlush");
+   if (!flush || !ctx->GLThread.enabled || OSMesaGetCurrentContext() != osmesa)
+      return GL_FALSE;
+   if (!osmesa->swap_done_init) {
+      util_queue_fence_init(&osmesa->swap_done);
+      osmesa->swap_done_init = true;
+   }
+   /* The flush before this one: over before another is queued. */
+   {
+      double t0 = rdn_hitch_begin();
+
+      util_queue_fence_wait(&osmesa->swap_done);
+      rdn_hitch_end(t0, "flush-wait", "previous-frame", 0, 0);
+   }
+   if (!_mesa_glthread_set_done_callback(ctx, osmesa_flush_notify_callback, osmesa))
+      return GL_FALSE;
+   osmesa->swap_shown = shown;
+   osmesa->swap_shown_arg = arg;
+   util_queue_fence_reset(&osmesa->swap_done);
+   /* The call is the batch's last, and the batch goes now. */
+   flush();
+   _mesa_glthread_flush_batch(ctx);
+   return GL_TRUE;
 }
 
 

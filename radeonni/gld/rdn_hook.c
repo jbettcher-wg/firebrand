@@ -621,6 +621,77 @@ static mach_msg_return_t hooked_mach_msg(mach_msg_header_t *msg, mach_msg_option
 	return real_mach_msg(msg, option, send_size, rcv_size, rcv_name, timeout, notify);
 }
 
+/*
+ * mach_msg_overwrite, the same wait by the other door. The window server's
+ * main loop (CGXRunOneServerPass) mostly waits here, not in mach_msg:
+ * sampled during a screen saver, 761 waits in mach_msg_overwrite to 92 in
+ * mach_msg. Hooking only mach_msg left the copies to the screen that
+ * rdn_mesa.c puts off (OSMesaDeferPresent) waiting after every frame
+ * composed while the thread then went idle in this call -- until some
+ * other update switched the screen's binding. A screen saver under its
+ * clock showed a burst of frames once a second, when the clock window
+ * drew, and nothing in between (CRTC CRC on an RX 570, 2026-11-20: 6.8
+ * changed pictures a second for 30 drawn; the window server's log: runs of
+ * "FLUSH of the screen context" and one "PRESENT, 7 copies").
+ *
+ * Only while copies are pending (idle() says how long they may wait) is
+ * the call changed: a send-and-receive sends first and then receives
+ * alone, as libsyscall's own mach_msg_overwrite retries an interrupted
+ * receive (option & ~MACH_SEND_MSG, send size 0), and the receive waits
+ * no longer than idle() said before timeout() presents.
+ */
+static mach_msg_return_t (*real_mach_msg_overwrite)(mach_msg_header_t *, mach_msg_option_t,
+						    mach_msg_size_t, mach_msg_size_t, mach_port_t,
+						    mach_msg_timeout_t, mach_port_t,
+						    mach_msg_header_t *, mach_msg_size_t);
+
+static mach_msg_return_t hooked_mach_msg_overwrite(mach_msg_header_t *msg, mach_msg_option_t option,
+						   mach_msg_size_t send_size, mach_msg_size_t rcv_size,
+						   mach_port_t rcv_name, mach_msg_timeout_t timeout,
+						   mach_port_t notify, mach_msg_header_t *rcv_msg,
+						   mach_msg_size_t rcv_limit)
+{
+	if (rdn_logging && pthread_equal(pthread_self(), mach_thread)) {
+		static unsigned seen[16];
+		unsigned key = option & 0x3f, i;
+
+		for (i = 0; i < 16 && seen[i]; i++)
+			if (seen[i] == key + 1)
+				break;
+		if (i < 16 && seen[i] == 0) {
+			seen[i] = key + 1;
+			rdn_log("mach_msg_overwrite option 0x%x timeout %u (first of its kind)",
+				(unsigned)option, (unsigned)timeout);
+		}
+	}
+	if ((option & MACH_RCV_MSG) && pthread_equal(pthread_self(), mach_thread)) {
+		unsigned ms = idle_handler();
+
+		if (ms && (!(option & MACH_RCV_TIMEOUT) || ms < timeout)) {
+			mach_msg_return_t r;
+
+			if (option & MACH_SEND_MSG) {
+				r = real_mach_msg_overwrite(msg, option & ~(MACH_RCV_MSG | MACH_RCV_TIMEOUT |
+									    MACH_RCV_INTERRUPT | MACH_RCV_LARGE),
+							    send_size, 0, MACH_PORT_NULL, timeout, notify, NULL, 0);
+				if (r != MACH_MSG_SUCCESS)
+					return r;
+				option &= ~(MACH_SEND_MSG | MACH_SEND_TIMEOUT | MACH_SEND_INTERRUPT);
+				send_size = 0;
+			}
+			r = real_mach_msg_overwrite(msg, option | MACH_RCV_TIMEOUT, 0, rcv_size, rcv_name,
+						    ms, notify, rcv_msg, rcv_limit);
+			if (r != MACH_RCV_TIMED_OUT)
+				return r;
+			idle_timeout();
+			if (option & MACH_RCV_TIMEOUT)
+				timeout -= ms;
+		}
+	}
+	return real_mach_msg_overwrite(msg, option, send_size, rcv_size, rcv_name, timeout, notify,
+				       rcv_msg, rcv_limit);
+}
+
 #ifdef __LP64__
 #define RDN_MACH_HEADER mach_header_64
 #define RDN_SEGMENT segment_command_64
@@ -708,6 +779,7 @@ static void rebind(const struct mach_header *mh, intptr_t slide)
 					BIND_RESOLVED(real_set_pbuffer, hooked_set_pbuffer);
 					BIND_RESOLVED(real_choose, hooked_choose);
 					BIND_RESOLVED(real_mach_msg, hooked_mach_msg);
+					BIND_RESOLVED(real_mach_msg_overwrite, hooked_mach_msg_overwrite);
 					BIND_RESOLVED(real_destroy_pbuffer, hooked_destroy_pbuffer);
 					BIND_RESOLVED(real_cgls_destroy_pbuffer, hooked_cgls_destroy_pbuffer);
 					BIND_RESOLVED(real_cgls_tex_image, hooked_cgls_tex_image);
@@ -759,6 +831,10 @@ static void rebind(const struct mach_header *mh, intptr_t slide)
 				    !strcmp(strings + symbols[sym].n_un.n_strx, "_mach_msg") &&
 				    pointers[k] != (void *)hooked_mach_msg)
 					pointers[k] = (void *)hooked_mach_msg;
+				if (real_mach_msg_overwrite &&
+				    !strcmp(strings + symbols[sym].n_un.n_strx, "_mach_msg_overwrite") &&
+				    pointers[k] != (void *)hooked_mach_msg_overwrite)
+					pointers[k] = (void *)hooked_mach_msg_overwrite;
 				if (real_destroy_pbuffer &&
 				    !strcmp(strings + symbols[sym].n_un.n_strx, "_CGLDestroyPBuffer") &&
 				    pointers[k] != (void *)hooked_destroy_pbuffer)
@@ -1106,6 +1182,11 @@ void rdn_hook_mach_msg(unsigned (*idle)(void), void (*timeout)(void))
 					       mach_port_t))orig_dlsym(RTLD_DEFAULT, "mach_msg");
 	if (!real_mach_msg)
 		return;
+	real_mach_msg_overwrite = (mach_msg_return_t (*)(mach_msg_header_t *, mach_msg_option_t,
+							 mach_msg_size_t, mach_msg_size_t, mach_port_t,
+							 mach_msg_timeout_t, mach_port_t,
+							 mach_msg_header_t *, mach_msg_size_t))
+		orig_dlsym(RTLD_DEFAULT, "mach_msg_overwrite");
 	idle_handler = idle;
 	idle_timeout = timeout;
 	mach_thread = pthread_self();

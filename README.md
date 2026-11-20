@@ -38,16 +38,33 @@ ones marked *this release* ran the driver and OpenGL bundle in this repository a
 | Family | Verified card | Verified on hardware | Last run |
 |---|---|---|---|
 | **Southern Islands** (GCN 1) | Radeon R7 450 | The display over DisplayPort (up to 3840x2160 at 60 Hz), 2D, Quartz Extreme, Core Image, OpenGL 4.5, power management, DisplayPort audio, H.264 decoding (UVD 3.1, 12 test streams bit-exact) | 2026-11-15, with the driver of that day. Since then the driver changed outside Southern Islands (Sea Islands, the untested-card policy) and, within it, only for the other chips: Cape Verde's tables and microcode files are the same, checked by the host tests. The card was not fitted for this release's run. |
-| **Sea Islands** (GCN 2) | FirePro W8100 | The display over DisplayPort (the desktop at 2560x1440, a 3840x2160 at 60 Hz link), 2D, Quartz Extreme, Core Image, OpenGL 4.5, power management (clocks follow the load, fan control), DisplayPort audio, H.264 decoding (UVD 4.2, 12 streams bit-exact) | 2026-11-15, *this release* |
+| **Sea Islands** (GCN 2) | FirePro W8100 | The display over DisplayPort (the desktop at 2560x1440, a 3840x2160 at 60 Hz link), 2D, Quartz Extreme, Core Image, OpenGL 4.5, power management (clocks follow the load, fan control), DisplayPort audio, H.264 decoding (UVD 4.2, 12 streams bit-exact) | 2026-11-15, with the driver and OpenGL bundle of that day; this release's changes (below) ran on the RX 570 |
 | **Polaris** (GCN 4) | Radeon RX 550 | 2D, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 6.3, 12 streams bit-exact), power management (214-1183 MHz under load) | 2026-11-15, without a monitor, with the driver of that day; since then Polaris's GART is 1 GB with the accelerator (256 MB before), run on the RX 570. The display over DisplayPort at up to 3840x2160 at 60 Hz, hot-plug and DisplayPort audio: 2026-11-14. |
-| | Radeon RX 570 | The display over HDMI (2560x1440 at 60 Hz, modes from the monitor's EDID and its CEA extension), 2D, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 6.3, 12 streams bit-exact, about 92 pictures/s at 1080p), power management (clocks follow the load: 1244 MHz engine and 1750 MHz memory clock under load, 300 and 300 MHz idle) | 2026-11-19, *this release* |
+| | Radeon RX 570 | The display over HDMI (2560x1440 at 60 Hz, modes from the monitor's EDID and its CEA extension), 2D, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 6.3, 12 streams bit-exact, about 92 pictures/s at 1080p), power management (clocks follow the load: 1244 MHz engine and 1750 MHz memory clock under load, 300 and 300 MHz idle) | 2026-11-20, *this release* |
 | | Embedded Radeon E9173 | The display over its three DisplayPort outputs, 2D, Quartz Extreme, Core Image, OpenGL 3.3, H.264 decoding (UVD 6.3), power management, DisplayPort audio | 2026-11-14 |
 | **Vega 20** (GCN 5) | Instinct MI50 | The display over DisplayPort, Quartz Extreme, Core Image, OpenGL 4.6, H.264 decoding (UVD 7), power management and clock gating, DisplayPort audio | 2026-11-15, with the driver of that afternoon; its Vega 20 code is unchanged since and passes the register-trace replays against Linux on both byte orders. The DMA engine occasionally stalls on its first frame after a start; the driver detects that and recovers it by itself (about 35 ms). |
 
-Not yet, on any family: DVI on a monitor (implemented, not tried; HDMI is verified on the RX
+Not yet, on any family: waiting for the vertical blank (a frame can land mid-scan and show
+across two refreshes), DVI on a monitor (implemented, not tried; HDMI is verified on the RX
 570 only), HDMI audio, video encoding
 (VCE), 1080p60 decoding in real time (1080p30 and 720p60 play without dropped frames),
 interrupts (the driver polls), compute queues.
+
+### Latest changes (2026-11-20)
+
+- **The Radeon RX 570** (Polaris 10) runs fully: display over HDMI, Quartz Extreme, Core
+  Image, OpenGL 4.6, H.264 decoding and power management. Polaris now gets a 1 GB GART with
+  the accelerator (256 MB before), as the other families have.
+- **Smoother composited updates on every card.** The window server's copies to the screen
+  were put off until some other part of the screen changed, so an animation with nothing
+  else moving ran in bursts: OpenGL screen savers under their clock showed about 7 pictures a
+  second for 30 drawn, and the Dock's genie effect stalled and then ran. Measured at the
+  display afterwards, every frame arrives.
+- **Core Image costs much less CPU.** New pbuffers were zeroed by the CPU through the PCIe
+  aperture, 14 MB each at 2560x1440 and several a frame; the GPU clears them now (a Quartz
+  Composer screen saver: 63 % of a core at 15 frames a second before, 37 % at 29 after).
+- **Quartz Extreme with monitors up to 2560x1440**, which until now got CPU compositing.
+- `patch-system-profiler-vram.sh` for cards over 2 GB (see [Installing](#installing)).
 
 ## Supported cards
 

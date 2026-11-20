@@ -340,6 +340,24 @@ GLAPI GLboolean GLAPIENTRY
 OSMesaSwapBuffersNotify( OSMesaContext ctx, void (*shown)(void *), void *arg );
 
 /*
+ * A single-buffered window's glFlush, told to the reader as a swap is:
+ * glFlush runs in glthread's thread as the batch's last call (it copies the
+ * front buffer to the surface and submits the copy), and shown(arg) is
+ * called there after it. The next call waits for the one before. False:
+ * nothing was done (no glthread); the caller flushes and tells the reader.
+ */
+GLAPI GLboolean GLAPIENTRY
+OSMesaFlushNotify( OSMesaContext ctx, void (*shown)(void *), void *arg );
+
+/*
+ * Clear a store to zero on the GPU, in this context's command stream,
+ * without touching GL state. False: not done.
+ */
+GLAPI GLboolean GLAPIENTRY
+OSMesaClearStore( OSMesaContext ctx, GLuint handle, GLsizei stride, GLuint offset,
+                  GLsizei width, GLsizei height, GLuint flags );
+
+/*
  * osx-gpu: with glthread, the most bytes glBufferData or glBufferSubData
  * can be given in one call without the program's thread waiting for the
  * other one to finish everything before it. 0: the context has no
